@@ -1,0 +1,19 @@
+# app/providers/notification/base.py
+from dataclasses import dataclass
+from typing import Dict, Protocol
+
+
+@dataclass(frozen=True)
+class NotificationRequest:
+    tenant_id: str
+    channel: str
+    destination: str
+    subject: str
+    body: str
+    metadata: Dict[str, str]
+
+
+class NotificationProvider(Protocol):
+    name: str
+    async def send(self, request: NotificationRequest) -> str:
+        ...

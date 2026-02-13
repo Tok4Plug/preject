@@ -1,0 +1,9 @@
+# app/providers/notification/telegram.py
+from app.providers.notification.base import NotificationRequest
+
+
+class TelegramNotificationProvider:
+    name = "telegram"
+
+    async def send(self, request: NotificationRequest) -> str:
+        return f"telegram:{request.destination}:sent"

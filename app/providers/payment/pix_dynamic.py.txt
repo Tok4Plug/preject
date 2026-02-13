@@ -1,0 +1,13 @@
+# app/providers/payment/pix_dynamic.py
+from app.providers.payment.base import PaymentProviderRequest, PaymentProviderResponse
+
+
+class PixDynamicProvider:
+    name = "pix_dynamic"
+    supported_rails = ("PIX_DYNAMIC",)
+
+    async def create_payment(self, request: PaymentProviderRequest) -> PaymentProviderResponse:
+        return PaymentProviderResponse(self.name, f"pdy_{request.intent_id}", "awaiting_payment", qr_code=f"pix-dynamic:{request.intent_id}")
+
+    async def validate_webhook(self, payload: bytes, signature: str) -> bool:
+        return bool(signature)

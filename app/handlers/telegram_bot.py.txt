@@ -1,0 +1,23 @@
+# app/handlers/telegram_bot.py
+"""Handler multi-bot: conecta bots ao FlowEngine sem lógica de negócio no canal."""
+
+from dataclasses import dataclass
+from typing import Dict
+
+
+@dataclass
+class BotRuntime:
+    bot_id: str
+    status: str = "active"
+
+
+class MultiBotManager:
+    def __init__(self) -> None:
+        self.bots: Dict[str, BotRuntime] = {}
+
+    async def initialize_all_bots(self) -> None:
+        # Bootstrap dinâmico (db/env/admin API)
+        self.bots["default_bot"] = BotRuntime(bot_id="default_bot")
+
+    async def shutdown_all_bots(self) -> None:
+        self.bots.clear()

@@ -1,0 +1,8 @@
+# app/engines/__init__.py
+"""Exports dos engines write-side/orquestração."""
+
+from app.engines.payment_engine import PaymentEngine
+from app.engines.subscription_engine import SubscriptionEngine
+from app.engines.offer_engine import OfferEngine
+
+__all__ = ["PaymentEngine", "SubscriptionEngine", "OfferEngine"]

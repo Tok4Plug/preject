@@ -1,0 +1,13 @@
+# app/providers/payment/paypal.py
+from app.providers.payment.base import PaymentProviderRequest, PaymentProviderResponse
+
+
+class PayPalProvider:
+    name = "paypal"
+    supported_rails = ("WALLET_GLOBAL", "CARD_USD", "CARD_EUR")
+
+    async def create_payment(self, request: PaymentProviderRequest) -> PaymentProviderResponse:
+        return PaymentProviderResponse(self.name, f"ppl_{request.intent_id}", "awaiting_payment", checkout_url=f"https://paypal.example/{request.intent_id}")
+
+    async def validate_webhook(self, payload: bytes, signature: str) -> bool:
+        return bool(signature)

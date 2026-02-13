@@ -1,0 +1,11 @@
+# app/handlers/admin_handler.py
+"""Admin API para configuração dinâmica sem redeploy (bots, ofertas, flags, pixels)."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class AdminActionResult:
+    ok: bool
+    message: str
+

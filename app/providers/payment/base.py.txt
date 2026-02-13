@@ -1,0 +1,33 @@
+# app/providers/payment/base.py
+from dataclasses import dataclass
+from typing import Dict, Protocol
+
+
+@dataclass(frozen=True)
+class PaymentProviderRequest:
+    tenant_id: str
+    intent_id: str
+    amount: float
+    currency: str
+    rail: str
+    metadata: Dict[str, str]
+
+
+@dataclass(frozen=True)
+class PaymentProviderResponse:
+    provider: str
+    external_payment_id: str
+    status: str
+    checkout_url: str | None = None
+    qr_code: str | None = None
+
+
+class PaymentProvider(Protocol):
+    name: str
+    supported_rails: tuple[str, ...]
+
+    async def create_payment(self, request: PaymentProviderRequest) -> PaymentProviderResponse:
+        ...
+
+    async def validate_webhook(self, payload: bytes, signature: str) -> bool:
+        ...

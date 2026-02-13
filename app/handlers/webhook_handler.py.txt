@@ -1,0 +1,12 @@
+# app/handlers/webhook_handler.py
+"""Endpoint-level webhook handler: valida assinatura e delega ao WebhookProcessor."""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class WebhookEnvelope:
+    tenant_id: str
+    provider: str
+    signature: str
+    payload: bytes

@@ -1,0 +1,13 @@
+# app/providers/payment/mbway.py
+from app.providers.payment.base import PaymentProviderRequest, PaymentProviderResponse
+
+
+class MBWayProvider:
+    name = "mbway"
+    supported_rails = ("MBWAY",)
+
+    async def create_payment(self, request: PaymentProviderRequest) -> PaymentProviderResponse:
+        return PaymentProviderResponse(self.name, f"mbw_{request.intent_id}", "awaiting_payment")
+
+    async def validate_webhook(self, payload: bytes, signature: str) -> bool:
+        return bool(signature)

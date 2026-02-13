@@ -1,0 +1,13 @@
+# app/providers/payment/pix_static.py
+from app.providers.payment.base import PaymentProviderRequest, PaymentProviderResponse
+
+
+class PixStaticProvider:
+    name = "pix_static"
+    supported_rails = ("PIX_STATIC",)
+
+    async def create_payment(self, request: PaymentProviderRequest) -> PaymentProviderResponse:
+        return PaymentProviderResponse(self.name, f"pst_{request.intent_id}", "awaiting_payment", qr_code=f"pix-static:{request.intent_id}")
+
+    async def validate_webhook(self, payload: bytes, signature: str) -> bool:
+        return bool(signature)

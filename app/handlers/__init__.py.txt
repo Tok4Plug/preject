@@ -1,0 +1,2 @@
+# app/handlers/__init__.py
+"""Handlers de entrada (Telegram, webhook, admin)."""

@@ -1,0 +1,13 @@
+# app/providers/payment/p2p_us.py
+from app.providers.payment.base import PaymentProviderRequest, PaymentProviderResponse
+
+
+class P2PUSProvider:
+    name = "p2p_us"
+    supported_rails = ("P2P_US",)
+
+    async def create_payment(self, request: PaymentProviderRequest) -> PaymentProviderResponse:
+        return PaymentProviderResponse(self.name, f"p2p_{request.intent_id}", "awaiting_payment")
+
+    async def validate_webhook(self, payload: bytes, signature: str) -> bool:
+        return bool(signature)

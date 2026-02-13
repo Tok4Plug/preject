@@ -1,0 +1,9 @@
+# app/providers/notification/email.py
+from app.providers.notification.base import NotificationRequest
+
+
+class EmailNotificationProvider:
+    name = "email"
+
+    async def send(self, request: NotificationRequest) -> str:
+        return f"email:{request.destination}:sent"

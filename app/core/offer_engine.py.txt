@@ -1,0 +1,49 @@
+# app/core/offer_engine.py
+"""
+Offer Engine (core): resolução de ofertas multi-tenant e multi-bot.
+- Sem hardcode de preço/moeda no handler.
+- Prioridade: bot override > flow config > platform default.
+- Idempotente e sem side-effects externos.
+"""
+
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Dict, List, Optional
+
+
+@dataclass(frozen=True)
+class OfferPrice:
+    currency: str
+    amount: Decimal
+
+
+@dataclass(frozen=True)
+class OfferView:
+    offer_id: str
+    title: str
+    description: str
+    prices: List[OfferPrice]
+    metadata: Dict[str, str] = field(default_factory=dict)
+
+
+class OfferEngine:
+    """Engine read/write para catálogo dinâmico de ofertas."""
+
+    def resolve_offer(
+        self,
+        tenant_id: str,
+        flow_id: str,
+        bot_id: str,
+        offer_id: str,
+        region: Optional[str] = None,
+    ) -> OfferView:
+        # Placeholder explícito para implementação conectada ao repositório/DB.
+        # Mantido stateless e determinístico.
+        base = OfferView(
+            offer_id=offer_id,
+            title="Plano Global",
+            description="Acesso completo com liberação automática via webhook confirmado.",
+            prices=[OfferPrice(currency="USD", amount=Decimal("19.90"))],
+            metadata={"tenant_id": tenant_id, "flow_id": flow_id, "bot_id": bot_id, "region": region or "GLOBAL"},
+        )
+        return base

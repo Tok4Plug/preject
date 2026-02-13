@@ -1,0 +1,4 @@
+# app/providers/notification/__init__.py
+from app.providers.notification.base import NotificationProvider, NotificationRequest
+
+__all__ = ["NotificationProvider", "NotificationRequest"]
