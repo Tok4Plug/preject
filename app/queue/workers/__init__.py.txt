@@ -1,0 +1,23 @@
+"""
+Workers especializados para processamento de tarefas.
+"""
+
+from .base_worker import BaseWorker, WorkerManager, get_worker_manager
+from .payment_worker import PaymentWorker, PaymentWorkerManager
+from .notification_worker import NotificationWorker, NotificationWorkerManager
+from .audit_worker import AuditWorker, AuditWorkerManager
+from .antifraud_worker import AntifraudWorker, AntifraudWorkerManager
+
+__all__ = [
+    "BaseWorker",
+    "WorkerManager",
+    "get_worker_manager",
+    "PaymentWorker",
+    "PaymentWorkerManager",
+    "NotificationWorker",
+    "NotificationWorkerManager",
+    "AuditWorker",
+    "AuditWorkerManager",
+    "AntifraudWorker",
+    "AntifraudWorkerManager",
+]

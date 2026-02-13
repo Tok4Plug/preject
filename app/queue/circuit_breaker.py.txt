@@ -1,0 +1,506 @@
+"""
+Circuit Breaker pattern para sistemas de filas.
+Protege contra falhas em cascata e permite auto-recuperação.
+"""
+
+import asyncio
+import logging
+import time
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, Optional, Any, Callable
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+class CircuitState(Enum):
+    """Estados do Circuit Breaker"""
+    CLOSED = "closed"      # Operação normal
+    OPEN = "open"          # Circuito aberto, falhas estão ocorrendo
+    HALF_OPEN = "half_open" # Testando se o serviço recuperou
+
+
+@dataclass
+class CircuitBreakerMetrics:
+    """Métricas do Circuit Breaker"""
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+    consecutive_failures: int = 0
+    total_opened_time: float = 0.0
+    last_state_change: Optional[datetime] = None
+    
+    def success_rate(self) -> float:
+        """Calcula taxa de sucesso"""
+        if self.total_requests == 0:
+            return 1.0
+        return self.successful_requests / self.total_requests
+    
+    def failure_rate(self) -> float:
+        """Calcula taxa de falha"""
+        if self.total_requests == 0:
+            return 0.0
+        return self.failed_requests / self.total_requests
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Configuração do Circuit Breaker"""
+    
+    # Thresholds
+    failure_threshold: int = 5           # Número de falhas para abrir
+    failure_threshold_percentage: float = 0.5  # Percentual de falhas
+    reset_timeout: float = 60.0          # Segundos antes de tentar half-open
+    
+    # Timeouts
+    request_timeout: float = 30.0        # Timeout por requisição
+    half_open_max_requests: int = 3      # Máx de requisições em half-open
+    
+    # Advanced
+    sliding_window_size: int = 100       # Tamanho da janela para estatísticas
+    min_number_of_calls: int = 10        # Mínimo de chamadas antes de abrir
+    
+    # Recovery
+    recovery_multiplier: float = 1.5     # Multiplicador para reset_timeout após sucessivas falhas
+    max_reset_timeout: float = 300.0     # Máximo de tempo de reset
+    
+    def __post_init__(self):
+        """Validação pós-inicialização"""
+        if not 0 < self.failure_threshold_percentage <= 1:
+            raise ValueError("failure_threshold_percentage deve estar entre 0 e 1")
+        
+        if self.reset_timeout <= 0:
+            raise ValueError("reset_timeout deve ser positivo")
+        
+        if self.request_timeout <= 0:
+            raise ValueError("request_timeout deve ser positivo")
+
+
+class CircuitBreaker:
+    """
+    Implementação do padrão Circuit Breaker com estado e métricas.
+    """
+    
+    def __init__(
+        self,
+        name: str,
+        config: Optional[CircuitBreakerConfig] = None,
+        fallback_function: Optional[Callable] = None
+    ):
+        self.name = name
+        self.config = config or CircuitBreakerConfig()
+        self.fallback_function = fallback_function
+        
+        # Estado inicial
+        self.state = CircuitState.CLOSED
+        self.metrics = CircuitBreakerMetrics()
+        
+        # Controle
+        self._last_failure_time: Optional[datetime] = None
+        self._half_open_attempts: int = 0
+        self._lock = asyncio.Lock()
+        
+        # Janela de falhas (para sliding window)
+        self._failure_window: list[bool] = []
+        self._success_window: list[bool] = []
+        
+        logger.info(f"CircuitBreaker '{name}' inicializado")
+    
+    def is_open(self) -> bool:
+        """Verifica se o circuito está aberto"""
+        if self.state != CircuitState.OPEN:
+            return False
+        
+        # Verifica se já passou tempo suficiente para tentar half-open
+        if self._last_failure_time:
+            elapsed = (datetime.utcnow() - self._last_failure_time).total_seconds()
+            return elapsed < self.config.reset_timeout
+        
+        return True
+    
+    def is_available(self) -> bool:
+        """Verifica se o circuito permite novas requisições"""
+        if self.state == CircuitState.CLOSED:
+            return True
+        
+        if self.state == CircuitState.HALF_OPEN:
+            return self._half_open_attempts < self.config.half_open_max_requests
+        
+        return False
+    
+    async def execute(self, func: Callable, *args, **kwargs) -> Any:
+        """
+        Executa uma função com proteção do Circuit Breaker.
+        
+        Args:
+            func: Função a ser executada
+            *args, **kwargs: Argumentos da função
+            
+        Returns:
+            Resultado da função ou fallback
+            
+        Raises:
+            CircuitBreakerOpenError: Se o circuito estiver aberto
+            CircuitBreakerTimeoutError: Se a função exceder timeout
+        """
+        
+        # Verifica disponibilidade
+        if not self.is_available():
+            logger.warning(
+                f"CircuitBreaker '{self.name}' está aberto, "
+                f"tentando fallback"
+            )
+            
+            if self.fallback_function:
+                return await self._execute_fallback(*args, **kwargs)
+            
+            raise CircuitBreakerOpenError(
+                circuit_name=self.name,
+                state=self.state,
+                reset_timeout=self.config.reset_timeout
+            )
+        
+        async with self._lock:
+            # Atualiza métricas de half-open se necessário
+            if self.state == CircuitState.HALF_OPEN:
+                self._half_open_attempts += 1
+            
+            self.metrics.total_requests += 1
+        
+        try:
+            # Executa com timeout
+            result = await asyncio.wait_for(
+                func(*args, **kwargs),
+                timeout=self.config.request_timeout
+            )
+            
+            # Sucesso
+            await self._record_success()
+            return result
+            
+        except asyncio.TimeoutError:
+            # Timeout
+            await self._record_failure(CircuitBreakerTimeoutError(
+                circuit_name=self.name,
+                timeout=self.config.request_timeout
+            ))
+            
+            # Tenta fallback
+            if self.fallback_function:
+                return await self._execute_fallback(*args, **kwargs)
+            raise
+            
+        except CircuitBreakerOpenError:
+            # Não registra como falha do circuito
+            raise
+            
+        except Exception as e:
+            # Falha genérica
+            await self._record_failure(e)
+            
+            # Tenta fallback
+            if self.fallback_function:
+                return await self._execute_fallback(*args, **kwargs)
+            raise
+    
+    async def _record_success(self):
+        """Registra sucesso e atualiza estado"""
+        async with self._lock:
+            self.metrics.successful_requests += 1
+            self.metrics.consecutive_failures = 0
+            
+            # Atualiza janela de sucesso
+            self._success_window.append(True)
+            self._failure_window.append(False)
+            
+            # Limita tamanho da janela
+            if len(self._success_window) > self.config.sliding_window_size:
+                self._success_window.pop(0)
+                self._failure_window.pop(0)
+            
+            # Se estava em half-open e teve sucesso, fecha o circuito
+            if self.state == CircuitState.HALF_OPEN:
+                self.state = CircuitState.CLOSED
+                self._half_open_attempts = 0
+                
+                logger.info(
+                    f"CircuitBreaker '{self.name}' fechado após sucesso em half-open"
+                )
+    
+    async def _record_failure(self, error: Exception):
+        """Registra falha e atualiza estado"""
+        async with self._lock:
+            self.metrics.failed_requests += 1
+            self.metrics.consecutive_failures += 1
+            
+            # Atualiza janela de falhas
+            self._success_window.append(False)
+            self._failure_window.append(True)
+            
+            # Limita tamanho da janela
+            if len(self._failure_window) > self.config.sliding_window_size:
+                self._success_window.pop(0)
+                self._failure_window.pop(0)
+            
+            self._last_failure_time = datetime.utcnow()
+            
+            # Verifica se deve abrir o circuito
+            should_open = self._should_open_circuit()
+            
+            if should_open and self.state != CircuitState.OPEN:
+                self.state = CircuitState.OPEN
+                self.metrics.last_state_change = datetime.utcnow()
+                
+                logger.error(
+                    f"CircuitBreaker '{self.name}' aberto devido a falhas. "
+                    f"Falhas consecutivas: {self.metrics.consecutive_failures}, "
+                    f"Taxa de falha: {self.metrics.failure_rate():.2%}"
+                )
+            
+            # Se estava em half-open e falhou, volta para open
+            elif self.state == CircuitState.HALF_OPEN:
+                self.state = CircuitState.OPEN
+                self._half_open_attempts = 0
+                
+                # Aumenta reset timeout (backoff)
+                self.config.reset_timeout = min(
+                    self.config.reset_timeout * self.config.recovery_multiplier,
+                    self.config.max_reset_timeout
+                )
+                
+                logger.warning(
+                    f"CircuitBreaker '{self.name}' reaberto após falha em half-open. "
+                    f"Novo reset_timeout: {self.config.reset_timeout}s"
+                )
+    
+    def _should_open_circuit(self) -> bool:
+        """Determina se o circuito deve abrir baseado nas métricas"""
+        
+        # Verifica falhas consecutivas
+        if self.metrics.consecutive_failures >= self.config.failure_threshold:
+            return True
+        
+        # Verifica taxa de falha na janela deslizante
+        if len(self._failure_window) >= self.config.min_number_of_calls:
+            recent_failures = sum(self._failure_window[-self.config.sliding_window_size:])
+            failure_rate = recent_failures / len(self._failure_window[-self.config.sliding_window_size:])
+            
+            if failure_rate >= self.config.failure_threshold_percentage:
+                return True
+        
+        return False
+    
+    async def _execute_fallback(self, *args, **kwargs) -> Any:
+        """Executa função de fallback"""
+        try:
+            if asyncio.iscoroutinefunction(self.fallback_function):
+                result = await self.fallback_function(*args, **kwargs)
+            else:
+                result = self.fallback_function(*args, **kwargs)
+            
+            logger.debug(f"Fallback executado com sucesso para {self.name}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Fallback também falhou para {self.name}: {str(e)}")
+            raise CircuitBreakerFallbackError(
+                circuit_name=self.name,
+                original_state=self.state,
+                fallback_error=str(e)
+            )
+    
+    async def reset(self):
+        """Reseta o circuit breaker para estado inicial"""
+        async with self._lock:
+            self.state = CircuitState.CLOSED
+            self.metrics.consecutive_failures = 0
+            self._half_open_attempts = 0
+            self._last_failure_time = None
+            
+            # Reseta timeout para valor original
+            base_config = CircuitBreakerConfig()
+            self.config.reset_timeout = base_config.reset_timeout
+            
+            logger.info(f"CircuitBreaker '{self.name}' resetado manualmente")
+    
+    async def attempt_reset(self):
+        """Tenta resetar o circuito se estiver em OPEN há tempo suficiente"""
+        if self.state != CircuitState.OPEN:
+            return
+        
+        if not self._last_failure_time:
+            return
+        
+        elapsed = (datetime.utcnow() - self._last_failure_time).total_seconds()
+        
+        if elapsed >= self.config.reset_timeout:
+            async with self._lock:
+                self.state = CircuitState.HALF_OPEN
+                self._half_open_attempts = 0
+                self.metrics.last_state_change = datetime.utcnow()
+                
+                logger.info(
+                    f"CircuitBreaker '{self.name}' movido para half-open "
+                    f"após {elapsed:.1f}s"
+                )
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Retorna status atual do circuit breaker"""
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "metrics": {
+                "total_requests": self.metrics.total_requests,
+                "successful_requests": self.metrics.successful_requests,
+                "failed_requests": self.metrics.failed_requests,
+                "consecutive_failures": self.metrics.consecutive_failures,
+                "success_rate": self.metrics.success_rate(),
+                "failure_rate": self.metrics.failure_rate(),
+            },
+            "config": {
+                "failure_threshold": self.config.failure_threshold,
+                "failure_threshold_percentage": self.config.failure_threshold_percentage,
+                "reset_timeout": self.config.reset_timeout,
+                "request_timeout": self.config.request_timeout,
+            },
+            "last_failure_time": self._last_failure_time.isoformat() if self._last_failure_time else None,
+            "is_available": self.is_available(),
+            "window_size": len(self._failure_window),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+class CircuitBreakerManager:
+    """Gerencia múltiplos circuit breakers"""
+    
+    def __init__(self):
+        self.circuits: Dict[str, CircuitBreaker] = {}
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._running = False
+    
+    def register(self, circuit: CircuitBreaker):
+        """Registra um circuit breaker"""
+        self.circuits[circuit.name] = circuit
+    
+    def get(self, name: str) -> Optional[CircuitBreaker]:
+        """Obtém um circuit breaker pelo nome"""
+        return self.circuits.get(name)
+    
+    async def start_monitoring(self, interval: float = 10.0):
+        """Inicia monitoramento periódico dos circuit breakers"""
+        self._running = True
+        
+        async def monitor():
+            while self._running:
+                try:
+                    for circuit in list(self.circuits.values()):
+                        await circuit.attempt_reset()
+                    await asyncio.sleep(interval)
+                except Exception as e:
+                    logger.error(f"Erro no monitor de circuit breakers: {str(e)}")
+                    await asyncio.sleep(interval)
+        
+        self._monitor_task = asyncio.create_task(monitor())
+        logger.info(f"Monitor de circuit breakers iniciado (intervalo: {interval}s)")
+    
+    async def stop_monitoring(self):
+        """Para o monitoramento"""
+        self._running = False
+        
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.info("Monitor de circuit breakers parado")
+    
+    def get_all_status(self) -> Dict[str, Any]:
+        """Retorna status de todos os circuit breakers"""
+        status = {}
+        for name, circuit in self.circuits.items():
+            status[name] = circuit.get_status()
+        
+        return {
+            "total_circuits": len(self.circuits),
+            "circuits": status,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    async def reset_all(self):
+        """Reseta todos os circuit breakers"""
+        for circuit in self.circuits.values():
+            await circuit.reset()
+        
+        logger.info(f"Todos os {len(self.circuits)} circuit breakers resetados")
+
+
+# Exceções específicas
+class CircuitBreakerError(Exception):
+    """Exceção base para erros do Circuit Breaker"""
+    pass
+
+class CircuitBreakerOpenError(CircuitBreakerError):
+    """Erro quando o circuito está aberto"""
+    
+    def __init__(self, circuit_name: str, state: CircuitState, reset_timeout: float):
+        super().__init__(
+            f"Circuit '{circuit_name}' is {state.value}. "
+            f"Reset in {reset_timeout:.1f}s"
+        )
+        self.circuit_name = circuit_name
+        self.state = state
+        self.reset_timeout = reset_timeout
+
+class CircuitBreakerTimeoutError(CircuitBreakerError):
+    """Erro quando a operação excede o timeout"""
+    
+    def __init__(self, circuit_name: str, timeout: float):
+        super().__init__(
+            f"Circuit '{circuit_name}' operation timeout after {timeout:.1f}s"
+        )
+        self.circuit_name = circuit_name
+        self.timeout = timeout
+
+class CircuitBreakerFallbackError(CircuitBreakerError):
+    """Erro quando o fallback também falha"""
+    
+    def __init__(self, circuit_name: str, original_state: CircuitState, fallback_error: str):
+        super().__init__(
+            f"Circuit '{circuit_name}' fallback also failed. "
+            f"Original state: {original_state.value}, Error: {fallback_error}"
+        )
+        self.circuit_name = circuit_name
+        self.original_state = original_state
+        self.fallback_error = fallback_error
+
+
+# Decorator para uso fácil
+def circuit_breaker(
+    name: str,
+    config: Optional[CircuitBreakerConfig] = None,
+    fallback: Optional[Callable] = None
+):
+    """
+    Decorator para aplicar circuit breaker a uma função.
+    
+    Exemplo:
+        @circuit_breaker("redis_queue", fallback=redis_fallback)
+        async def publish_to_redis(...):
+            ...
+    """
+    
+    def decorator(func):
+        cb = CircuitBreaker(name=name, config=config, fallback_function=fallback)
+        
+        async def wrapper(*args, **kwargs):
+            return await cb.execute(func, *args, **kwargs)
+        
+        # Expõe o circuit breaker para controle
+        wrapper.circuit_breaker = cb
+        
+        return wrapper
+    
+    return decorator

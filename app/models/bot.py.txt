@@ -1,0 +1,408 @@
+# app/models/bot.py
+"""
+Modelo de Bot - Registro dinâmico de bots multi-tenant.
+Cada bot é apenas uma identidade, a lógica está no Flow Engine.
+"""
+
+import uuid
+import hashlib
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, ForeignKey, Index, Text, Enum
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+import enum
+
+from app.database import Base
+
+
+class BotStatus(enum.Enum):
+    """Status do bot no sistema."""
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    SUSPENDED = "suspended"
+    MAINTENANCE = "maintenance"
+    DELETED = "deleted"
+
+
+class BotPlatform(enum.Enum):
+    """Plataforma do bot."""
+    TELEGRAM = "telegram"
+    WHATSAPP = "whatsapp"
+    DISCORD = "discord"
+    SLACK = "slack"
+    WEB = "web"
+
+
+class Bot(Base):
+    """
+    Bot registrado no sistema.
+    
+    Princípios:
+    1. Identidade pura: O bot não contém lógica, apenas configuração
+    2. Multi-plataforma: Suporte a Telegram, WhatsApp, etc.
+    3. Configuração dinâmica: Tudo configurável via Admin API
+    4. Isolamento por tenant
+    5. Tokens seguros (hash armazenado)
+    """
+    
+    __tablename__ = "bots"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    external_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)  # ID no sistema do cliente
+    
+    # Identidade do bot
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    username: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # @nome_do_bot
+    platform: Mapped[BotPlatform] = mapped_column(Enum(BotPlatform), nullable=False, default=BotPlatform.TELEGRAM)
+    
+    # Tokens seguros (apenas hash é armazenado)
+    token_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    token_salt: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_last_rotated: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Configuração
+    config: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Status e controle
+    status: Mapped[BotStatus] = mapped_column(Enum(BotStatus), nullable=False, default=BotStatus.ACTIVE)
+    default_flow_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # Flow padrão
+    current_flow_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # Flow atual (pode ser sobrescrito)
+    
+    # Overrides específicos do bot
+    overrides: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Limites e estatísticas
+    rate_limit_per_second: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    rate_limit_per_minute: Mapped[int] = mapped_column(Integer, nullable=False, default=1000)
+    max_concurrent_users: Mapped[int] = mapped_column(Integer, nullable=False, default=1000)
+    
+    # Webhook configuration (para plataformas que usam webhook)
+    webhook_url: Mapped[Optional[str]] = mapped_column(Text)
+    webhook_secret_hash: Mapped[Optional[str]] = mapped_column(String(128))
+    webhook_configured_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_active_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="bots")
+    payment_intents: Mapped[List["PaymentIntent"]] = relationship(back_populates="bot", cascade="all, delete-orphan")
+    flow_states: Mapped[List["FlowState"]] = relationship(back_populates="bot", cascade="all, delete-orphan")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="bot", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_bots_tenant_status', 'tenant_id', 'status'),
+        Index('ix_bots_platform_username', 'platform', 'username'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<Bot(id='{self.id}', name='{self.name}', platform='{self.platform.value}', status='{self.status.value}')>"
+    
+    def to_dict(self, include_sensitive: bool = False) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "id": self.id,
+            "tenant_id": self.tenant_id,
+            "external_id": self.external_id,
+            "name": self.name,
+            "username": self.username,
+            "platform": self.platform.value,
+            "status": self.status.value,
+            "config": self.config,
+            "metadata": self.metadata,
+            "default_flow_id": self.default_flow_id,
+            "current_flow_id": self.current_flow_id,
+            "overrides": self.overrides,
+            "rate_limit_per_second": self.rate_limit_per_second,
+            "rate_limit_per_minute": self.rate_limit_per_minute,
+            "max_concurrent_users": self.max_concurrent_users,
+            "webhook_url": self.webhook_url,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "last_active_at": self.last_active_at.isoformat() if self.last_active_at else None
+        }
+        
+        if include_sensitive:
+            data.update({
+                "token_last_rotated": self.token_last_rotated.isoformat() if self.token_last_rotated else None,
+                "webhook_configured_at": self.webhook_configured_at.isoformat() if self.webhook_configured_at else None
+            })
+        
+        return data
+    
+    @property
+    def is_active(self) -> bool:
+        """Verifica se o bot está ativo."""
+        return (
+            self.status == BotStatus.ACTIVE and 
+            self.deleted_at is None
+        )
+    
+    @property
+    def can_receive_messages(self) -> bool:
+        """Verifica se o bot pode receber mensagens."""
+        return self.is_active and self.status != BotStatus.MAINTENANCE
+    
+    @property
+    def effective_flow_id(self) -> str:
+        """Retorna o flow ID efetivo (current ou default)."""
+        return self.current_flow_id or self.default_flow_id or "default"
+    
+    def generate_token_hash(self, token: str) -> str:
+        """Gera hash do token para armazenamento seguro."""
+        # Usa salt específico do bot
+        return hashlib.sha512(f"{token}{self.token_salt}".encode()).hexdigest()
+    
+    def verify_token(self, token: str) -> bool:
+        """Verifica se o token corresponde ao hash armazenado."""
+        return self.token_hash == self.generate_token_hash(token)
+    
+    def rotate_token(self, new_token: str):
+        """Rotaciona o token do bot."""
+        self.token_hash = self.generate_token_hash(new_token)
+        self.token_salt = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:64]
+        self.token_last_rotated = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def update_last_active(self):
+        """Atualiza o timestamp de última atividade."""
+        self.last_active_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def update_config(self, new_config: Dict[str, Any], merge: bool = True):
+        """Atualiza a configuração do bot."""
+        if merge:
+            self.config.update(new_config)
+        else:
+            self.config = new_config
+        self.updated_at = datetime.utcnow()
+    
+    def update_overrides(self, new_overrides: Dict[str, Any], merge: bool = True):
+        """Atualiza os overrides do bot."""
+        if merge:
+            self.overrides.update(new_overrides)
+        else:
+            self.overrides = new_overrides
+        self.updated_at = datetime.utcnow()
+    
+    def get_override(self, key: str, default: Any = None) -> Any:
+        """Obtém um valor específico dos overrides."""
+        return self.overrides.get(key, default)
+    
+    def set_flow(self, flow_id: str, is_default: bool = False):
+        """Define o flow do bot."""
+        if is_default:
+            self.default_flow_id = flow_id
+        else:
+            self.current_flow_id = flow_id
+        self.updated_at = datetime.utcnow()
+    
+    def reset_flow(self):
+        """Reseta o flow atual para o padrão."""
+        self.current_flow_id = None
+        self.updated_at = datetime.utcnow()
+    
+    def activate(self):
+        """Ativa o bot."""
+        self.status = BotStatus.ACTIVE
+        self.updated_at = datetime.utcnow()
+    
+    def deactivate(self):
+        """Desativa o bot."""
+        self.status = BotStatus.INACTIVE
+        self.updated_at = datetime.utcnow()
+    
+    def suspend(self, reason: Optional[str] = None):
+        """Suspende o bot."""
+        self.status = BotStatus.SUSPENDED
+        self.updated_at = datetime.utcnow()
+        
+        # Registra motivo nos metadados
+        if reason:
+            self.metadata["suspension_reason"] = reason
+            self.metadata["suspended_at"] = datetime.utcnow().isoformat()
+    
+    def put_in_maintenance(self):
+        """Coloca o bot em manutenção."""
+        self.status = BotStatus.MAINTENANCE
+        self.updated_at = datetime.utcnow()
+    
+    def soft_delete(self):
+        """Deleta o bot de forma reversível."""
+        self.deleted_at = datetime.utcnow()
+        self.status = BotStatus.DELETED
+        self.updated_at = datetime.utcnow()
+    
+    def configure_webhook(self, url: str, secret: Optional[str] = None):
+        """Configura webhook para o bot."""
+        self.webhook_url = url
+        
+        if secret:
+            self.webhook_secret_hash = hashlib.sha512(f"{secret}{self.id}".encode()).hexdigest()
+        
+        self.webhook_configured_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def verify_webhook_signature(self, signature: str, payload: str, secret: str) -> bool:
+        """Verifica assinatura do webhook."""
+        if not self.webhook_secret_hash:
+            return False
+        
+        expected_hash = hashlib.sha512(f"{payload}{secret}".encode()).hexdigest()
+        return self.webhook_secret_hash == expected_hash
+    
+    def check_rate_limit(self, user_id: str, current_counts: Dict[str, int]) -> bool:
+        """Verifica se o usuário está dentro dos limites de taxa."""
+        # Em produção, isso consultaria Redis
+        # Esta é uma implementação simplificada
+        
+        per_second = current_counts.get("per_second", 0)
+        per_minute = current_counts.get("per_minute", 0)
+        
+        return (
+            per_second < self.rate_limit_per_second and
+            per_minute < self.rate_limit_per_minute
+        )
+
+
+class BotStat(Base):
+    """
+    Estatísticas do bot para monitoramento e analytics.
+    """
+    
+    __tablename__ = "bot_stats"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    bot_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.bots.id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Métricas de uso
+    total_messages_received: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_messages_sent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_users_interacted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_commands_executed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    # Métricas de conversão
+    total_payments_initiated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_payments_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    conversion_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    
+    # Métricas de performance
+    average_response_time_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    error_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    uptime_percentage: Mapped[float] = mapped_column(Float, nullable=False, default=100.0)
+    
+    # Timestamps
+    period_start: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    period_end: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Relacionamentos
+    bot: Mapped["Bot"] = relationship(back_populates="stats")
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_bot_stats_bot_period', 'bot_id', 'period_start', 'period_end'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<BotStat(bot_id='{self.bot_id}', period='{self.period_start} to {self.period_end}')>"
+    
+    def update_conversion_rate(self):
+        """Atualiza taxa de conversão."""
+        if self.total_payments_initiated > 0:
+            self.conversion_rate = (self.total_payments_completed / self.total_payments_initiated) * 100
+        else:
+            self.conversion_rate = 0.0
+
+
+class BotOverride(Base):
+    """
+    Overrides específicos por bot para flows, ofertas, etc.
+    Permite customização sem modificar o fluxo base.
+    """
+    
+    __tablename__ = "bot_overrides"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    bot_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.bots.id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Scope do override
+    override_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # flow, offer, pricing, template
+    target_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # ID do target (flow_id, offer_id, etc.)
+    
+    # Dados do override
+    override_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # Maior prioridade = aplicado primeiro
+    
+    # Validade
+    valid_from: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    valid_until: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relacionamentos
+    bot: Mapped["Bot"] = relationship(back_populates="specific_overrides")
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_bot_overrides_bot_type_target', 'bot_id', 'override_type', 'target_id'),
+        Index('ix_bot_overrides_validity', 'valid_from', 'valid_until', 'is_active'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<BotOverride(bot_id='{self.bot_id}', type='{self.override_type}', target='{self.target_id}')>"
+    
+    @property
+    def is_valid(self) -> bool:
+        """Verifica se o override está válido."""
+        if not self.is_active:
+            return False
+        
+        now = datetime.utcnow()
+        
+        if self.valid_from and now < self.valid_from:
+            return False
+        
+        if self.valid_until and now > self.valid_until:
+            return False
+        
+        return True
+    
+    def apply_override(self, original_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Aplica o override aos dados originais."""
+        # Merge recursivo
+        def deep_merge(target: Dict, source: Dict) -> Dict:
+            for key, value in source.items():
+                if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                    target[key] = deep_merge(target[key], value)
+                else:
+                    target[key] = value
+            return target
+        
+        return deep_merge(original_data.copy(), self.override_data)
+
+
+# Adiciona as relações de volta no Bot
+Bot.stats = relationship("BotStat", back_populates="bot", cascade="all, delete-orphan")
+Bot.specific_overrides = relationship("BotOverride", back_populates="bot", cascade="all, delete-orphan")

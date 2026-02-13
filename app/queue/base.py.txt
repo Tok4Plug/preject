@@ -1,0 +1,469 @@
+"""
+Interface base para sistema de filas distribuídas.
+Garante isolamento por tenant, idempotência e observabilidade.
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, Optional, TypeVar, Generic, Callable, List
+from uuid import uuid4
+import json
+import logging
+
+# Type definitions
+T = TypeVar('T')
+
+logger = logging.getLogger(__name__)
+
+
+class QueueMessageStatus(Enum):
+    """Status de uma mensagem na fila"""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DEAD_LETTER = "dead_letter"
+
+
+@dataclass(frozen=True)
+class QueueMetadata:
+    """Metadados imutáveis para rastreamento de mensagens"""
+    message_id: str = field(default_factory=lambda: str(uuid4()))
+    tenant_id: str
+    correlation_id: str = field(default_factory=lambda: str(uuid4()))
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    source: str = "unknown"
+    retry_count: int = 0
+    original_message_id: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte metadados para dicionário serializável"""
+        return {
+            "message_id": self.message_id,
+            "tenant_id": self.tenant_id,
+            "correlation_id": self.correlation_id,
+            "created_at": self.created_at.isoformat(),
+            "source": self.source,
+            "retry_count": self.retry_count,
+            "original_message_id": self.original_message_id
+        }
+
+
+@dataclass(frozen=True)
+class QueueMessage(Generic[T]):
+    """
+    Mensagem padronizada para o sistema de filas.
+    Imutável por design para garantir idempotência.
+    """
+    metadata: QueueMetadata
+    payload: T
+    queue_name: str
+    visibility_timeout: int = 300  # 5 minutos por padrão
+    
+    def serialize(self) -> str:
+        """Serializa a mensagem para string JSON"""
+        data = {
+            "metadata": self.metadata.to_dict(),
+            "payload": self.payload if isinstance(self.payload, dict) else self.payload,
+            "queue_name": self.queue_name,
+            "visibility_timeout": self.visibility_timeout
+        }
+        return json.dumps(data, default=str)
+    
+    @classmethod
+    def deserialize(cls, data: str) -> 'QueueMessage':
+        """Desserializa a mensagem a partir de string JSON"""
+        parsed = json.loads(data)
+        
+        # Recria metadata
+        metadata_dict = parsed["metadata"]
+        metadata_dict["created_at"] = datetime.fromisoformat(metadata_dict["created_at"])
+        metadata = QueueMetadata(**metadata_dict)
+        
+        return cls(
+            metadata=metadata,
+            payload=parsed["payload"],
+            queue_name=parsed["queue_name"],
+            visibility_timeout=parsed.get("visibility_timeout", 300)
+        )
+
+
+class DeadLetterQueue(ABC):
+    """Interface para dead letter queue"""
+    
+    @abstractmethod
+    async def store_failed_message(
+        self, 
+        message: QueueMessage,
+        error: str,
+        last_error: str,
+        stack_trace: Optional[str] = None
+    ) -> None:
+        """Armazena mensagem falha para análise posterior"""
+        pass
+    
+    @abstractmethod
+    async def get_failed_messages(
+        self, 
+        tenant_id: Optional[str] = None,
+        queue_name: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Recupera mensagens falhas para análise"""
+        pass
+
+
+class QueueMetrics(ABC):
+    """Interface para métricas da fila"""
+    
+    @abstractmethod
+    async def increment_counter(
+        self,
+        metric_name: str,
+        tenant_id: str,
+        value: int = 1,
+        tags: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Incrementa contador de métricas"""
+        pass
+    
+    @abstractmethod
+    async def record_processing_time(
+        self,
+        queue_name: str,
+        tenant_id: str,
+        processing_time_ms: float
+    ) -> None:
+        """Registra tempo de processamento"""
+        pass
+
+
+class BaseQueue(ABC):
+    """
+    Interface base abstrata para todas as implementações de fila.
+    Segue princípios de isolamento por tenant e idempotência.
+    """
+    
+    def __init__(
+        self,
+        dead_letter_queue: Optional[DeadLetterQueue] = None,
+        metrics: Optional[QueueMetrics] = None
+    ):
+        self.dead_letter_queue = dead_letter_queue
+        self.metrics = metrics
+        self._shutting_down = False
+    
+    @abstractmethod
+    async def publish(
+        self,
+        queue_name: str,
+        payload: Any,
+        tenant_id: str,
+        delay_seconds: int = 0,
+        idempotency_key: Optional[str] = None,
+        source: str = "unknown"
+    ) -> QueueMessage:
+        """
+        Publica uma mensagem na fila com garantia de idempotência.
+        
+        Args:
+            queue_name: Nome da fila
+            payload: Dados da mensagem (serão serializados como JSON)
+            tenant_id: ID do tenant para isolamento
+            delay_seconds: Atraso em segundos antes do processamento
+            idempotency_key: Chave para garantir idempotência
+            source: Origem da mensagem para auditoria
+            
+        Returns:
+            QueueMessage publicada
+            
+        Raises:
+            QueueError: Se houver erro ao publicar
+        """
+        pass
+    
+    @abstractmethod
+    async def consume(
+        self,
+        queue_name: str,
+        callback: Callable[[QueueMessage], Any],
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1,
+        visibility_timeout: int = 300
+    ) -> None:
+        """
+        Consome mensagens da fila de forma contínua.
+        
+        Args:
+            queue_name: Nome da fila
+            callback: Função chamada para cada mensagem
+            tenant_id: Se especificado, consome apenas deste tenant
+            batch_size: Número de mensagens por lote
+            visibility_timeout: Tempo de invisibilidade após recebimento
+        """
+        pass
+    
+    @abstractmethod
+    async def receive_message(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None,
+        visibility_timeout: int = 300
+    ) -> Optional[QueueMessage]:
+        """
+        Recebe uma única mensagem da fila.
+        
+        Args:
+            queue_name: Nome da fila
+            tenant_id: Se especificado, recebe apenas deste tenant
+            visibility_timeout: Tempo de invisibilidade após recebimento
+            
+        Returns:
+            QueueMessage ou None se não houver mensagens
+        """
+        pass
+    
+    @abstractmethod
+    async def acknowledge(self, message: QueueMessage) -> None:
+        """
+        Confirma processamento bem-sucedido da mensagem.
+        
+        Args:
+            message: Mensagem a ser confirmada
+        """
+        pass
+    
+    @abstractmethod
+    async def nack(
+        self,
+        message: QueueMessage,
+        error: Optional[str] = None,
+        retry_after: Optional[int] = None
+    ) -> None:
+        """
+        Nega confirmação da mensagem (negative acknowledgment).
+        
+        Args:
+            message: Mensagem não processada
+            error: Mensagem de erro para auditoria
+            retry_after: Segundos para retentativa (None para DLQ)
+        """
+        pass
+    
+    @abstractmethod
+    async def get_queue_stats(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Obtém estatísticas da fila.
+        
+        Returns:
+            Dicionário com estatísticas (message_count, delayed_count, etc.)
+        """
+        pass
+    
+    @abstractmethod
+    async def purge_queue(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> None:
+        """
+        Limpa completamente uma fila.
+        
+        Apenas para uso administrativo em desenvolvimento/testes.
+        """
+        pass
+    
+    async def process_with_retry(
+        self,
+        message: QueueMessage,
+        processor: Callable[[Any], Any],
+        max_retries: int = 3,
+        retry_delays: List[int] = None
+    ) -> None:
+        """
+        Processa mensagem com retry automático e dead letter queue.
+        
+        Args:
+            message: Mensagem a ser processada
+            processor: Função de processamento
+            max_retries: Número máximo de tentativas
+            retry_delays: Lista de atrasos entre retentativas (em segundos)
+        """
+        if retry_delays is None:
+            retry_delays = [1, 5, 30, 60]  # Backoff exponencial
+        
+        last_error = None
+        stack_trace = None
+        
+        try:
+            start_time = datetime.utcnow()
+            
+            # Processa a mensagem
+            result = await processor(message.payload)
+            
+            # Registra métricas de sucesso
+            if self.metrics:
+                processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+                await self.metrics.record_processing_time(
+                    queue_name=message.queue_name,
+                    tenant_id=message.metadata.tenant_id,
+                    processing_time_ms=processing_time
+                )
+                await self.metrics.increment_counter(
+                    metric_name="queue_processing_success",
+                    tenant_id=message.metadata.tenant_id,
+                    tags={"queue": message.queue_name}
+                )
+            
+            # Confirma processamento
+            await self.acknowledge(message)
+            
+            logger.info(
+                f"Message {message.metadata.message_id} processed successfully",
+                extra={
+                    "tenant_id": message.metadata.tenant_id,
+                    "queue": message.queue_name,
+                    "correlation_id": message.metadata.correlation_id
+                }
+            )
+            
+        except Exception as e:
+            import traceback
+            last_error = str(e)
+            stack_trace = traceback.format_exc()
+            
+            # Incrementa contador de retry
+            new_metadata = QueueMetadata(
+                message_id=message.metadata.message_id,
+                tenant_id=message.metadata.tenant_id,
+                correlation_id=message.metadata.correlation_id,
+                created_at=message.metadata.created_at,
+                source=message.metadata.source,
+                retry_count=message.metadata.retry_count + 1,
+                original_message_id=message.metadata.original_message_id
+            )
+            
+            retry_message = QueueMessage(
+                metadata=new_metadata,
+                payload=message.payload,
+                queue_name=message.queue_name,
+                visibility_timeout=message.visibility_timeout
+            )
+            
+            # Verifica se deve fazer retry ou enviar para DLQ
+            if message.metadata.retry_count < max_retries:
+                retry_delay = retry_delays[min(
+                    message.metadata.retry_count, 
+                    len(retry_delays) - 1
+                )]
+                
+                logger.warning(
+                    f"Message {message.metadata.message_id} failed, retrying in {retry_delay}s "
+                    f"(attempt {message.metadata.retry_count + 1}/{max_retries})",
+                    extra={
+                        "tenant_id": message.metadata.tenant_id,
+                        "queue": message.queue_name,
+                        "error": last_error,
+                        "retry_count": message.metadata.retry_count
+                    }
+                )
+                
+                # Republica com delay
+                await self.publish(
+                    queue_name=message.queue_name,
+                    payload=message.payload,
+                    tenant_id=message.metadata.tenant_id,
+                    delay_seconds=retry_delay,
+                    idempotency_key=message.metadata.message_id,
+                    source=message.metadata.source
+                )
+                
+                # Confirma a mensagem original (já foi movida para retry)
+                await self.acknowledge(message)
+                
+            else:
+                # Máximo de retries alcançado, envia para DLQ
+                logger.error(
+                    f"Message {message.metadata.message_id} failed after {max_retries} retries, "
+                    f"sending to DLQ",
+                    extra={
+                        "tenant_id": message.metadata.tenant_id,
+                        "queue": message.queue_name,
+                        "error": last_error,
+                        "retry_count": message.metadata.retry_count
+                    }
+                )
+                
+                if self.dead_letter_queue:
+                    await self.dead_letter_queue.store_failed_message(
+                        message=message,
+                        error=last_error,
+                        last_error=last_error,
+                        stack_trace=stack_trace
+                    )
+                
+                if self.metrics:
+                    await self.metrics.increment_counter(
+                        metric_name="queue_processing_failed",
+                        tenant_id=message.metadata.tenant_id,
+                        tags={"queue": message.queue_name}
+                    )
+                
+                # Confirma a mensagem (já foi movida para DLQ)
+                await self.acknowledge(message)
+    
+    async def shutdown(self) -> None:
+        """Desliga a conexão com a fila de forma segura"""
+        self._shutting_down = True
+        logger.info("Queue system shutting down...")
+
+
+class QueueError(Exception):
+    """Exceção base para erros de fila"""
+    
+    def __init__(
+        self, 
+        message: str, 
+        tenant_id: Optional[str] = None,
+        queue_name: Optional[str] = None,
+        original_error: Optional[Exception] = None
+    ):
+        super().__init__(message)
+        self.tenant_id = tenant_id
+        self.queue_name = queue_name
+        self.original_error = original_error
+        self.message = message
+    
+    def __str__(self) -> str:
+        base = f"QueueError: {self.message}"
+        if self.tenant_id:
+            base += f" (tenant: {self.tenant_id})"
+        if self.queue_name:
+            base += f" (queue: {self.queue_name})"
+        return base
+
+
+class QueueConfigurationError(QueueError):
+    """Erro de configuração da fila"""
+    pass
+
+
+class QueuePublishError(QueueError):
+    """Erro ao publicar mensagem"""
+    pass
+
+
+class QueueConsumeError(QueueError):
+    """Erro ao consumir mensagem"""
+    pass
+
+
+class IdempotencyViolationError(QueueError):
+    """Violação de idempotência detectada"""
+    pass

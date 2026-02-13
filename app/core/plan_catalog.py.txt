@@ -1,0 +1,1379 @@
+"""
+Plan Catalog - Sistema de catálogo de planos com versionamento, preços dinâmicos e isolamento por tenant
+
+Princípios:
+1. Planos versionados e imutáveis após publicação
+2. Suporte a preços em múltiplas moedas
+3. Isolamento absoluto por tenant
+4. Rules engine para condições de cobrança
+5. Integração com PricingEngine para cálculos dinâmicos
+"""
+
+import json
+import hashlib
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Any, Set, Tuple, Union
+from decimal import Decimal
+import uuid
+
+from app.models.tenant import Tenant
+from app.core.audit_logger import AuditLogger
+from app.utils.cryptography import encrypt_data, decrypt_data
+from app.core.pricing_engine import PricingEngine, PriceOverride, BillingCycle
+
+
+class PlanStatus(Enum):
+    """Status do plano no catálogo"""
+    DRAFT = "draft"          # Em edição, não visível
+    ACTIVE = "active"        # Ativo e disponível
+    ARCHIVED = "archived"    # Arquivado, não mais vendido
+    DEPRECATED = "deprecated" # Descontinuado, mas existente
+
+
+class PlanVisibility(Enum):
+    """Visibilidade do plano"""
+    PUBLIC = "public"        # Visível para todos
+    PRIVATE = "private"      # Acesso por código/invite
+    INTERNAL = "internal"    # Apenas uso interno
+
+
+class BillingPeriodUnit(Enum):
+    """Unidade de período de cobrança"""
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    QUARTER = "quarter"
+    YEAR = "year"
+    LIFETIME = "lifetime"    # Pagamento único vitalício
+
+
+class FeatureType(Enum):
+    """Tipo de feature/benefício"""
+    BOOLEAN = "boolean"      # Disponível ou não
+    NUMERIC = "numeric"      # Valor numérico (ex: 5GB)
+    ENUM = "enum"            # Valor de lista (ex: gold/silver/bronze)
+    TEXT = "text"            # Texto descritivo
+
+
+@dataclass
+class PlanFeature:
+    """Feature/benefício incluído no plano"""
+    code: str                    # Identificador único (ex: storage_gb)
+    name: str                    # Nome legível (ex: Armazenamento)
+    description: str             # Descrição detalhada
+    feature_type: FeatureType    # Tipo da feature
+    value: Any                   # Valor (True, 10, "premium", etc.)
+    display_order: int = 0       # Ordem de exibição
+    metadata: Dict[str, Any] = field(default_factory=dict)  # Metadados extras
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "code": self.code,
+            "name": self.name,
+            "description": self.description,
+            "type": self.feature_type.value,
+            "value": self.value,
+            "display_order": self.display_order,
+            "metadata": self.metadata
+        }
+
+
+@dataclass
+class PlanPrice:
+    """Preço específico do plano em uma moeda"""
+    currency: str                    # Código ISO da moeda (BRL, USD, EUR)
+    amount: Decimal                  # Valor monetário
+    setup_fee: Optional[Decimal] = None  # Taxa de setup
+    trial_days: int = 0              # Dias de trial gratuito
+    billing_period: int = 1          # Período (ex: 1 mês)
+    billing_period_unit: BillingPeriodUnit = BillingPeriodUnit.MONTH
+    
+    # Regras especiais
+    is_prorated: bool = True         # Cobrança proporcional
+    minimum_periods: Optional[int] = None  # Mínimo de períodos
+    maximum_periods: Optional[int] = None  # Máximo de períodos
+    
+    # Descontos e promoções
+    discount_amount: Optional[Decimal] = None  # Valor fixo de desconto
+    discount_percentage: Optional[Decimal] = None  # Percentual de desconto
+    valid_from: Optional[date] = None         # Vigência início
+    valid_to: Optional[date] = None           # Vigência fim
+    
+    def calculate_amount(
+        self,
+        proration_days: Optional[int] = None
+    ) -> Decimal:
+        """Calcula valor considerando prorata e descontos"""
+        amount = self.amount
+        
+        # Aplica desconto percentual
+        if self.discount_percentage:
+            discount = amount * (self.discount_percentage / Decimal('100'))
+            amount = amount - discount
+        
+        # Aplica desconto fixo
+        if self.discount_amount:
+            amount = amount - self.discount_amount
+        
+        # Garante que não seja negativo
+        if amount < Decimal('0'):
+            amount = Decimal('0')
+        
+        # Aplica prorata se necessário
+        if self.is_prorated and proration_days:
+            if self.billing_period_unit == BillingPeriodUnit.MONTH:
+                days_in_period = 30  # Simplificação
+                daily_rate = amount / Decimal(days_in_period)
+                amount = daily_rate * Decimal(proration_days)
+            # Adicionar lógica para outras unidades
+        
+        return amount.quantize(Decimal('0.01'))
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "currency": self.currency,
+            "amount": str(self.amount),
+            "setup_fee": str(self.setup_fee) if self.setup_fee else None,
+            "trial_days": self.trial_days,
+            "billing_period": self.billing_period,
+            "billing_period_unit": self.billing_period_unit.value,
+            "is_prorated": self.is_prorated,
+            "minimum_periods": self.minimum_periods,
+            "maximum_periods": self.maximum_periods,
+            "discount_amount": str(self.discount_amount) if self.discount_amount else None,
+            "discount_percentage": str(self.discount_percentage) if self.discount_percentage else None,
+            "valid_from": self.valid_from.isoformat() if self.valid_from else None,
+            "valid_to": self.valid_to.isoformat() if self.valid_to else None
+        }
+
+
+@dataclass
+class PlanVersion:
+    """Versão específica de um plano"""
+    version_id: str                    # ID único da versão
+    plan_id: str                       # ID do plano
+    tenant_id: str                     # Tenant dono
+    name: str                          # Nome do plano
+    description: str                   # Descrição detalhada
+    features: List[PlanFeature]        # Lista de features
+    prices: List[PlanPrice]            # Lista de preços por moeda
+    metadata: Dict[str, Any] = field(default_factory=dict)  # Metadados
+    terms_and_conditions: str = ""     # Termos e condições
+    tags: List[str] = field(default_factory=list)  # Tags para busca
+    checksum: str = ""                 # Checksum para validação
+    is_active: bool = True             # Versão ativa
+    is_immutable: bool = True          # Imutável após publicação
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_by: Optional[str] = None
+    published_at: Optional[datetime] = None
+    deprecated_at: Optional[datetime] = None
+    
+    def validate(self) -> bool:
+        """Valida integridade da versão"""
+        # Calcula checksum atual
+        content = json.dumps({
+            "name": self.name,
+            "description": self.description,
+            "features": [f.to_dict() for f in self.features],
+            "prices": [p.to_dict() for p in self.prices],
+            "metadata": self.metadata,
+            "terms": self.terms_and_conditions
+        }, sort_keys=True)
+        
+        current_checksum = hashlib.sha256(content.encode()).hexdigest()
+        return current_checksum == self.checksum
+    
+    def get_price(self, currency: str) -> Optional[PlanPrice]:
+        """Obtém preço para moeda específica"""
+        for price in self.prices:
+            if price.currency == currency:
+                return price
+        return None
+    
+    def get_feature(self, feature_code: str) -> Optional[PlanFeature]:
+        """Obtém feature específica"""
+        for feature in self.features:
+            if feature.code == feature_code:
+                return feature
+        return None
+    
+    def to_dict(self, include_content: bool = True) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        data = {
+            "version_id": self.version_id,
+            "plan_id": self.plan_id,
+            "tenant_id": self.tenant_id,
+            "name": self.name,
+            "description": self.description,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat(),
+            "created_by": self.created_by,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
+            "deprecated_at": self.deprecated_at.isoformat() if self.deprecated_at else None,
+            "tags": self.tags,
+            "checksum": self.checksum
+        }
+        
+        if include_content:
+            data.update({
+                "features": [f.to_dict() for f in self.features],
+                "prices": [p.to_dict() for p in self.prices],
+                "metadata": self.metadata,
+                "terms_and_conditions": self.terms_and_conditions
+            })
+        
+        return data
+
+
+@dataclass
+class Plan:
+    """Plano com múltiplas versões"""
+    plan_id: str                    # ID único do plano
+    tenant_id: str                  # Tenant dono
+    code: str                       # Código único (ex: "pro_monthly")
+    name: str                       # Nome do plano
+    description: str                # Descrição curta
+    status: PlanStatus              # Status atual
+    visibility: PlanVisibility      # Visibilidade
+    current_version: Optional[str] = None  # Versão ativa
+    versions: Dict[str, PlanVersion] = field(default_factory=dict)  # Todas versões
+    category: str = "default"       # Categoria para organização
+    tags: List[str] = field(default_factory=list)  # Tags para filtro
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    
+    # Relacionamentos
+    parent_plan_id: Optional[str] = None  # Plano pai (para upsells)
+    upgrade_paths: List[str] = field(default_factory=list)  # Planos para upgrade
+    
+    def get_version(self, version_id: Optional[str] = None) -> Optional[PlanVersion]:
+        """Obtém versão específica ou a atual"""
+        if version_id:
+            return self.versions.get(version_id)
+        elif self.current_version:
+            return self.versions.get(self.current_version)
+        return None
+    
+    def add_version(self, version: PlanVersion) -> bool:
+        """Adiciona nova versão do plano"""
+        if version.plan_id != self.plan_id or version.tenant_id != self.tenant_id:
+            return False
+        
+        if version.version_id in self.versions:
+            return False
+        
+        self.versions[version.version_id] = version
+        self.current_version = version.version_id
+        self.updated_at = datetime.utcnow()
+        return True
+    
+    def publish_version(self, version_id: str, published_by: str) -> bool:
+        """Publica uma versão do plano"""
+        version = self.versions.get(version_id)
+        if not version:
+            return False
+        
+        version.published_at = datetime.utcnow()
+        version.created_by = published_by
+        version.is_active = True
+        
+        # Torna versões anteriores inativas
+        for v in self.versions.values():
+            if v.version_id != version_id and v.is_active:
+                v.is_active = False
+        
+        self.current_version = version_id
+        self.updated_at = datetime.utcnow()
+        return True
+    
+    def deprecate_version(self, version_id: str, deprecated_by: str) -> bool:
+        """Deprecia uma versão do plano"""
+        version = self.versions.get(version_id)
+        if not version:
+            return False
+        
+        version.deprecated_at = datetime.utcnow()
+        version.is_active = False
+        
+        if self.current_version == version_id:
+            # Encontra última versão ativa
+            active_versions = [
+                v for v in self.versions.values() 
+                if v.is_active and v.version_id != version_id
+            ]
+            if active_versions:
+                self.current_version = max(
+                    active_versions, 
+                    key=lambda v: v.published_at or v.created_at
+                ).version_id
+            else:
+                self.current_version = None
+        
+        self.updated_at = datetime.utcnow()
+        return True
+    
+    def to_dict(self, include_versions: bool = False) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        data = {
+            "plan_id": self.plan_id,
+            "tenant_id": self.tenant_id,
+            "code": self.code,
+            "name": self.name,
+            "description": self.description,
+            "status": self.status.value,
+            "visibility": self.visibility.value,
+            "current_version": self.current_version,
+            "category": self.category,
+            "tags": self.tags,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "parent_plan_id": self.parent_plan_id,
+            "upgrade_paths": self.upgrade_paths
+        }
+        
+        if include_versions:
+            data["versions"] = {
+                v_id: v.to_dict(include_content=False)
+                for v_id, v in self.versions.items()
+            }
+        
+        return data
+
+
+class PlanValidationError(Exception):
+    """Erro de validação do plano"""
+    pass
+
+
+class PlanNotFoundError(Exception):
+    """Plano não encontrado"""
+    pass
+
+
+class CurrencyNotSupportedError(Exception):
+    """Moeda não suportada pelo plano"""
+    pass
+
+
+class PlanCatalog:
+    """
+    Catálogo principal de planos com versionamento
+    """
+    
+    def __init__(
+        self,
+        audit_logger: AuditLogger,
+        pricing_engine: Optional[PricingEngine] = None
+    ):
+        self.audit_logger = audit_logger
+        self.pricing_engine = pricing_engine
+        
+        # Armazenamento em memória (em produção, seria banco)
+        self._plans: Dict[str, Dict[str, Plan]] = {}  # tenant_id -> {plan_id -> Plan}
+        self._plan_codes: Dict[str, Dict[str, str]] = {}  # tenant_id -> {code -> plan_id}
+        
+        # Cache para buscas frequentes
+        self._cache = {}
+        self._cache_ttl = 300  # 5 minutos
+        
+        # Inicializa com planos padrão
+        self._initialize_default_plans()
+    
+    def _initialize_default_plans(self):
+        """Inicializa planos padrão do sistema"""
+        default_tenant = "system"
+        
+        # Plano gratuito padrão
+        free_plan = self._create_default_free_plan()
+        self._add_plan_to_store(default_tenant, free_plan)
+        
+        # Plano básico
+        basic_plan = self._create_default_basic_plan()
+        self._add_plan_to_store(default_tenant, basic_plan)
+        
+        # Plano profissional
+        pro_plan = self._create_default_pro_plan()
+        self._add_plan_to_store(default_tenant, pro_plan)
+    
+    def _create_default_free_plan(self) -> Plan:
+        """Cria plano gratuito padrão"""
+        plan_id = f"plan_{uuid.uuid4().hex[:16]}"
+        
+        # Features do plano gratuito
+        features = [
+            PlanFeature(
+                code="storage_gb",
+                name="Armazenamento",
+                description="Espaço de armazenamento em GB",
+                feature_type=FeatureType.NUMERIC,
+                value=1
+            ),
+            PlanFeature(
+                code="users",
+                name="Usuários",
+                description="Número máximo de usuários",
+                feature_type=FeatureType.NUMERIC,
+                value=1
+            ),
+            PlanFeature(
+                code="support",
+                name="Suporte",
+                description="Tipo de suporte incluído",
+                feature_type=FeatureType.ENUM,
+                value="community"
+            )
+        ]
+        
+        # Preços (apenas USD para plano padrão)
+        prices = [
+            PlanPrice(
+                currency="USD",
+                amount=Decimal('0'),
+                billing_period=1,
+                billing_period_unit=BillingPeriodUnit.MONTH,
+                trial_days=0
+            )
+        ]
+        
+        # Cria versão
+        version_id = "v1.0.0"
+        version = PlanVersion(
+            version_id=version_id,
+            plan_id=plan_id,
+            tenant_id="system",
+            name="Plano Gratuito",
+            description="Plano gratuito com recursos básicos",
+            features=features,
+            prices=prices,
+            tags=["free", "basic", "default"],
+            created_by="system"
+        )
+        
+        # Calcula checksum
+        self._calculate_version_checksum(version)
+        
+        # Cria plano
+        plan = Plan(
+            plan_id=plan_id,
+            tenant_id="system",
+            code="free",
+            name="Plano Gratuito",
+            description="Plano gratuito com recursos básicos",
+            status=PlanStatus.ACTIVE,
+            visibility=PlanVisibility.PUBLIC,
+            category="default",
+            tags=["free", "basic", "default"]
+        )
+        
+        plan.add_version(version)
+        plan.publish_version(version_id, "system")
+        
+        return plan
+    
+    def _create_default_basic_plan(self) -> Plan:
+        """Cria plano básico padrão"""
+        plan_id = f"plan_{uuid.uuid4().hex[:16]}"
+        
+        features = [
+            PlanFeature(
+                code="storage_gb",
+                name="Armazenamento",
+                description="Espaço de armazenamento em GB",
+                feature_type=FeatureType.NUMERIC,
+                value=10
+            ),
+            PlanFeature(
+                code="users",
+                name="Usuários",
+                description="Número máximo de usuários",
+                feature_type=FeatureType.NUMERIC,
+                value=3
+            ),
+            PlanFeature(
+                code="support",
+                name="Suporte",
+                description="Tipo de suporte incluído",
+                feature_type=FeatureType.ENUM,
+                value="email"
+            ),
+            PlanFeature(
+                code="api_calls",
+                name="Chamadas API",
+                description="Chamadas API por mês",
+                feature_type=FeatureType.NUMERIC,
+                value=1000
+            )
+        ]
+        
+        prices = [
+            PlanPrice(
+                currency="USD",
+                amount=Decimal('9.99'),
+                billing_period=1,
+                billing_period_unit=BillingPeriodUnit.MONTH,
+                trial_days=14
+            ),
+            PlanPrice(
+                currency="USD",
+                amount=Decimal('99.99'),
+                billing_period=1,
+                billing_period_unit=BillingPeriodUnit.YEAR,
+                discount_percentage=Decimal('16.67'),  # ~2 meses grátis
+                trial_days=14
+            )
+        ]
+        
+        version_id = "v1.0.0"
+        version = PlanVersion(
+            version_id=version_id,
+            plan_id=plan_id,
+            tenant_id="system",
+            name="Plano Básico",
+            description="Plano básico para pequenas equipes",
+            features=features,
+            prices=prices,
+            tags=["basic", "team", "default"],
+            created_by="system"
+        )
+        
+        self._calculate_version_checksum(version)
+        
+        plan = Plan(
+            plan_id=plan_id,
+            tenant_id="system",
+            code="basic",
+            name="Plano Básico",
+            description="Plano básico para pequenas equipes",
+            status=PlanStatus.ACTIVE,
+            visibility=PlanVisibility.PUBLIC,
+            category="default",
+            tags=["basic", "team", "default"],
+            parent_plan_id=None
+        )
+        
+        plan.add_version(version)
+        plan.publish_version(version_id, "system")
+        
+        return plan
+    
+    def _create_default_pro_plan(self) -> Plan:
+        """Cria plano profissional padrão"""
+        plan_id = f"plan_{uuid.uuid4().hex[:16]}"
+        
+        features = [
+            PlanFeature(
+                code="storage_gb",
+                name="Armazenamento",
+                description="Espaço de armazenamento em GB",
+                feature_type=FeatureType.NUMERIC,
+                value=100
+            ),
+            PlanFeature(
+                code="users",
+                name="Usuários",
+                description="Número máximo de usuários",
+                feature_type=FeatureType.NUMERIC,
+                value=10
+            ),
+            PlanFeature(
+                code="support",
+                name="Suporte",
+                description="Tipo de suporte incluído",
+                feature_type=FeatureType.ENUM,
+                value="priority"
+            ),
+            PlanFeature(
+                code="api_calls",
+                name="Chamadas API",
+                description="Chamadas API por mês",
+                feature_type=FeatureType.NUMERIC,
+                value=10000
+            ),
+            PlanFeature(
+                code="custom_domain",
+                name="Domínio Personalizado",
+                description="Suporte a domínio personalizado",
+                feature_type=FeatureType.BOOLEAN,
+                value=True
+            ),
+            PlanFeature(
+                code="white_label",
+                name="White Label",
+                description="Remoção de marca",
+                feature_type=FeatureType.BOOLEAN,
+                value=True
+            )
+        ]
+        
+        prices = [
+            PlanPrice(
+                currency="USD",
+                amount=Decimal('29.99'),
+                billing_period=1,
+                billing_period_unit=BillingPeriodUnit.MONTH,
+                trial_days=14
+            ),
+            PlanPrice(
+                currency="USD",
+                amount=Decimal('299.99'),
+                billing_period=1,
+                billing_period_unit=BillingPeriodUnit.YEAR,
+                discount_percentage=Decimal('16.67'),
+                trial_days=14
+            )
+        ]
+        
+        version_id = "v1.0.0"
+        version = PlanVersion(
+            version_id=version_id,
+            plan_id=plan_id,
+            tenant_id="system",
+            name="Plano Profissional",
+            description="Plano profissional para empresas",
+            features=features,
+            prices=prices,
+            tags=["pro", "business", "default"],
+            created_by="system"
+        )
+        
+        self._calculate_version_checksum(version)
+        
+        plan = Plan(
+            plan_id=plan_id,
+            tenant_id="system",
+            code="pro",
+            name="Plano Profissional",
+            description="Plano profissional para empresas",
+            status=PlanStatus.ACTIVE,
+            visibility=PlanVisibility.PUBLIC,
+            category="default",
+            tags=["pro", "business", "default"],
+            parent_plan_id="basic"  # Upgrade do básico
+        )
+        
+        plan.add_version(version)
+        plan.publish_version(version_id, "system")
+        
+        return plan
+    
+    def _calculate_version_checksum(self, version: PlanVersion) -> None:
+        """Calcula e atribui checksum da versão"""
+        content = json.dumps({
+            "name": version.name,
+            "description": version.description,
+            "features": [f.to_dict() for f in version.features],
+            "prices": [p.to_dict() for p in version.prices],
+            "metadata": version.metadata,
+            "terms": version.terms_and_conditions
+        }, sort_keys=True)
+        
+        version.checksum = hashlib.sha256(content.encode()).hexdigest()
+    
+    def _add_plan_to_store(self, tenant_id: str, plan: Plan) -> None:
+        """Adiciona plano ao armazenamento interno"""
+        if tenant_id not in self._plans:
+            self._plans[tenant_id] = {}
+            self._plan_codes[tenant_id] = {}
+        
+        self._plans[tenant_id][plan.plan_id] = plan
+        self._plan_codes[tenant_id][plan.code] = plan.plan_id
+    
+    async def create_plan(
+        self,
+        tenant: Tenant,
+        code: str,
+        name: str,
+        description: str,
+        status: PlanStatus,
+        visibility: PlanVisibility,
+        category: str,
+        tags: List[str],
+        created_by: str,
+        parent_plan_id: Optional[str] = None,
+        upgrade_paths: Optional[List[str]] = None
+    ) -> Plan:
+        """
+        Cria novo plano (sem versões ainda)
+        """
+        # Valida unicidade do código
+        existing_plan = await self.get_plan_by_code(tenant, code)
+        if existing_plan:
+            raise PlanValidationError(f"Plano com código '{code}' já existe")
+        
+        # Gera ID único
+        plan_id = f"plan_{uuid.uuid4().hex[:16]}"
+        
+        # Cria plano
+        plan = Plan(
+            plan_id=plan_id,
+            tenant_id=tenant.tenant_id,
+            code=code,
+            name=name,
+            description=description,
+            status=status,
+            visibility=visibility,
+            category=category,
+            tags=tags,
+            parent_plan_id=parent_plan_id,
+            upgrade_paths=upgrade_paths or []
+        )
+        
+        # Adiciona ao armazenamento
+        self._add_plan_to_store(tenant.tenant_id, plan)
+        
+        # Audit log
+        await self.audit_logger.log(
+            tenant_id=tenant.tenant_id,
+            user_id=created_by,
+            action="plan.create",
+            resource_type="plan",
+            resource_id=plan_id,
+            metadata={
+                "code": code,
+                "name": name,
+                "status": status.value,
+                "visibility": visibility.value,
+                "category": category
+            }
+        )
+        
+        return plan
+    
+    async def create_plan_version(
+        self,
+        tenant: Tenant,
+        plan_id: str,
+        name: str,
+        description: str,
+        features: List[Dict[str, Any]],
+        prices: List[Dict[str, Any]],
+        metadata: Dict[str, Any],
+        terms_and_conditions: str,
+        tags: List[str],
+        created_by: str,
+        version_tag: Optional[str] = None
+    ) -> PlanVersion:
+        """
+        Cria nova versão de um plano
+        """
+        # Obtém plano
+        plan = await self.get_plan(tenant, plan_id)
+        if not plan:
+            raise PlanNotFoundError(f"Plano '{plan_id}' não encontrado")
+        
+        # Valida se plano pode receber novas versões
+        if plan.status == PlanStatus.ARCHIVED:
+            raise PlanValidationError("Plano arquivado não pode receber novas versões")
+        
+        # Converte features
+        plan_features = []
+        for feat_data in features:
+            feature = PlanFeature(
+                code=feat_data["code"],
+                name=feat_data["name"],
+                description=feat_data["description"],
+                feature_type=FeatureType(feat_data.get("type", "boolean")),
+                value=feat_data["value"],
+                display_order=feat_data.get("display_order", 0),
+                metadata=feat_data.get("metadata", {})
+            )
+            plan_features.append(feature)
+        
+        # Converte prices
+        plan_prices = []
+        for price_data in prices:
+            price = PlanPrice(
+                currency=price_data["currency"],
+                amount=Decimal(str(price_data["amount"])),
+                setup_fee=Decimal(str(price_data["setup_fee"])) if price_data.get("setup_fee") else None,
+                trial_days=price_data.get("trial_days", 0),
+                billing_period=price_data.get("billing_period", 1),
+                billing_period_unit=BillingPeriodUnit(price_data.get("billing_period_unit", "month")),
+                is_prorated=price_data.get("is_prorated", True),
+                minimum_periods=price_data.get("minimum_periods"),
+                maximum_periods=price_data.get("maximum_periods"),
+                discount_amount=Decimal(str(price_data["discount_amount"])) if price_data.get("discount_amount") else None,
+                discount_percentage=Decimal(str(price_data["discount_percentage"])) if price_data.get("discount_percentage") else None,
+                valid_from=datetime.fromisoformat(price_data["valid_from"]) if price_data.get("valid_from") else None,
+                valid_to=datetime.fromisoformat(price_data["valid_to"]) if price_data.get("valid_to") else None
+            )
+            plan_prices.append(price)
+        
+        # Gera tag de versão
+        if not version_tag:
+            current_version = plan.get_version()
+            if current_version:
+                # Incrementa versão
+                base_version = current_version.version_id
+                if base_version.startswith('v'):
+                    try:
+                        parts = base_version[1:].split('.')
+                        major, minor = int(parts[0]), int(parts[1])
+                        patch = int(parts[2]) if len(parts) > 2 else 0
+                        version_tag = f"v{major}.{minor + 1}.0"
+                    except:
+                        version_tag = f"{base_version}.1"
+                else:
+                    version_tag = f"{base_version}_v2"
+            else:
+                version_tag = "v1.0.0"
+        
+        # Cria versão
+        version = PlanVersion(
+            version_id=version_tag,
+            plan_id=plan_id,
+            tenant_id=tenant.tenant_id,
+            name=name,
+            description=description,
+            features=plan_features,
+            prices=plan_prices,
+            metadata=metadata,
+            terms_and_conditions=terms_and_conditions,
+            tags=tags,
+            created_by=created_by
+        )
+        
+        # Calcula checksum
+        self._calculate_version_checksum(version)
+        
+        # Adiciona ao plano
+        if not plan.add_version(version):
+            raise PlanValidationError(f"Falha ao adicionar versão '{version_tag}'")
+        
+        # Audit log
+        await self.audit_logger.log(
+            tenant_id=tenant.tenant_id,
+            user_id=created_by,
+            action="plan.version.create",
+            resource_type="plan",
+            resource_id=plan_id,
+            metadata={
+                "version": version_tag,
+                "plan_name": plan.name,
+                "features_count": len(plan_features),
+                "prices_count": len(plan_prices)
+            }
+        )
+        
+        return version
+    
+    async def publish_plan_version(
+        self,
+        tenant: Tenant,
+        plan_id: str,
+        version_id: str,
+        published_by: str
+    ) -> bool:
+        """
+        Publica uma versão do plano
+        """
+        plan = await self.get_plan(tenant, plan_id)
+        if not plan:
+            raise PlanNotFoundError(f"Plano '{plan_id}' não encontrado")
+        
+        # Valida versão
+        version = plan.get_version(version_id)
+        if not version:
+            raise PlanValidationError(f"Versão '{version_id}' não encontrada")
+        
+        # Valida integridade
+        if not version.validate():
+            raise PlanValidationError("Checksum inválido da versão")
+        
+        # Publica
+        success = plan.publish_version(version_id, published_by)
+        
+        if success:
+            # Atualiza status do plano
+            if plan.status == PlanStatus.DRAFT:
+                plan.status = PlanStatus.ACTIVE
+            
+            # Audit log
+            await self.audit_logger.log(
+                tenant_id=tenant.tenant_id,
+                user_id=published_by,
+                action="plan.version.publish",
+                resource_type="plan",
+                resource_id=plan_id,
+                metadata={
+                    "version": version_id,
+                    "plan_name": plan.name
+                }
+            )
+        
+        return success
+    
+    async def get_plan(
+        self,
+        tenant: Tenant,
+        plan_id: str,
+        include_versions: bool = False
+    ) -> Optional[Plan]:
+        """
+        Obtém plano específico
+        """
+        # Tenta do tenant específico
+        tenant_plans = self._plans.get(tenant.tenant_id, {})
+        plan = tenant_plans.get(plan_id)
+        
+        if not plan:
+            # Tenta do sistema
+            system_plans = self._plans.get("system", {})
+            plan = system_plans.get(plan_id)
+        
+        return plan
+    
+    async def get_plan_by_code(
+        self,
+        tenant: Tenant,
+        code: str
+    ) -> Optional[Plan]:
+        """
+        Obtém plano pelo código
+        """
+        # Tenta do tenant
+        tenant_codes = self._plan_codes.get(tenant.tenant_id, {})
+        plan_id = tenant_codes.get(code)
+        
+        if plan_id:
+            return await self.get_plan(tenant, plan_id)
+        
+        # Tenta do sistema
+        system_codes = self._plan_codes.get("system", {})
+        plan_id = system_codes.get(code)
+        
+        if plan_id:
+            return await self.get_plan(tenant, plan_id)
+        
+        return None
+    
+    async def list_plans(
+        self,
+        tenant: Tenant,
+        status: Optional[PlanStatus] = None,
+        visibility: Optional[PlanVisibility] = None,
+        category: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        include_system: bool = True
+    ) -> List[Plan]:
+        """
+        Lista planos disponíveis
+        """
+        plans = []
+        
+        # Planos do tenant
+        tenant_plans = self._plans.get(tenant.tenant_id, {}).values()
+        plans.extend(tenant_plans)
+        
+        # Planos do sistema (se permitido)
+        if include_system:
+            system_plans = self._plans.get("system", {}).values()
+            plans.extend(system_plans)
+        
+        # Filtros
+        filtered = []
+        for plan in plans:
+            if status and plan.status != status:
+                continue
+            
+            if visibility and plan.visibility != visibility:
+                continue
+            
+            if category and plan.category != category:
+                continue
+            
+            if tags and not any(tag in plan.tags for tag in tags):
+                continue
+            
+            filtered.append(plan)
+        
+        return filtered
+    
+    async def calculate_price(
+        self,
+        tenant: Tenant,
+        plan_id: str,
+        currency: str,
+        version_id: Optional[str] = None,
+        proration_days: Optional[int] = None,
+        override_params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Calcula preço do plano considerando regras e overrides
+        """
+        # Obtém plano e versão
+        plan = await self.get_plan(tenant, plan_id)
+        if not plan:
+            raise PlanNotFoundError(f"Plano '{plan_id}' não encontrado")
+        
+        version = plan.get_version(version_id)
+        if not version:
+            raise PlanValidationError(f"Versão '{version_id or 'current'}' não encontrada")
+        
+        # Obtém preço base
+        price = version.get_price(currency)
+        if not price:
+            raise CurrencyNotSupportedError(f"Moeda '{currency}' não suportada pelo plano")
+        
+        # Calcula valor base
+        base_amount = price.calculate_amount(proration_days)
+        
+        # Aplica pricing engine se disponível
+        final_amount = base_amount
+        adjustments = []
+        
+        if self.pricing_engine:
+            override = PriceOverride(
+                tenant_id=tenant.tenant_id,
+                plan_id=plan_id,
+                currency=currency,
+                base_amount=base_amount,
+                proration_days=proration_days,
+                override_params=override_params or {}
+            )
+            
+            result = await self.pricing_engine.calculate_price(override)
+            final_amount = result.final_amount
+            adjustments = result.adjustments
+        
+        return {
+            "plan_id": plan_id,
+            "version_id": version.version_id,
+            "plan_name": version.name,
+            "currency": currency,
+            "base_amount": str(base_amount),
+            "final_amount": str(final_amount),
+            "billing_period": price.billing_period,
+            "billing_period_unit": price.billing_period_unit.value,
+            "trial_days": price.trial_days,
+            "is_prorated": price.is_prorated,
+            "adjustments": adjustments,
+            "features": [f.to_dict() for f in version.features]
+        }
+    
+    async def compare_plans(
+        self,
+        tenant: Tenant,
+        plan_ids: List[str],
+        currency: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Compara múltiplos planos
+        """
+        plans_data = []
+        all_features = set()
+        
+        for plan_id in plan_ids:
+            plan = await self.get_plan(tenant, plan_id)
+            if not plan:
+                continue
+            
+            version = plan.get_version()
+            if not version:
+                continue
+            
+            # Coleta features
+            plan_features = {}
+            for feature in version.features:
+                plan_features[feature.code] = feature.value
+                all_features.add(feature.code)
+            
+            # Preços
+            prices_data = []
+            if currency:
+                price = version.get_price(currency)
+                if price:
+                    prices_data.append({
+                        "currency": currency,
+                        "amount": str(price.amount),
+                        "billing_period": f"{price.billing_period} {price.billing_period_unit.value}"
+                    })
+            else:
+                for price in version.prices[:3]:  # Limita a 3 moedas
+                    prices_data.append({
+                        "currency": price.currency,
+                        "amount": str(price.amount),
+                        "billing_period": f"{price.billing_period} {price.billing_period_unit.value}"
+                    })
+            
+            plans_data.append({
+                "plan_id": plan_id,
+                "code": plan.code,
+                "name": version.name,
+                "description": version.description,
+                "status": plan.status.value,
+                "features": plan_features,
+                "prices": prices_data,
+                "tags": version.tags
+            })
+        
+        # Matriz de comparação
+        comparison_matrix = []
+        for feature_code in sorted(all_features):
+            row = {"feature": feature_code}
+            for plan_data in plans_data:
+                row[plan_data["code"]] = plan_data["features"].get(feature_code, "-")
+            comparison_matrix.append(row)
+        
+        return {
+            "plans": plans_data,
+            "comparison_matrix": comparison_matrix,
+            "currency": currency,
+            "feature_count": len(all_features),
+            "plan_count": len(plans_data)
+        }
+    
+    async def update_plan_status(
+        self,
+        tenant: Tenant,
+        plan_id: str,
+        new_status: PlanStatus,
+        updated_by: str,
+        reason: Optional[str] = None
+    ) -> bool:
+        """
+        Atualiza status do plano
+        """
+        plan = await self.get_plan(tenant, plan_id)
+        if not plan:
+            raise PlanNotFoundError(f"Plano '{plan_id}' não encontrado")
+        
+        old_status = plan.status
+        plan.status = new_status
+        plan.updated_at = datetime.utcnow()
+        
+        # Audit log
+        await self.audit_logger.log(
+            tenant_id=tenant.tenant_id,
+            user_id=updated_by,
+            action="plan.status.update",
+            resource_type="plan",
+            resource_id=plan_id,
+            metadata={
+                "old_status": old_status.value,
+                "new_status": new_status.value,
+                "reason": reason,
+                "plan_name": plan.name
+            }
+        )
+        
+        return True
+    
+    async def export_plan(
+        self,
+        tenant: Tenant,
+        plan_id: str,
+        include_versions: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Exporta plano para formato portável
+        """
+        plan = await self.get_plan(tenant, plan_id)
+        if not plan:
+            raise PlanNotFoundError(f"Plano '{plan_id}' não encontrado")
+        
+        export_data = plan.to_dict(include_versions=False)
+        
+        if include_versions:
+            export_data["versions"] = {}
+            for version_id, version in plan.versions.items():
+                export_data["versions"][version_id] = version.to_dict(include_content=True)
+        
+        return export_data
+    
+    async def import_plan(
+        self,
+        tenant: Tenant,
+        import_data: Dict[str, Any],
+        imported_by: str
+    ) -> Plan:
+        """
+        Importa plano de formato portável
+        """
+        # Valida dados
+        required_fields = ["plan_id", "code", "name", "description", "status", "visibility"]
+        for field in required_fields:
+            if field not in import_data:
+                raise PlanValidationError(f"Campo obrigatório faltando: {field}")
+        
+        # Verifica se plano já existe
+        existing = await self.get_plan_by_code(tenant, import_data["code"])
+        if existing:
+            raise PlanValidationError(f"Plano com código '{import_data['code']}' já existe")
+        
+        # Cria plano
+        plan = Plan(
+            plan_id=import_data["plan_id"],
+            tenant_id=tenant.tenant_id,
+            code=import_data["code"],
+            name=import_data["name"],
+            description=import_data["description"],
+            status=PlanStatus(import_data["status"]),
+            visibility=PlanVisibility(import_data["visibility"]),
+            category=import_data.get("category", "default"),
+            tags=import_data.get("tags", []),
+            parent_plan_id=import_data.get("parent_plan_id"),
+            upgrade_paths=import_data.get("upgrade_paths", [])
+        )
+        
+        # Importa versões
+        if "versions" in import_data:
+            for version_id, version_data in import_data["versions"].items():
+                # Converte features
+                features = []
+                for feat_data in version_data["features"]:
+                    feature = PlanFeature(
+                        code=feat_data["code"],
+                        name=feat_data["name"],
+                        description=feat_data["description"],
+                        feature_type=FeatureType(feat_data["type"]),
+                        value=feat_data["value"],
+                        display_order=feat_data.get("display_order", 0),
+                        metadata=feat_data.get("metadata", {})
+                    )
+                    features.append(feature)
+                
+                # Converte prices
+                prices = []
+                for price_data in version_data["prices"]:
+                    price = PlanPrice(
+                        currency=price_data["currency"],
+                        amount=Decimal(price_data["amount"]),
+                        setup_fee=Decimal(price_data["setup_fee"]) if price_data.get("setup_fee") else None,
+                        trial_days=price_data.get("trial_days", 0),
+                        billing_period=price_data.get("billing_period", 1),
+                        billing_period_unit=BillingPeriodUnit(price_data.get("billing_period_unit", "month")),
+                        is_prorated=price_data.get("is_prorated", True),
+                        minimum_periods=price_data.get("minimum_periods"),
+                        maximum_periods=price_data.get("maximum_periods"),
+                        discount_amount=Decimal(price_data["discount_amount"]) if price_data.get("discount_amount") else None,
+                        discount_percentage=Decimal(price_data["discount_percentage"]) if price_data.get("discount_percentage") else None,
+                        valid_from=datetime.fromisoformat(price_data["valid_from"]) if price_data.get("valid_from") else None,
+                        valid_to=datetime.fromisoformat(price_data["valid_to"]) if price_data.get("valid_to") else None
+                    )
+                    prices.append(price)
+                
+                version = PlanVersion(
+                    version_id=version_id,
+                    plan_id=import_data["plan_id"],
+                    tenant_id=tenant.tenant_id,
+                    name=version_data["name"],
+                    description=version_data["description"],
+                    features=features,
+                    prices=prices,
+                    metadata=version_data.get("metadata", {}),
+                    terms_and_conditions=version_data.get("terms_and_conditions", ""),
+                    tags=version_data.get("tags", []),
+                    checksum=version_data["checksum"],
+                    is_active=version_data.get("is_active", True),
+                    created_by=imported_by,
+                    published_at=datetime.fromisoformat(version_data["published_at"]) if version_data.get("published_at") else None,
+                    deprecated_at=datetime.fromisoformat(version_data["deprecated_at"]) if version_data.get("deprecated_at") else None
+                )
+                
+                plan.add_version(version)
+        
+        # Adiciona ao catálogo
+        self._add_plan_to_store(tenant.tenant_id, plan)
+        
+        # Audit log
+        await self.audit_logger.log(
+            tenant_id=tenant.tenant_id,
+            user_id=imported_by,
+            action="plan.import",
+            resource_type="plan",
+            resource_id=plan.plan_id,
+            metadata={
+                "code": plan.code,
+                "name": plan.name,
+                "versions_imported": len(import_data.get("versions", {})),
+                "source": "import"
+            }
+        )
+        
+        return plan
+    
+    async def get_upgrade_paths(
+        self,
+        tenant: Tenant,
+        from_plan_id: str,
+        currency: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Obtém caminhos de upgrade a partir de um plano
+        """
+        plan = await self.get_plan(tenant, from_plan_id)
+        if not plan:
+            raise PlanNotFoundError(f"Plano '{from_plan_id}' não encontrado")
+        
+        upgrade_paths = []
+        
+        # Planos definidos como upgrade paths
+        for target_plan_id in plan.upgrade_paths:
+            target_plan = await self.get_plan(tenant, target_plan_id)
+            if target_plan and target_plan.status == PlanStatus.ACTIVE:
+                upgrade_paths.append(await self._calculate_upgrade_details(
+                    tenant, plan, target_plan, currency
+                ))
+        
+        # Planos que têm este como parent
+        tenant_plans = self._plans.get(tenant.tenant_id, {})
+        for target_plan in tenant_plans.values():
+            if (target_plan.parent_plan_id == from_plan_id and 
+                target_plan.status == PlanStatus.ACTIVE and
+                target_plan.plan_id not in plan.upgrade_paths):
+                upgrade_paths.append(await self._calculate_upgrade_details(
+                    tenant, plan, target_plan, currency
+                ))
+        
+        # Ordena por preço
+        upgrade_paths.sort(key=lambda x: Decimal(x.get("price_difference", "0")))
+        
+        return upgrade_paths
+    
+    async def _calculate_upgrade_details(
+        self,
+        tenant: Tenant,
+        from_plan: Plan,
+        to_plan: Plan,
+        currency: Optional[str]
+    ) -> Dict[str, Any]:
+        """Calcula detalhes do upgrade"""
+        from_version = from_plan.get_version()
+        to_version = to_plan.get_version()
+        
+        if not from_version or not to_version:
+            return {}
+        
+        # Compara features
+        feature_comparison = {}
+        for feature in to_version.features:
+            from_feature = from_version.get_feature(feature.code)
+            feature_comparison[feature.code] = {
+                "from": from_feature.value if from_feature else None,
+                "to": feature.value
+            }
+        
+        # Calcula diferença de preço se moeda especificada
+        price_difference = None
+        if currency:
+            from_price = from_version.get_price(currency)
+            to_price = to_version.get_price(currency)
+            
+            if from_price and to_price:
+                price_difference = str(to_price.amount - from_price.amount)
+        
+        return {
+            "from_plan_id": from_plan.plan_id,
+            "from_plan_code": from_plan.code,
+            "to_plan_id": to_plan.plan_id,
+            "to_plan_code": to_plan.code,
+            "to_plan_name": to_version.name,
+            "feature_comparison": feature_comparison,
+            "price_difference": price_difference,
+            "currency": currency
+        }

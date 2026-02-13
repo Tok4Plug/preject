@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CENTRAL ECLIPSE - Dashboard</title>
+
+<!-- Chart.js para gráficos -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<!-- Google Fonts e ícones -->
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+
+<style>
+/* Reset básico */
+* { margin:0; padding:0; box-sizing:border-box; font-family: 'Roboto', sans-serif; }
+body { display:flex; height:100vh; background:#121212; color:#fff; }
+
+/* Coluna lateral */
+.sidebar {
+    width:220px;
+    background:#1f1f1f;
+    display:flex;
+    flex-direction:column;
+    padding:20px;
+}
+.sidebar h1 { font-size:20px; margin-bottom:40px; }
+.sidebar button {
+    background:none;
+    border:none;
+    color:#fff;
+    padding:15px 10px;
+    text-align:left;
+    margin-bottom:10px;
+    cursor:pointer;
+    border-radius:6px;
+    transition: all 0.3s;
+}
+.sidebar button:hover, .sidebar button.active { background:#292929; }
+
+/* Conteúdo principal */
+.main {
+    flex:1;
+    padding:20px;
+    overflow-y:auto;
+    display:flex;
+    flex-direction:column;
+    transition: all 0.3s;
+}
+
+/* Blocos métricas */
+.metrics {
+    display:flex;
+    justify-content:space-between;
+    margin-bottom:30px;
+}
+.metric-card {
+    background:#1f1f1f;
+    padding:20px;
+    border-radius:8px;
+    flex:1;
+    margin-right:15px;
+    text-align:center;
+    transition: transform 0.3s;
+}
+.metric-card:last-child { margin-right:0; }
+.metric-card:hover { transform: scale(1.05); }
+.metric-card h2 { font-size:20px; margin-bottom:10px; color:#00ffe0; }
+.metric-card p { font-size:16px; color:#ccc; }
+
+/* Gráfico */
+.chart-container {
+    background:#1f1f1f;
+    padding:20px;
+    border-radius:8px;
+}
+canvas { width:100% !important; height:400px !important; }
+
+/* Aba integração */
+.integration {
+    display:none;
+    flex-direction:column;
+}
+.integration input, .integration select {
+    padding:10px;
+    margin-bottom:15px;
+    border-radius:6px;
+    border:none;
+    background:#292929;
+    color:#fff;
+}
+.integration button {
+    padding:12px;
+    background:#00ffe0;
+    color:#121212;
+    border:none;
+    border-radius:6px;
+    cursor:pointer;
+    font-weight:bold;
+    transition: all 0.3s;
+}
+.integration button:hover { background:#00ccaa; }
+
+/* Transição entre abas */
+.tab { display:none; }
+.tab.active { display:flex; flex-direction:column; animation: fadeIn 0.5s; }
+@keyframes fadeIn { from {opacity:0} to {opacity:1} }
+</style>
+</head>
+<body>
+
+<!-- Coluna lateral -->
+<div class="sidebar">
+    <h1>CENTRAL ECLIPSE</h1>
+    <button class="tab-btn active" data-tab="home">Home</button>
+    <button class="tab-btn" data-tab="integration">Integração</button>
+    <button class="tab-btn" data-tab="reports">Relatórios</button>
+    <button class="tab-btn" data-tab="users">Usuários</button>
+    <button class="tab-btn" data-tab="settings">Configurações</button>
+</div>
+
+<!-- Conteúdo principal -->
+<div class="main">
+    <!-- Home -->
+    <div id="home" class="tab active">
+        <div class="metrics">
+            <div class="metric-card">
+                <h2 id="dailyRevenue">R$0</h2>
+                <p>Faturamento Diário</p>
+            </div>
+            <div class="metric-card">
+                <h2 id="monthlyRevenue">R$0</h2>
+                <p>Faturamento Mensal</p>
+            </div>
+            <div class="metric-card">
+                <h2 id="salesCount">0</h2>
+                <p>Vendas</p>
+            </div>
+            <div class="metric-card">
+                <h2 id="totalWithdraw">R$0</h2>
+                <p>Valor de Saque</p>
+            </div>
+        </div>
+        <div class="chart-container">
+            <canvas id="dailyChart"></canvas>
+        </div>
+    </div>
+
+    <!-- Integração -->
+    <div id="integration" class="tab">
+        <h2>Gerenciamento de Pixels</h2>
+        <label>Plataforma:</label>
+        <select id="pixelPlatform">
+            <option value="google">Google Tag Manager</option>
+            <option value="facebook">Facebook Ads</option>
+            <option value="tiktok">TikTok Ads</option>
+        </select>
+        <label>ID do Pixel:</label>
+        <input type="text" id="pixelID" placeholder="Insira o ID do Pixel">
+        <label>Token:</label>
+        <input type="text" id="pixelToken" placeholder="Insira o Token">
+        <button id="savePixel">Salvar Pixel</button>
+    </div>
+
+    <!-- Outras abas -->
+    <div id="reports" class="tab"><p>Em desenvolvimento...</p></div>
+    <div id="users" class="tab"><p>Em desenvolvimento...</p></div>
+    <div id="settings" class="tab"><p>Em desenvolvimento...</p></div>
+</div>
+
+<script>
+// Transição entre abas
+const tabs = document.querySelectorAll('.tab');
+const btns = document.querySelectorAll('.tab-btn');
+btns.forEach(btn => {
+    btn.addEventListener('click', () => {
+        btns.forEach(b => b.classList.remove('active'));
+        tabs.forEach(t => t.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById(btn.dataset.tab).classList.add('active');
+    });
+});
+
+// Gráfico animado de faturamento diário
+const ctx = document.getElementById('dailyChart').getContext('2d');
+const dailyChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: Array.from({length: 24}, (_, i) => `${i}:00`),
+        datasets: [{
+            label: 'Faturamento por hora',
+            data: Array.from({length: 24}, () => Math.floor(Math.random()*500)),
+            borderColor: '#00ffe0',
+            backgroundColor: 'rgba(0,255,224,0.2)',
+            tension:0.3,
+            fill:true
+        }]
+    },
+    options: {
+        responsive:true,
+        plugins: { legend: { display: false } },
+        scales: { 
+            y: { beginAtZero:true, ticks: { color:'#ccc' } },
+            x: { ticks: { color:'#ccc' } }
+        }
+    }
+});
+
+// Simulação de atualização de métricas
+function updateMetrics() {
+    document.getElementById('dailyRevenue').innerText = `R$${Math.floor(Math.random()*5000)}`;
+    document.getElementById('monthlyRevenue').innerText = `R$${Math.floor(Math.random()*150000)}`;
+    document.getElementById('salesCount').innerText = Math.floor(Math.random()*100);
+    document.getElementById('totalWithdraw').innerText = `R$${Math.floor(Math.random()*50000)}`;
+
+    // Atualiza gráfico com novos dados
+    dailyChart.data.datasets[0].data = Array.from({length: 24}, () => Math.floor(Math.random()*500));
+    dailyChart.update();
+}
+// Atualiza métricas a cada 5 segundos (simulação)
+setInterval(updateMetrics, 5000);
+
+// Salvar Pixel
+document.getElementById('savePixel').addEventListener('click', () => {
+    const platform = document.getElementById('pixelPlatform').value;
+    const id = document.getElementById('pixelID').value;
+    const token = document.getElementById('pixelToken').value;
+    alert(`Pixel salvo!\nPlataforma: ${platform}\nID: ${id}\nToken: ${token}`);
+});
+</script>
+</body>
+</html>

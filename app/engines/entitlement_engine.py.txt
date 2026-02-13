@@ -1,0 +1,1177 @@
+"""
+Entitlement Engine - Sistema de controle de acesso baseado em assinaturas.
+Grant/revoke de features, controle de escopo e expiração automática.
+"""
+
+from datetime import datetime, timedelta
+from decimal import Decimal
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Any, Set
+from dataclasses import dataclass, field
+import asyncio
+import json
+import uuid
+from collections import defaultdict
+
+from app.core.state_machine import StateMachine, StateTransitionError
+from app.core.audit_logger import AuditLogger
+from app.engines.subscription_engine import SubscriptionEngine, Subscription
+
+
+class EntitlementScope(Enum):
+    """Escopo de uma entitlement."""
+    GLOBAL = "global"           # Acesso global ao sistema
+    TENANT = "tenant"           # Acesso a um tenant específico
+    BOT = "bot"                 # Acesso a um bot específico
+    FEATURE = "feature"         # Acesso a uma feature específica
+    RESOURCE = "resource"       # Acesso a um recurso específico
+
+
+class EntitlementStatus(Enum):
+    """Status de uma entitlement."""
+    ACTIVE = "active"
+    PENDING = "pending"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+    SUSPENDED = "suspended"
+
+
+class EntitlementAction(Enum):
+    """Ações de entitlement."""
+    GRANT = "grant"
+    REVOKE = "revoke"
+    SUSPEND = "suspend"
+    RESUME = "resume"
+    EXTEND = "extend"
+    UPGRADE = "upgrade"
+    DOWNGRADE = "downgrade"
+
+
+@dataclass
+class EntitlementFeature:
+    """Feature específica de uma entitlement."""
+    feature_id: str
+    name: str
+    description: str
+    limit: Optional[int] = None  # None = ilimitado
+    usage_count: int = 0
+    reset_period: Optional[str] = None  # daily, weekly, monthly, yearly
+    
+    def is_within_limit(self) -> bool:
+        """Verifica se está dentro do limite."""
+        if self.limit is None:
+            return True
+        return self.usage_count < self.limit
+    
+    def increment_usage(self, count: int = 1) -> bool:
+        """Incrementa contador de uso."""
+        if self.limit is not None and (self.usage_count + count) > self.limit:
+            return False
+        
+        self.usage_count += count
+        return True
+    
+    def reset_usage(self):
+        """Reseta contador de uso."""
+        self.usage_count = 0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "feature_id": self.feature_id,
+            "name": self.name,
+            "description": self.description,
+            "limit": self.limit,
+            "usage_count": self.usage_count,
+            "reset_period": self.reset_period
+        }
+
+
+@dataclass
+class Entitlement:
+    """Modelo de entitlement."""
+    # Identificadores
+    entitlement_id: str
+    tenant_id: str
+    user_id: str
+    
+    # Escopo
+    scope: EntitlementScope
+    scope_id: Optional[str] = None  # ID específico do escopo
+    
+    # Associação
+    subscription_id: Optional[str] = None
+    plan_id: Optional[str] = None
+    plan_version: Optional[int] = None
+    
+    # Features
+    features: List[EntitlementFeature] = field(default_factory=list)
+    
+    # Controles
+    status: EntitlementStatus = EntitlementStatus.ACTIVE
+    priority: int = 100  # Quanto menor, maior prioridade
+    
+    # Período
+    granted_at: datetime = field(default_factory=datetime.utcnow)
+    expires_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    
+    # Metadados
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    tags: List[str] = field(default_factory=list)
+    
+    # Audit
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def is_active(self) -> bool:
+        """Verifica se a entitlement está ativa."""
+        if self.status != EntitlementStatus.ACTIVE:
+            return False
+        
+        if self.expires_at and datetime.utcnow() > self.expires_at:
+            return False
+        
+        return True
+    
+    def has_feature(self, feature_id: str) -> bool:
+        """Verifica se tem uma feature específica."""
+        return any(f.feature_id == feature_id for f in self.features)
+    
+    def get_feature(self, feature_id: str) -> Optional[EntitlementFeature]:
+        """Obtém uma feature específica."""
+        for feature in self.features:
+            if feature.feature_id == feature_id:
+                return feature
+        return None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "entitlement_id": self.entitlement_id,
+            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
+            "scope": self.scope.value,
+            "scope_id": self.scope_id,
+            "subscription_id": self.subscription_id,
+            "plan_id": self.plan_id,
+            "plan_version": self.plan_version,
+            "features": [f.to_dict() for f in self.features],
+            "status": self.status.value,
+            "priority": self.priority,
+            "granted_at": self.granted_at.isoformat(),
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
+            "metadata": self.metadata,
+            "tags": self.tags,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat()
+        }
+
+
+@dataclass
+class AccessRequest:
+    """Requisição de acesso."""
+    request_id: str
+    tenant_id: str
+    user_id: str
+    scope: EntitlementScope
+    scope_id: Optional[str] = None
+    feature_id: Optional[str] = None
+    resource_id: Optional[str] = None
+    action: str = "access"
+    context: Dict[str, Any] = field(default_factory=dict)
+    requested_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def get_cache_key(self) -> str:
+        """Gera chave de cache para a requisição."""
+        components = [
+            self.tenant_id,
+            self.user_id,
+            self.scope.value,
+            self.scope_id or "global",
+            self.feature_id or "any",
+            self.resource_id or "any",
+            self.action
+        ]
+        return "|".join(components)
+
+
+@dataclass
+class AccessResult:
+    """Resultado de verificação de acesso."""
+    allowed: bool
+    entitlement_id: Optional[str] = None
+    feature_id: Optional[str] = None
+    reason: Optional[str] = None
+    limitations: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "allowed": self.allowed,
+            "entitlement_id": self.entitlement_id,
+            "feature_id": self.feature_id,
+            "reason": self.reason,
+            "limitations": self.limitations,
+            "metadata": self.metadata
+        }
+
+
+class EntitlementEngine:
+    """
+    Engine de controle de acesso baseado em entitlements.
+    Integração com Subscription Engine para grant automático.
+    """
+    
+    def __init__(
+        self,
+        db_pool,
+        audit_logger: AuditLogger,
+        subscription_engine: SubscriptionEngine,
+        redis_client=None,
+        cache_ttl: int = 300
+    ):
+        """
+        Inicializa o Entitlement Engine.
+        
+        Args:
+            db_pool: Pool de conexões com banco
+            audit_logger: Logger de auditoria
+            subscription_engine: Engine de assinaturas
+            redis_client: Cliente Redis (opcional)
+            cache_ttl: TTL do cache em segundos
+        """
+        self.db_pool = db_pool
+        self.audit_logger = audit_logger
+        self.subscription_engine = subscription_engine
+        self.redis = redis_client
+        self.cache_ttl = cache_ttl
+        
+        # Cache de entitlements
+        self.entitlement_cache: Dict[str, Entitlement] = {}
+        
+        # Cache de resultados de acesso
+        self.access_cache: Dict[str, AccessResult] = {}
+        
+        # Mapeamento subscription -> entitlements
+        self.subscription_entitlements: Dict[str, List[str]] = defaultdict(list)
+        
+        # Máquina de estados
+        self.state_machine = StateMachine(
+            initial_states=[EntitlementStatus.PENDING.value],
+            transitions={
+                EntitlementStatus.PENDING.value: [
+                    EntitlementStatus.ACTIVE.value,
+                    EntitlementStatus.REVOKED.value
+                ],
+                EntitlementStatus.ACTIVE.value: [
+                    EntitlementStatus.SUSPENDED.value,
+                    EntitlementStatus.EXPIRED.value,
+                    EntitlementStatus.REVOKED.value
+                ],
+                EntitlementStatus.SUSPENDED.value: [
+                    EntitlementStatus.ACTIVE.value,
+                    EntitlementStatus.REVOKED.value
+                ],
+                EntitlementStatus.EXPIRED.value: [
+                    EntitlementStatus.ACTIVE.value  # Re-ativação
+                ],
+                EntitlementStatus.REVOKED.value: []
+            },
+            state_field="status",
+            resource_id_field="entitlement_id"
+        )
+        
+        # Carrega cache
+        asyncio.create_task(self._load_cache())
+        
+        # Inicia worker de expiração
+        self._expiration_task = asyncio.create_task(self._process_expirations())
+    
+    async def _load_cache(self):
+        """Carrega cache de entitlements ativos."""
+        async with self.db_pool.acquire() as conn:
+            # Carrega entitlements ativos
+            rows = await conn.fetch(
+                """
+                SELECT * FROM entitlements 
+                WHERE status = 'active' 
+                  AND (expires_at IS NULL OR expires_at > $1)
+                """,
+                datetime.utcnow()
+            )
+            
+            for row in rows:
+                entitlement = self._row_to_entitlement(row)
+                self.entitlement_cache[entitlement.entitlement_id] = entitlement
+                
+                # Mapeia subscription -> entitlement
+                if entitlement.subscription_id:
+                    self.subscription_entitlements[entitlement.subscription_id].append(
+                        entitlement.entitlement_id
+                    )
+    
+    async def grant_entitlement_from_subscription(
+        self,
+        subscription: Subscription,
+        granted_by: str = "system"
+    ) -> Tuple[bool, Optional[Entitlement], List[str]]:
+        """
+        Concede entitlement baseado em uma assinatura.
+        
+        Args:
+            subscription: Assinatura
+            granted_by: Quem concedeu
+            
+        Returns:
+            Tuple[success, entitlement, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Verifica se já existe entitlement para esta subscription
+                    existing = await self._get_entitlement_for_subscription(
+                        conn, subscription.subscription_id
+                    )
+                    
+                    if existing:
+                        # Se já existe, verifica se precisa atualizar
+                        if existing.status == EntitlementStatus.ACTIVE:
+                            return True, existing, ["Entitlement already active"]
+                        
+                        # Re-ativa se estava expirada/revogada
+                        if existing.status in [EntitlementStatus.EXPIRED, EntitlementStatus.REVOKED]:
+                            return await self._reactivate_entitlement(
+                                conn, existing, granted_by, "Subscription renewed"
+                            )
+                    
+                    # Cria nova entitlement
+                    entitlement_id = f"ent_{uuid.uuid4().hex[:12]}"
+                    
+                    # Busca features do plano
+                    features = await self._get_plan_features(
+                        subscription.tenant_id,
+                        subscription.plan_id,
+                        subscription.plan_version
+                    )
+                    
+                    # Calcula expiração baseado no período da assinatura
+                    expires_at = subscription.current_period_end
+                    
+                    entitlement = Entitlement(
+                        entitlement_id=entitlement_id,
+                        tenant_id=subscription.tenant_id,
+                        user_id=subscription.user_id,
+                        scope=EntitlementScope.GLOBAL,  # Pode ser configurável
+                        subscription_id=subscription.subscription_id,
+                        plan_id=subscription.plan_id,
+                        plan_version=subscription.plan_version,
+                        features=features,
+                        status=EntitlementStatus.ACTIVE,
+                        granted_at=datetime.utcnow(),
+                        expires_at=expires_at,
+                        metadata={
+                            "subscription_status": subscription.status.value,
+                            "billing_cycle": subscription.billing_cycle.value
+                        }
+                    )
+                    
+                    # Persiste
+                    await self._save_entitlement(conn, entitlement)
+                    
+                    # Atualiza cache
+                    self.entitlement_cache[entitlement_id] = entitlement
+                    self.subscription_entitlements[subscription.subscription_id].append(entitlement_id)
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=subscription.tenant_id,
+                        user_id=subscription.user_id,
+                        action="entitlement.granted",
+                        resource_type="entitlement",
+                        resource_id=entitlement_id,
+                        changes={
+                            "subscription_id": subscription.subscription_id,
+                            "plan_id": subscription.plan_id,
+                            "features_count": len(features),
+                            "expires_at": expires_at.isoformat() if expires_at else None
+                        },
+                        metadata=entitlement.to_dict()
+                    )
+                    
+                    return True, entitlement, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def revoke_entitlement(
+        self,
+        tenant_id: str,
+        entitlement_id: str,
+        reason: str,
+        revoked_by: str = "system"
+    ) -> Tuple[bool, Optional[Entitlement], List[str]]:
+        """
+        Revoga uma entitlement.
+        
+        Args:
+            tenant_id: ID do tenant
+            entitlement_id: ID da entitlement
+            reason: Motivo da revogação
+            revoked_by: Quem revogou
+            
+        Returns:
+            Tuple[success, entitlement, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    entitlement = await self._get_entitlement(conn, tenant_id, entitlement_id)
+                    if not entitlement:
+                        return False, None, [f"Entitlement not found: {entitlement_id}"]
+                    
+                    # Atualiza status
+                    await self._update_entitlement_status(
+                        conn, entitlement, EntitlementStatus.REVOKED,
+                        revoked_by, reason,
+                        {"revoked_at": datetime.utcnow()}
+                    )
+                    
+                    # Remove do cache
+                    if entitlement_id in self.entitlement_cache:
+                        del self.entitlement_cache[entitlement_id]
+                    
+                    # Remove do mapeamento
+                    if entitlement.subscription_id in self.subscription_entitlements:
+                        self.subscription_entitlements[entitlement.subscription_id] = [
+                            eid for eid in self.subscription_entitlements[entitlement.subscription_id]
+                            if eid != entitlement_id
+                        ]
+                    
+                    return True, entitlement, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def check_access(
+        self,
+        tenant_id: str,
+        user_id: str,
+        scope: EntitlementScope,
+        scope_id: Optional[str] = None,
+        feature_id: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        action: str = "access",
+        context: Optional[Dict[str, Any]] = None,
+        skip_cache: bool = False
+    ) -> AccessResult:
+        """
+        Verifica se um usuário tem acesso a um recurso.
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário
+            scope: Escopo do acesso
+            scope_id: ID específico do escopo
+            feature_id: ID da feature (opcional)
+            resource_id: ID do recurso (opcional)
+            action: Ação desejada
+            context: Contexto adicional
+            skip_cache: Ignorar cache
+            
+        Returns:
+            Resultado da verificação
+        """
+        # Cria request
+        request = AccessRequest(
+            request_id=f"req_{uuid.uuid4().hex[:8]}",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            scope=scope,
+            scope_id=scope_id,
+            feature_id=feature_id,
+            resource_id=resource_id,
+            action=action,
+            context=context or {}
+        )
+        
+        # Verifica cache
+        cache_key = request.get_cache_key()
+        if not skip_cache and cache_key in self.access_cache:
+            return self.access_cache[cache_key]
+        
+        async with self.db_pool.acquire() as conn:
+            # Busca entitlements ativas do usuário
+            entitlements = await self._get_user_entitlements(
+                conn, tenant_id, user_id, active_only=True
+            )
+            
+            if not entitlements:
+                result = AccessResult(
+                    allowed=False,
+                    reason="No active entitlements found"
+                )
+                self.access_cache[cache_key] = result
+                return result
+            
+            # Verifica cada entitlement
+            for entitlement in entitlements:
+                # Verifica escopo
+                if not self._check_scope(entitlement, scope, scope_id):
+                    continue
+                
+                # Verifica feature específica (se solicitada)
+                if feature_id:
+                    feature = entitlement.get_feature(feature_id)
+                    if not feature:
+                        continue
+                    
+                    # Verifica limite da feature
+                    if not feature.is_within_limit():
+                        continue
+                    
+                    # Incrementa uso (se aplicável)
+                    if action in ["use", "consume"]:
+                        if not feature.increment_usage():
+                            result = AccessResult(
+                                allowed=False,
+                                entitlement_id=entitlement.entitlement_id,
+                                feature_id=feature_id,
+                                reason=f"Feature limit reached: {feature.usage_count}/{feature.limit}",
+                                limitations={"usage_count": feature.usage_count, "limit": feature.limit}
+                            )
+                            self.access_cache[cache_key] = result
+                            return result
+                        
+                        # Atualiza no banco
+                        await self._update_feature_usage(
+                            conn, entitlement.entitlement_id, feature_id, feature.usage_count
+                        )
+                    
+                    result = AccessResult(
+                        allowed=True,
+                        entitlement_id=entitlement.entitlement_id,
+                        feature_id=feature_id,
+                        limitations={
+                            "usage_count": feature.usage_count,
+                            "limit": feature.limit,
+                            "reset_period": feature.reset_period
+                        },
+                        metadata={
+                            "entitlement": entitlement.to_dict(),
+                            "feature": feature.to_dict()
+                        }
+                    )
+                    self.access_cache[cache_key] = result
+                    return result
+                
+                # Acesso geral ao escopo
+                result = AccessResult(
+                    allowed=True,
+                    entitlement_id=entitlement.entitlement_id,
+                    metadata={"entitlement": entitlement.to_dict()}
+                )
+                self.access_cache[cache_key] = result
+                return result
+            
+            # Nenhuma entitlement válida encontrada
+            result = AccessResult(
+                allowed=False,
+                reason=f"No entitlement found for scope {scope.value}"
+            )
+            self.access_cache[cache_key] = result
+            return result
+    
+    async def get_user_entitlements(
+        self,
+        tenant_id: str,
+        user_id: str,
+        active_only: bool = True
+    ) -> List[Entitlement]:
+        """
+        Lista entitlements de um usuário.
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário
+            active_only: Apenas entitlements ativas
+            
+        Returns:
+            Lista de entitlements
+        """
+        async with self.db_pool.acquire() as conn:
+            return await self._get_user_entitlements(
+                conn, tenant_id, user_id, active_only
+            )
+    
+    async def get_entitlement(
+        self,
+        tenant_id: str,
+        entitlement_id: str
+    ) -> Optional[Entitlement]:
+        """Obtém uma entitlement específica."""
+        cache_key = f"ent:{tenant_id}:{entitlement_id}"
+        
+        if cache_key in self.entitlement_cache:
+            return self.entitlement_cache[cache_key]
+        
+        async with self.db_pool.acquire() as conn:
+            return await self._get_entitlement(conn, tenant_id, entitlement_id)
+    
+    async def extend_entitlement(
+        self,
+        tenant_id: str,
+        entitlement_id: str,
+        days: int,
+        extended_by: str = "system",
+        reason: str = "Manual extension"
+    ) -> Tuple[bool, Optional[Entitlement], List[str]]:
+        """
+        Estende expiração de uma entitlement.
+        
+        Args:
+            tenant_id: ID do tenant
+            entitlement_id: ID da entitlement
+            days: Dias para estender
+            extended_by: Quem estendeu
+            reason: Motivo
+            
+        Returns:
+            Tuple[success, entitlement, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    entitlement = await self._get_entitlement(conn, tenant_id, entitlement_id)
+                    if not entitlement:
+                        return False, None, [f"Entitlement not found: {entitlement_id}"]
+                    
+                    # Calcula nova data de expiração
+                    if entitlement.expires_at:
+                        new_expires_at = entitlement.expires_at + timedelta(days=days)
+                    else:
+                        new_expires_at = datetime.utcnow() + timedelta(days=days)
+                    
+                    # Atualiza
+                    await conn.execute(
+                        """
+                        UPDATE entitlements 
+                        SET expires_at = $1, updated_at = $2
+                        WHERE entitlement_id = $3
+                        """,
+                        new_expires_at,
+                        datetime.utcnow(),
+                        entitlement_id
+                    )
+                    
+                    # Atualiza objeto
+                    entitlement.expires_at = new_expires_at
+                    entitlement.updated_at = datetime.utcnow()
+                    
+                    # Atualiza cache
+                    cache_key = f"ent:{tenant_id}:{entitlement_id}"
+                    self.entitlement_cache[cache_key] = entitlement
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=entitlement.user_id,
+                        action="entitlement.extended",
+                        resource_type="entitlement",
+                        resource_id=entitlement_id,
+                        changes={
+                            "old_expires_at": entitlement.expires_at.isoformat(),
+                            "new_expires_at": new_expires_at.isoformat(),
+                            "days_added": days,
+                            "reason": reason
+                        }
+                    )
+                    
+                    return True, entitlement, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def update_feature_usage(
+        self,
+        tenant_id: str,
+        user_id: str,
+        feature_id: str,
+        increment: int = 1
+    ) -> Tuple[bool, Optional[EntitlementFeature], List[str]]:
+        """
+        Atualiza contador de uso de uma feature.
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário
+            feature_id: ID da feature
+            increment: Valor a incrementar
+            
+        Returns:
+            Tuple[success, feature, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Busca entitlement com a feature
+                    entitlements = await self._get_user_entitlements(
+                        conn, tenant_id, user_id, active_only=True
+                    )
+                    
+                    for entitlement in entitlements:
+                        feature = entitlement.get_feature(feature_id)
+                        if feature:
+                            # Incrementa uso
+                            if not feature.increment_usage(increment):
+                                return False, None, [f"Feature limit reached: {feature.usage_count}/{feature.limit}"]
+                            
+                            # Atualiza no banco
+                            await self._update_feature_usage(
+                                conn, entitlement.entitlement_id, feature_id, feature.usage_count
+                            )
+                            
+                            # Atualiza cache
+                            cache_key = f"ent:{tenant_id}:{entitlement.entitlement_id}"
+                            self.entitlement_cache[cache_key] = entitlement
+                            
+                            return True, feature, []
+                    
+                    return False, None, [f"Feature not found: {feature_id}"]
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def reset_feature_usage(
+        self,
+        tenant_id: str,
+        user_id: str,
+        feature_id: str,
+        reset_by: str = "system"
+    ) -> Tuple[bool, Optional[EntitlementFeature], List[str]]:
+        """
+        Reseta contador de uso de uma feature.
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário
+            feature_id: ID da feature
+            reset_by: Quem resetou
+            
+        Returns:
+            Tuple[success, feature, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Busca entitlement com a feature
+                    entitlements = await self._get_user_entitlements(
+                        conn, tenant_id, user_id, active_only=True
+                    )
+                    
+                    for entitlement in entitlements:
+                        feature = entitlement.get_feature(feature_id)
+                        if feature:
+                            # Reseta uso
+                            old_usage = feature.usage_count
+                            feature.reset_usage()
+                            
+                            # Atualiza no banco
+                            await self._update_feature_usage(
+                                conn, entitlement.entitlement_id, feature_id, 0
+                            )
+                            
+                            # Atualiza cache
+                            cache_key = f"ent:{tenant_id}:{entitlement.entitlement_id}"
+                            self.entitlement_cache[cache_key] = entitlement
+                            
+                            # Log
+                            await self.audit_logger.log(
+                                tenant_id=tenant_id,
+                                user_id=user_id,
+                                action="entitlement.feature_reset",
+                                resource_type="entitlement",
+                                resource_id=entitlement.entitlement_id,
+                                changes={
+                                    "feature_id": feature_id,
+                                    "old_usage": old_usage,
+                                    "new_usage": 0
+                                }
+                            )
+                            
+                            return True, feature, []
+                    
+                    return False, None, [f"Feature not found: {feature_id}"]
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    # Métodos privados
+    async def _get_entitlement(
+        self,
+        conn,
+        tenant_id: str,
+        entitlement_id: str
+    ) -> Optional[Entitlement]:
+        """Busca entitlement do banco."""
+        cache_key = f"ent:{tenant_id}:{entitlement_id}"
+        
+        if cache_key in self.entitlement_cache:
+            return self.entitlement_cache[cache_key]
+        
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM entitlements 
+            WHERE tenant_id = $1 AND entitlement_id = $2
+            """,
+            tenant_id, entitlement_id
+        )
+        
+        if not row:
+            return None
+        
+        entitlement = self._row_to_entitlement(row)
+        self.entitlement_cache[cache_key] = entitlement
+        return entitlement
+    
+    async def _get_entitlement_for_subscription(
+        self,
+        conn,
+        subscription_id: str
+    ) -> Optional[Entitlement]:
+        """Busca entitlement para uma subscription."""
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM entitlements 
+            WHERE subscription_id = $1 
+              AND status = 'active'
+            ORDER BY created_at DESC 
+            LIMIT 1
+            """,
+            subscription_id
+        )
+        return self._row_to_entitlement(row) if row else None
+    
+    async def _get_user_entitlements(
+        self,
+        conn,
+        tenant_id: str,
+        user_id: str,
+        active_only: bool = True
+    ) -> List[Entitlement]:
+        """Busca entitlements de um usuário."""
+        query = """
+            SELECT * FROM entitlements 
+            WHERE tenant_id = $1 AND user_id = $2
+        """
+        params = [tenant_id, user_id]
+        
+        if active_only:
+            query += " AND status = 'active' AND (expires_at IS NULL OR expires_at > $3)"
+            params.append(datetime.utcnow())
+        
+        query += " ORDER BY priority ASC, created_at DESC"
+        
+        rows = await conn.fetch(query, *params)
+        return [self._row_to_entitlement(row) for row in rows]
+    
+    async def _get_plan_features(
+        self,
+        tenant_id: str,
+        plan_id: str,
+        plan_version: int
+    ) -> List[EntitlementFeature]:
+        """Obtém features de um plano."""
+        async with self.db_pool.acquire() as conn:
+            # Busca plano
+            row = await conn.fetchrow(
+                """
+                SELECT features FROM plans 
+                WHERE tenant_id = $1 AND plan_id = $2 AND version = $3
+                """,
+                tenant_id, plan_id, plan_version
+            )
+            
+            if not row:
+                return []
+            
+            features_data = json.loads(row["features"])
+            features = []
+            
+            for feature_data in features_data:
+                features.append(EntitlementFeature(
+                    feature_id=feature_data["code"],
+                    name=feature_data["name"],
+                    description=feature_data["description"],
+                    limit=feature_data.get("limit"),
+                    reset_period=feature_data.get("reset_period")
+                ))
+            
+            return features
+    
+    async def _save_entitlement(self, conn, entitlement: Entitlement):
+        """Persiste entitlement no banco."""
+        await conn.execute(
+            """
+            INSERT INTO entitlements (
+                entitlement_id, tenant_id, user_id, scope, scope_id,
+                subscription_id, plan_id, plan_version, features, status,
+                priority, granted_at, expires_at, revoked_at, metadata,
+                tags, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                     $13, $14, $15, $16, $17, $18)
+            """,
+            entitlement.entitlement_id,
+            entitlement.tenant_id,
+            entitlement.user_id,
+            entitlement.scope.value,
+            entitlement.scope_id,
+            entitlement.subscription_id,
+            entitlement.plan_id,
+            entitlement.plan_version,
+            json.dumps([f.to_dict() for f in entitlement.features]),
+            entitlement.status.value,
+            entitlement.priority,
+            entitlement.granted_at,
+            entitlement.expires_at,
+            entitlement.revoked_at,
+            json.dumps(entitlement.metadata),
+            entitlement.tags,
+            entitlement.created_at,
+            entitlement.updated_at
+        )
+        
+        # Atualiza cache
+        cache_key = f"ent:{entitlement.tenant_id}:{entitlement.entitlement_id}"
+        self.entitlement_cache[cache_key] = entitlement
+    
+    async def _update_entitlement_status(
+        self,
+        conn,
+        entitlement: Entitlement,
+        new_status: EntitlementStatus,
+        actor: str,
+        reason: str,
+        metadata: Optional[Dict] = None
+    ):
+        """Atualiza status de uma entitlement."""
+        old_status = entitlement.status
+        
+        # Valida transição
+        if not self.state_machine.can_transition(old_status.value, new_status.value):
+            raise StateTransitionError(
+                f"Cannot transition entitlement from {old_status.value} to {new_status.value}"
+            )
+        
+        # Atualiza
+        entitlement.status = new_status
+        entitlement.updated_at = datetime.utcnow()
+        
+        # Atualiza campos específicos
+        update_fields = ["status = $1", "updated_at = $2"]
+        params = [new_status.value, entitlement.updated_at]
+        
+        if new_status == EntitlementStatus.REVOKED:
+            entitlement.revoked_at = datetime.utcnow()
+            update_fields.append("revoked_at = $3")
+            params.append(entitlement.revoked_at)
+        
+        await conn.execute(
+            f"""
+            UPDATE entitlements 
+            SET {', '.join(update_fields)}
+            WHERE entitlement_id = ${len(params) + 1}
+            """,
+            *params, entitlement.entitlement_id
+        )
+        
+        # Log
+        await self.audit_logger.log(
+            tenant_id=entitlement.tenant_id,
+            user_id=entitlement.user_id,
+            action="entitlement.status_changed",
+            resource_type="entitlement",
+            resource_id=entitlement.entitlement_id,
+            changes={
+                "old_status": old_status.value,
+                "new_status": new_status.value,
+                "reason": reason,
+                "actor": actor
+            },
+            metadata=metadata or {}
+        )
+    
+    async def _reactivate_entitlement(
+        self,
+        conn,
+        entitlement: Entitlement,
+        reactivated_by: str,
+        reason: str
+    ) -> Tuple[bool, Optional[Entitlement], List[str]]:
+        """Re-ativa uma entitlement expirada/revogada."""
+        # Atualiza status
+        await self._update_entitlement_status(
+            conn, entitlement, EntitlementStatus.ACTIVE,
+            reactivated_by, reason
+        )
+        
+        # Limpa campos de revogação
+        entitlement.revoked_at = None
+        await conn.execute(
+            """
+            UPDATE entitlements 
+            SET revoked_at = NULL
+            WHERE entitlement_id = $1
+            """,
+            entitlement.entitlement_id
+        )
+        
+        return True, entitlement, []
+    
+    async def _update_feature_usage(
+        self,
+        conn,
+        entitlement_id: str,
+        feature_id: str,
+        usage_count: int
+    ):
+        """Atualiza contador de uso de uma feature."""
+        # Busca entitlement atual
+        row = await conn.fetchrow(
+            "SELECT features FROM entitlements WHERE entitlement_id = $1",
+            entitlement_id
+        )
+        
+        if not row:
+            return
+        
+        features_data = json.loads(row["features"])
+        
+        # Atualiza feature específica
+        for feature_data in features_data:
+            if feature_data["feature_id"] == feature_id:
+                feature_data["usage_count"] = usage_count
+                break
+        
+        # Persiste
+        await conn.execute(
+            """
+            UPDATE entitlements 
+            SET features = $1, updated_at = $2
+            WHERE entitlement_id = $3
+            """,
+            json.dumps(features_data),
+            datetime.utcnow(),
+            entitlement_id
+        )
+    
+    def _check_scope(
+        self,
+        entitlement: Entitlement,
+        requested_scope: EntitlementScope,
+        requested_scope_id: Optional[str]
+    ) -> bool:
+        """Verifica se entitlement cobre o escopo solicitado."""
+        # Escopo global cobre tudo
+        if entitlement.scope == EntitlementScope.GLOBAL:
+            return True
+        
+        # Escopos devem ser iguais
+        if entitlement.scope != requested_scope:
+            return False
+        
+        # Se não tem scope_id, cobre todos do mesmo escopo
+        if not entitlement.scope_id:
+            return True
+        
+        # Verifica scope_id específico
+        return entitlement.scope_id == requested_scope_id
+    
+    async def _process_expirations(self):
+        """Processa expirações automáticas de entitlements."""
+        while True:
+            try:
+                async with self.db_pool.acquire() as conn:
+                    # Busca entitlements expiradas
+                    now = datetime.utcnow()
+                    rows = await conn.fetch(
+                        """
+                        SELECT * FROM entitlements 
+                        WHERE status = 'active' 
+                          AND expires_at IS NOT NULL 
+                          AND expires_at <= $1
+                        LIMIT 100
+                        """,
+                        now
+                    )
+                    
+                    for row in rows:
+                        entitlement = self._row_to_entitlement(row)
+                        
+                        # Marca como expirada
+                        await self._update_entitlement_status(
+                            conn, entitlement, EntitlementStatus.EXPIRED,
+                            "system", "Automatic expiration"
+                        )
+                        
+                        # Remove do cache
+                        cache_key = f"ent:{entitlement.tenant_id}:{entitlement.entitlement_id}"
+                        if cache_key in self.entitlement_cache:
+                            del self.entitlement_cache[cache_key]
+                        
+                        # Log
+                        await self.audit_logger.log(
+                            tenant_id=entitlement.tenant_id,
+                            user_id=entitlement.user_id,
+                            action="entitlement.expired",
+                            resource_type="entitlement",
+                            resource_id=entitlement.entitlement_id,
+                            changes={
+                                "expired_at": now.isoformat()
+                            }
+                        )
+                
+                # Aguarda antes da próxima execução
+                await asyncio.sleep(3600)  # 1 hora
+                
+            except Exception as e:
+                print(f"Error processing expirations: {e}")
+                await asyncio.sleep(300)  # 5 minutos em caso de erro
+    
+    def _row_to_entitlement(self, row) -> Entitlement:
+        """Converte linha do banco para Entitlement."""
+        # Parse de features
+        features_data = json.loads(row["features"]) if row.get("features") else []
+        features = []
+        for feature_data in features_data:
+            features.append(EntitlementFeature(
+                feature_id=feature_data["feature_id"],
+                name=feature_data["name"],
+                description=feature_data["description"],
+                limit=feature_data.get("limit"),
+                usage_count=feature_data.get("usage_count", 0),
+                reset_period=feature_data.get("reset_period")
+            ))
+        
+        return Entitlement(
+            entitlement_id=row["entitlement_id"],
+            tenant_id=row["tenant_id"],
+            user_id=row["user_id"],
+            scope=EntitlementScope(row["scope"]),
+            scope_id=row.get("scope_id"),
+            subscription_id=row.get("subscription_id"),
+            plan_id=row.get("plan_id"),
+            plan_version=row.get("plan_version"),
+            features=features,
+            status=EntitlementStatus(row["status"]),
+            priority=row.get("priority", 100),
+            granted_at=row["granted_at"],
+            expires_at=row.get("expires_at"),
+            revoked_at=row.get("revoked_at"),
+            metadata=json.loads(row["metadata"]) if row.get("metadata") else {},
+            tags=row.get("tags", []),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )

@@ -1,0 +1,1084 @@
+"""
+State Machine Engine - Motor de máquinas de estado para gestão de ciclo de vida de entidades
+
+Princípios:
+1. Estados e transições declarativas
+2. Hooks (before/after) para cada transição
+3. Validações de transição
+4. Auditoria completa de mudanças de estado
+5. Suporte a rollback e compensação
+"""
+
+import asyncio
+import inspect
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum, auto
+from typing import Dict, List, Optional, Any, Callable, Set, Union, TypeVar, Generic
+from functools import wraps
+import uuid
+
+from app.core.audit_logger import AuditLogger
+from app.utils.cryptography import generate_secure_hash
+from app.core.entitlement_resolver import EntitlementResolver
+
+
+class StateMachineError(Exception):
+    """Exceção base para erros da máquina de estado"""
+    pass
+
+
+class InvalidTransitionError(StateMachineError):
+    """Tentativa de transição inválida"""
+    pass
+
+
+class TransitionValidationError(StateMachineError):
+    """Erro na validação da transição"""
+    pass
+
+
+class StateLockedError(StateMachineError):
+    """Estado está bloqueado para transição"""
+    pass
+
+
+@dataclass
+class StateTransition:
+    """Registro de uma transição de estado"""
+    transition_id: str
+    entity_id: str
+    entity_type: str
+    from_state: str
+    to_state: str
+    triggered_by: str
+    trigger_event: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    rollback_data: Optional[Dict[str, Any]] = None
+    is_rolled_back: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "transition_id": self.transition_id,
+            "entity_id": self.entity_id,
+            "entity_type": self.entity_type,
+            "from_state": self.from_state,
+            "to_state": self.to_state,
+            "triggered_by": self.triggered_by,
+            "trigger_event": self.trigger_event,
+            "metadata": self.metadata,
+            "timestamp": self.timestamp.isoformat(),
+            "is_rolled_back": self.is_rolled_back
+        }
+
+
+@dataclass
+class StateDefinition:
+    """Definição de um estado na máquina"""
+    name: str
+    description: str
+    is_terminal: bool = False
+    is_error: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    entry_actions: List[str] = field(default_factory=list)
+    exit_actions: List[str] = field(default_factory=list)
+    
+    def __hash__(self):
+        return hash(self.name)
+
+
+@dataclass
+class TransitionDefinition:
+    """Definição de uma transição entre estados"""
+    from_state: str
+    to_state: str
+    trigger_event: str
+    description: str
+    validators: List[str] = field(default_factory=list)
+    before_hooks: List[str] = field(default_factory=list)
+    after_hooks: List[str] = field(default_factory=list)
+    requires_entitlement: Optional[str] = None
+    timeout_seconds: Optional[int] = None
+    auto_retry: bool = False
+    max_retries: int = 3
+    is_compensatable: bool = False
+    compensation_event: Optional[str] = None
+    
+    def __hash__(self):
+        return hash(f"{self.from_state}::{self.to_state}::{self.trigger_event}")
+
+
+class HookContext:
+    """Contexto passado para hooks durante transições"""
+    
+    def __init__(
+        self,
+        entity: Any,
+        from_state: str,
+        to_state: str,
+        trigger_event: str,
+        triggered_by: str,
+        metadata: Dict[str, Any]
+    ):
+        self.entity = entity
+        self.from_state = from_state
+        self.to_state = to_state
+        self.trigger_event = trigger_event
+        self.triggered_by = triggered_by
+        self.metadata = metadata
+        self._abort = False
+        self._abort_reason = None
+        self._additional_data = {}
+    
+    def abort(self, reason: str = "Transição abortada por hook"):
+        """Aborta a transição"""
+        self._abort = True
+        self._abort_reason = reason
+    
+    def set_data(self, key: str, value: Any):
+        """Armazena dados adicionais no contexto"""
+        self._additional_data[key] = value
+    
+    def get_data(self, key: str, default: Any = None) -> Any:
+        """Obtém dados adicionais do contexto"""
+        return self._additional_data.get(key, default)
+
+
+class StateMachineConfig:
+    """Configuração de uma máquina de estado específica"""
+    
+    def __init__(
+        self,
+        name: str,
+        entity_type: str,
+        initial_state: str,
+        states: Dict[str, StateDefinition],
+        transitions: List[TransitionDefinition]
+    ):
+        self.name = name
+        self.entity_type = entity_type
+        self.initial_state = initial_state
+        self.states = states
+        self.transitions = transitions
+        
+        # Valida configuração
+        self._validate_config()
+    
+    def _validate_config(self) -> None:
+        """Valida a configuração da máquina de estado"""
+        # Verifica se estado inicial existe
+        if self.initial_state not in self.states:
+            raise ValueError(f"Estado inicial '{self.initial_state}' não definido")
+        
+        # Verifica se todas as transições referenciam estados existentes
+        for transition in self.transitions:
+            if transition.from_state not in self.states:
+                raise ValueError(
+                    f"Transição '{transition.trigger_event}' referencia estado inexistente: {transition.from_state}"
+                )
+            if transition.to_state not in self.states:
+                raise ValueError(
+                    f"Transição '{transition.trigger_event}' referencia estado inexistente: {transition.to_state}"
+                )
+        
+        # Verifica se há estados inalcançáveis (opcional, mas útil)
+        reachable_states = self._find_reachable_states()
+        unreachable = set(self.states.keys()) - reachable_states
+        if unreachable:
+            print(f"Aviso: Estados inalcançáveis: {unreachable}")
+    
+    def _find_reachable_states(self) -> Set[str]:
+        """Encontra estados alcançáveis a partir do estado inicial"""
+        reachable = {self.initial_state}
+        queue = [self.initial_state]
+        
+        while queue:
+            current = queue.pop()
+            # Encontra todas as transições a partir do estado atual
+            for transition in self.transitions:
+                if transition.from_state == current and transition.to_state not in reachable:
+                    reachable.add(transition.to_state)
+                    queue.append(transition.to_state)
+        
+        return reachable
+    
+    def get_transition(
+        self,
+        from_state: str,
+        trigger_event: str
+    ) -> Optional[TransitionDefinition]:
+        """Obtém definição de transição específica"""
+        for transition in self.transitions:
+            if transition.from_state == from_state and transition.trigger_event == trigger_event:
+                return transition
+        return None
+    
+    def get_available_transitions(self, from_state: str) -> List[TransitionDefinition]:
+        """Obtém transições disponíveis a partir de um estado"""
+        return [
+            t for t in self.transitions
+            if t.from_state == from_state
+        ]
+    
+    def get_state_definition(self, state_name: str) -> Optional[StateDefinition]:
+        """Obtém definição de estado específico"""
+        return self.states.get(state_name)
+    
+    def can_transition(self, from_state: str, trigger_event: str) -> bool:
+        """Verifica se transição é possível"""
+        return self.get_transition(from_state, trigger_event) is not None
+
+
+class StateMachineRegistry:
+    """Registro global de máquinas de estado"""
+    
+    def __init__(self):
+        self._machines: Dict[str, StateMachineConfig] = {}
+        self._hooks: Dict[str, Dict[str, Callable]] = {
+            "validators": {},
+            "before_hooks": {},
+            "after_hooks": {},
+            "entry_actions": {},
+            "exit_actions": {}
+        }
+    
+    def register_machine(self, config: StateMachineConfig) -> None:
+        """Registra uma nova máquina de estado"""
+        if config.name in self._machines:
+            raise ValueError(f"Máquina '{config.name}' já registrada")
+        self._machines[config.name] = config
+    
+    def get_machine(self, name: str) -> Optional[StateMachineConfig]:
+        """Obtém configuração de máquina por nome"""
+        return self._machines.get(name)
+    
+    def register_hook(
+        self,
+        hook_type: str,
+        hook_name: str,
+        hook_func: Callable
+    ) -> None:
+        """Registra um hook para uso em máquinas de estado"""
+        if hook_type not in self._hooks:
+            raise ValueError(f"Tipo de hook inválido: {hook_type}")
+        self._hooks[hook_type][hook_name] = hook_func
+    
+    def get_hook(self, hook_type: str, hook_name: str) -> Optional[Callable]:
+        """Obtém função de hook específica"""
+        return self._hooks.get(hook_type, {}).get(hook_name)
+
+
+# Registry global
+_state_machine_registry = StateMachineRegistry()
+
+
+def state_machine(name: str, entity_type: str):
+    """Decorator para definir uma máquina de estado"""
+    def decorator(cls):
+        class StateMachineMeta(type):
+            def __init__(self, name, bases, dct):
+                super().__init__(name, bases, dct)
+                
+                # Coleta estados definidos na classe
+                states = {}
+                transitions = []
+                
+                for attr_name, attr_value in dct.items():
+                    if isinstance(attr_value, StateDefinition):
+                        states[attr_name] = attr_value
+                    elif isinstance(attr_value, TransitionDefinition):
+                        transitions.append(attr_value)
+                
+                # Cria configuração
+                initial_state = getattr(cls, 'INITIAL_STATE', 'initial')
+                config = StateMachineConfig(
+                    name=name,
+                    entity_type=entity_type,
+                    initial_state=initial_state,
+                    states=states,
+                    transitions=transitions
+                )
+                
+                # Registra no registry global
+                _state_machine_registry.register_machine(config)
+                
+                # Adiciona configuração à classe
+                cls.STATE_MACHINE_CONFIG = config
+        
+        class StateMachineClass(cls, metaclass=StateMachineMeta):
+            pass
+        
+        return StateMachineClass
+    return decorator
+
+
+def validator(name: str):
+    """Decorator para registrar validadores"""
+    def decorator(func):
+        _state_machine_registry.register_hook("validators", name, func)
+        return func
+    return decorator
+
+
+def before_hook(name: str):
+    """Decorator para registrar hooks before"""
+    def decorator(func):
+        _state_machine_registry.register_hook("before_hooks", name, func)
+        return func
+    return decorator
+
+
+def after_hook(name: str):
+    """Decorator para registrar hooks after"""
+    def decorator(func):
+        _state_machine_registry.register_hook("after_hooks", name, func)
+        return func
+    return decorator
+
+
+def entry_action(name: str):
+    """Decorator para registrar ações de entrada"""
+    def decorator(func):
+        _state_machine_registry.register_hook("entry_actions", name, func)
+        return func
+    return decorator
+
+
+def exit_action(name: str):
+    """Decorator para registrar ações de saída"""
+    def decorator(func):
+        _state_machine_registry.register_hook("exit_actions", name, func)
+        return func
+    return decorator
+
+
+class StateMachineInstance:
+    """Instância de máquina de estado para uma entidade específica"""
+    
+    def __init__(
+        self,
+        machine_name: str,
+        entity: Any,
+        audit_logger: AuditLogger,
+        entitlement_resolver: Optional[EntitlementResolver] = None
+    ):
+        self.machine_name = machine_name
+        self.entity = entity
+        self.audit_logger = audit_logger
+        self.entitlement_resolver = entitlement_resolver
+        
+        # Obtém configuração
+        self.config = _state_machine_registry.get_machine(machine_name)
+        if not self.config:
+            raise ValueError(f"Máquina de estado '{machine_name}' não encontrada")
+        
+        # Estado atual
+        self.current_state = getattr(entity, 'state', self.config.initial_state)
+        
+        # Histórico de transições
+        self.transition_history: List[StateTransition] = []
+        
+        # Lock para transições concorrentes
+        self._transition_lock = asyncio.Lock()
+        
+        # Cache de transições disponíveis
+        self._available_transitions_cache = None
+    
+    def get_current_state_definition(self) -> Optional[StateDefinition]:
+        """Obtém definição do estado atual"""
+        return self.config.get_state_definition(self.current_state)
+    
+    def get_available_transitions(self, refresh: bool = False) -> List[TransitionDefinition]:
+        """Obtém transições disponíveis a partir do estado atual"""
+        if refresh or self._available_transitions_cache is None:
+            self._available_transitions_cache = self.config.get_available_transitions(
+                self.current_state
+            )
+        return self._available_transitions_cache
+    
+    def can_transition(self, trigger_event: str) -> bool:
+        """Verifica se transição é possível"""
+        return self.config.can_transition(self.current_state, trigger_event)
+    
+    async def transition(
+        self,
+        trigger_event: str,
+        triggered_by: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        force: bool = False
+    ) -> StateTransition:
+        """
+        Executa transição de estado
+        
+        Args:
+            trigger_event: Evento que dispara a transição
+            triggered_by: Quem disparou a transição (user_id, system, etc.)
+            metadata: Metadados adicionais para a transição
+            force: Ignorar validações (apenas para recuperação de erro)
+        
+        Returns:
+            StateTransition: Registro da transição realizada
+        """
+        metadata = metadata or {}
+        
+        async with self._transition_lock:
+            # Obtém definição da transição
+            transition_def = self.config.get_transition(self.current_state, trigger_event)
+            if not transition_def:
+                raise InvalidTransitionError(
+                    f"Transição não permitida de '{self.current_state}' via evento '{trigger_event}'"
+                )
+            
+            # Cria contexto para hooks
+            context = HookContext(
+                entity=self.entity,
+                from_state=self.current_state,
+                to_state=transition_def.to_state,
+                trigger_event=trigger_event,
+                triggered_by=triggered_by,
+                metadata=metadata
+            )
+            
+            try:
+                # 1. Executa ações de saída do estado atual
+                await self._execute_exit_actions(context)
+                
+                # 2. Validações (a menos que force=True)
+                if not force:
+                    await self._execute_validators(context, transition_def)
+                    
+                    # Verifica se há entitlements necessários
+                    if transition_def.requires_entitlement and self.entitlement_resolver:
+                        tenant_id = getattr(self.entity, 'tenant_id', None)
+                        if tenant_id:
+                            has_entitlement = await self.entitlement_resolver.has_entitlement(
+                                tenant_id=tenant_id,
+                                user_id=triggered_by,
+                                entitlement_key=transition_def.requires_entitlement
+                            )
+                            if not has_entitlement:
+                                raise TransitionValidationError(
+                                    f"Entitlement necessário: {transition_def.requires_entitlement}"
+                                )
+                
+                # 3. Verifica se algum hook abortou a transição
+                if context._abort:
+                    raise TransitionValidationError(
+                        f"Transição abortada: {context._abort_reason}"
+                    )
+                
+                # 4. Executa hooks before
+                await self._execute_before_hooks(context, transition_def)
+                
+                # 5. Cria registro da transição
+                transition_id = f"tr_{uuid.uuid4().hex[:16]}"
+                transition_record = StateTransition(
+                    transition_id=transition_id,
+                    entity_id=str(getattr(self.entity, 'id', 'unknown')),
+                    entity_type=self.config.entity_type,
+                    from_state=self.current_state,
+                    to_state=transition_def.to_state,
+                    triggered_by=triggered_by,
+                    trigger_event=trigger_event,
+                    metadata=metadata
+                )
+                
+                # 6. Executa transição (atualiza estado da entidade)
+                old_state = self.current_state
+                self.current_state = transition_def.to_state
+                setattr(self.entity, 'state', self.current_state)
+                
+                # 7. Executa ações de entrada no novo estado
+                await self._execute_entry_actions(context)
+                
+                # 8. Executa hooks after
+                await self._execute_after_hooks(context, transition_def)
+                
+                # 9. Atualiza histórico e cache
+                self.transition_history.append(transition_record)
+                self._available_transitions_cache = None
+                
+                # 10. Log de auditoria
+                await self._log_transition(transition_record, old_state)
+                
+                return transition_record
+                
+            except Exception as e:
+                # Se ocorrer erro durante a transição, mantém estado anterior
+                self.current_state = context.from_state
+                setattr(self.entity, 'state', self.current_state)
+                
+                # Log de erro
+                await self.audit_logger.log(
+                    tenant_id=getattr(self.entity, 'tenant_id', 'system'),
+                    user_id=triggered_by,
+                    action="state_transition.error",
+                    resource_type=self.config.entity_type,
+                    resource_id=str(getattr(self.entity, 'id', 'unknown')),
+                    metadata={
+                        "machine": self.machine_name,
+                        "from_state": context.from_state,
+                        "to_state": context.to_state,
+                        "trigger_event": trigger_event,
+                        "error": str(e),
+                        "error_type": e.__class__.__name__
+                    },
+                    severity="high"
+                )
+                
+                raise
+    
+    async def _execute_validators(
+        self,
+        context: HookContext,
+        transition_def: TransitionDefinition
+    ) -> None:
+        """Executa validadores da transição"""
+        for validator_name in transition_def.validators:
+            validator_func = _state_machine_registry.get_hook("validators", validator_name)
+            if validator_func:
+                try:
+                    if inspect.iscoroutinefunction(validator_func):
+                        await validator_func(context)
+                    else:
+                        validator_func(context)
+                    
+                    if context._abort:
+                        raise TransitionValidationError(
+                            f"Validador '{validator_name}' abortou: {context._abort_reason}"
+                        )
+                except Exception as e:
+                    raise TransitionValidationError(
+                        f"Validador '{validator_name}' falhou: {str(e)}"
+                    )
+    
+    async def _execute_before_hooks(
+        self,
+        context: HookContext,
+        transition_def: TransitionDefinition
+    ) -> None:
+        """Executa hooks before da transição"""
+        for hook_name in transition_def.before_hooks:
+            hook_func = _state_machine_registry.get_hook("before_hooks", hook_name)
+            if hook_func:
+                try:
+                    if inspect.iscoroutinefunction(hook_func):
+                        await hook_func(context)
+                    else:
+                        hook_func(context)
+                    
+                    if context._abort:
+                        raise TransitionValidationError(
+                            f"Hook before '{hook_name}' abortou: {context._abort_reason}"
+                        )
+                except Exception as e:
+                    raise TransitionValidationError(
+                        f"Hook before '{hook_name}' falhou: {str(e)}"
+                    )
+    
+    async def _execute_after_hooks(
+        self,
+        context: HookContext,
+        transition_def: TransitionDefinition
+    ) -> None:
+        """Executa hooks after da transição"""
+        for hook_name in transition_def.after_hooks:
+            hook_func = _state_machine_registry.get_hook("after_hooks", hook_name)
+            if hook_func:
+                try:
+                    if inspect.iscoroutinefunction(hook_func):
+                        await hook_func(context)
+                    else:
+                        hook_func(context)
+                except Exception as e:
+                    # Hooks after não devem abortar, apenas logar erro
+                    await self.audit_logger.log(
+                        tenant_id=getattr(self.entity, 'tenant_id', 'system'),
+                        user_id=context.triggered_by,
+                        action="state_transition.after_hook_error",
+                        resource_type=self.config.entity_type,
+                        resource_id=str(getattr(self.entity, 'id', 'unknown')),
+                        metadata={
+                            "machine": self.machine_name,
+                            "hook_name": hook_name,
+                            "error": str(e)
+                        },
+                        severity="medium"
+                    )
+    
+    async def _execute_entry_actions(self, context: HookContext) -> None:
+        """Executa ações de entrada no novo estado"""
+        state_def = self.config.get_state_definition(context.to_state)
+        if state_def:
+            for action_name in state_def.entry_actions:
+                action_func = _state_machine_registry.get_hook("entry_actions", action_name)
+                if action_func:
+                    try:
+                        if inspect.iscoroutinefunction(action_func):
+                            await action_func(context)
+                        else:
+                            action_func(context)
+                    except Exception as e:
+                        # Loga erro mas não reverte transição
+                        await self.audit_logger.log(
+                            tenant_id=getattr(self.entity, 'tenant_id', 'system'),
+                            user_id=context.triggered_by,
+                            action="state_transition.entry_action_error",
+                            resource_type=self.config.entity_type,
+                            resource_id=str(getattr(self.entity, 'id', 'unknown')),
+                            metadata={
+                                "machine": self.machine_name,
+                                "action_name": action_name,
+                                "error": str(e)
+                            },
+                            severity="medium"
+                        )
+    
+    async def _execute_exit_actions(self, context: HookContext) -> None:
+        """Executa ações de saída do estado atual"""
+        state_def = self.config.get_state_definition(context.from_state)
+        if state_def:
+            for action_name in state_def.exit_actions:
+                action_func = _state_machine_registry.get_hook("exit_actions", action_name)
+                if action_func:
+                    try:
+                        if inspect.iscoroutinefunction(action_func):
+                            await action_func(context)
+                        else:
+                            action_func(context)
+                    except Exception as e:
+                        # Loga erro mas continua transição
+                        await self.audit_logger.log(
+                            tenant_id=getattr(self.entity, 'tenant_id', 'system'),
+                            user_id=context.triggered_by,
+                            action="state_transition.exit_action_error",
+                            resource_type=self.config.entity_type,
+                            resource_id=str(getattr(self.entity, 'id', 'unknown')),
+                            metadata={
+                                "machine": self.machine_name,
+                                "action_name": action_name,
+                                "error": str(e)
+                            },
+                            severity="medium"
+                        )
+    
+    async def _log_transition(
+        self,
+        transition: StateTransition,
+        old_state: str
+    ) -> None:
+        """Registra transição no log de auditoria"""
+        await self.audit_logger.log(
+            tenant_id=getattr(self.entity, 'tenant_id', 'system'),
+            user_id=transition.triggered_by,
+            action="state_transition",
+            resource_type=self.config.entity_type,
+            resource_id=transition.entity_id,
+            metadata=transition.to_dict()
+        )
+    
+    async def rollback_transition(
+        self,
+        transition_id: str,
+        rollback_by: str,
+        reason: str
+    ) -> Optional[StateTransition]:
+        """
+        Reverte uma transição específica (se permitida)
+        
+        Nota: Nem todas as transições são reversíveis
+        """
+        # Encontra transição
+        target_transition = None
+        for i, trans in enumerate(self.transition_history):
+            if trans.transition_id == transition_id:
+                target_transition = trans
+                break
+        
+        if not target_transition:
+            return None
+        
+        # Verifica se transição original permite rollback
+        transition_def = self.config.get_transition(
+            target_transition.from_state,
+            target_transition.trigger_event
+        )
+        
+        if not transition_def or not transition_def.is_compensatable:
+            raise InvalidTransitionError(
+                f"Transição '{transition_id}' não é reversível"
+            )
+        
+        # Executa evento de compensação
+        if transition_def.compensation_event:
+            try:
+                rollback_transition = await self.transition(
+                    trigger_event=transition_def.compensation_event,
+                    triggered_by=rollback_by,
+                    metadata={
+                        "rollback_reason": reason,
+                        "original_transition_id": transition_id,
+                        "original_trigger": target_transition.trigger_event
+                    }
+                )
+                
+                # Marca transição original como revertida
+                target_transition.is_rolled_back = True
+                target_transition.rollback_data = {
+                    "rolled_back_by": rollback_by,
+                    "rolled_back_at": datetime.utcnow().isoformat(),
+                    "reason": reason,
+                    "rollback_transition_id": rollback_transition.transition_id
+                }
+                
+                return rollback_transition
+                
+            except Exception as e:
+                raise StateMachineError(f"Falha ao reverter transição: {str(e)}")
+        
+        return None
+    
+    def get_transition_history(
+        self,
+        limit: int = 100,
+        offset: int = 0
+    ) -> List[StateTransition]:
+        """Obtém histórico de transições"""
+        start = offset
+        end = offset + limit
+        return self.transition_history[start:end]
+    
+    def get_last_transition(self) -> Optional[StateTransition]:
+        """Obtém última transição"""
+        if self.transition_history:
+            return self.transition_history[-1]
+        return None
+    
+    def is_in_terminal_state(self) -> bool:
+        """Verifica se está em estado terminal"""
+        state_def = self.get_current_state_definition()
+        return state_def.is_terminal if state_def else False
+    
+    def is_in_error_state(self) -> bool:
+        """Verifica se está em estado de erro"""
+        state_def = self.get_current_state_definition()
+        return state_def.is_error if state_def else False
+
+
+# Exemplo de definição de máquina de estado para PaymentIntent
+@state_machine(name="payment_intent", entity_type="payment_intent")
+class PaymentIntentStateMachine:
+    """Máquina de estado para PaymentIntent"""
+    
+    INITIAL_STATE = "pending"
+    
+    # Estados
+    pending = StateDefinition(
+        name="pending",
+        description="Intenção de pagamento criada, aguardando escolha de método"
+    )
+    
+    awaiting_payment = StateDefinition(
+        name="awaiting_payment",
+        description="Instruções de pagamento exibidas, aguardando confirmação"
+    )
+    
+    paid = StateDefinition(
+        name="paid",
+        description="Pagamento confirmado via webhook",
+        is_terminal=True,
+        entry_actions=["notify_payment_received", "grant_entitlements"]
+    )
+    
+    expired = StateDefinition(
+        name="expired",
+        description="Tempo para pagamento expirado",
+        is_terminal=True,
+        entry_actions=["notify_expiration"]
+    )
+    
+    failed = StateDefinition(
+        name="failed",
+        description="Falha no processamento do pagamento",
+        is_error=True,
+        is_terminal=True,
+        entry_actions=["notify_failure"]
+    )
+    
+    cancelled = StateDefinition(
+        name="cancelled",
+        description="Pagamento cancelado pelo usuário",
+        is_terminal=True
+    )
+    
+    # Transições
+    payment_method_selected = TransitionDefinition(
+        from_state="pending",
+        to_state="awaiting_payment",
+        trigger_event="payment_method_selected",
+        description="Usuário selecionou método de pagamento",
+        validators=["validate_payment_method"],
+        before_hooks=["lock_intent"],
+        after_hooks=["generate_payment_instructions"]
+    )
+    
+    payment_received = TransitionDefinition(
+        from_state="awaiting_payment",
+        to_state="paid",
+        trigger_event="payment_received",
+        description="Webhook confirmou pagamento",
+        validators=["validate_webhook", "validate_amount"],
+        before_hooks=["verify_payment"],
+        after_hooks=["update_billing", "log_payment"],
+        is_compensatable=True,
+        compensation_event="refund_issued"
+    )
+    
+    timeout = TransitionDefinition(
+        from_state="awaiting_payment",
+        to_state="expired",
+        trigger_event="timeout",
+        description="Tempo para pagamento expirou",
+        validators=["check_expiration"],
+        after_hooks=["cleanup_resources"]
+    )
+    
+    payment_failed = TransitionDefinition(
+        from_state="awaiting_payment",
+        to_state="failed",
+        trigger_event="payment_failed",
+        description="Falha no processamento do pagamento",
+        validators=["validate_failure_reason"],
+        after_hooks=["notify_technical_team"]
+    )
+    
+    user_cancelled = TransitionDefinition(
+        from_state="awaiting_payment",
+        to_state="cancelled",
+        trigger_event="user_cancelled",
+        description="Usuário cancelou pagamento",
+        validators=["validate_cancellation"],
+        after_hooks=["release_resources"]
+    )
+
+
+# Exemplo de hooks e validators
+@validator("validate_payment_method")
+async def validate_payment_method(context: HookContext):
+    """Valida método de pagamento selecionado"""
+    entity = context.entity
+    payment_method = context.metadata.get("payment_method")
+    
+    if not payment_method:
+        context.abort("Método de pagamento não especificado")
+        return
+    
+    # Verifica se método está disponível para região
+    region = getattr(entity, 'region', None)
+    if region and payment_method not in get_available_methods_for_region(region):
+        context.abort(f"Método {payment_method} não disponível para região {region}")
+
+
+@before_hook("lock_intent")
+async def lock_intent(context: HookContext):
+    """Bloqueia intent para processamento concorrente"""
+    entity = context.entity
+    
+    # Verifica se já está bloqueado
+    if hasattr(entity, 'is_locked') and entity.is_locked:
+        context.abort("Intent já está bloqueada para processamento")
+        return
+    
+    # Marca como bloqueada
+    entity.is_locked = True
+    entity.locked_at = datetime.utcnow()
+    entity.locked_by = context.triggered_by
+
+
+@after_hook("generate_payment_instructions")
+async def generate_payment_instructions(context: HookContext):
+    """Gera instruções de pagamento após seleção de método"""
+    entity = context.entity
+    payment_method = context.metadata.get("payment_method")
+    
+    # Delega para provider específico
+    from app.providers.payment import get_payment_provider
+    provider = get_payment_provider(payment_method)
+    
+    if provider:
+        instructions = await provider.generate_payment_instructions(entity)
+        entity.payment_instructions = instructions
+        context.set_data("payment_instructions", instructions)
+
+
+@entry_action("notify_payment_received")
+async def notify_payment_received(context: HookContext):
+    """Notifica sistema sobre pagamento recebido"""
+    from app.core.notification_engine import NotificationEngine
+    from app.models.user import User
+    
+    entity = context.entity
+    
+    # Busca usuário
+    user = await User.get(entity.user_id)
+    if user:
+        # Envia notificação
+        notification_engine = NotificationEngine()
+        await notification_engine.send_notification(
+            user_id=user.id,
+            notification_type="payment_received",
+            data={
+                "amount": entity.amount,
+                "currency": entity.currency,
+                "intent_id": entity.id
+            }
+        )
+
+
+def get_available_methods_for_region(region: str) -> List[str]:
+    """Retorna métodos disponíveis por região"""
+    # Mapeamento simplificado
+    region_methods = {
+        "BR": ["pix_static", "pix_dynamic", "card"],
+        "EU": ["sepa_instant", "mbway", "card"],
+        "US": ["cash_app", "paypal", "card"],
+        "GLOBAL": ["wallet_global", "card"]
+    }
+    return region_methods.get(region, ["card"])
+
+
+class StateMachineEngine:
+    """
+    Engine principal para gerenciar múltiplas máquinas de estado
+    """
+    
+    def __init__(
+        self,
+        audit_logger: AuditLogger,
+        entitlement_resolver: Optional[EntitlementResolver] = None
+    ):
+        self.audit_logger = audit_logger
+        self.entitlement_resolver = entitlement_resolver
+        self._instances: Dict[str, StateMachineInstance] = {}
+        
+        # Registra máquinas padrão
+        self._register_default_machines()
+    
+    def _register_default_machines(self):
+        """Registra máquinas de estado padrão do sistema"""
+        # PaymentIntent já registrada via decorator
+        # Subscription, Invoice, etc. seriam registradas aqui
+        pass
+    
+    def create_instance(
+        self,
+        machine_name: str,
+        entity: Any
+    ) -> StateMachineInstance:
+        """Cria nova instância de máquina de estado"""
+        instance = StateMachineInstance(
+            machine_name=machine_name,
+            entity=entity,
+            audit_logger=self.audit_logger,
+            entitlement_resolver=self.entitlement_resolver
+        )
+        
+        # Armazena por referência (em produção, persistiria no banco)
+        instance_key = f"{machine_name}:{entity.id}"
+        self._instances[instance_key] = instance
+        
+        return instance
+    
+    def get_instance(
+        self,
+        machine_name: str,
+        entity_id: str
+    ) -> Optional[StateMachineInstance]:
+        """Obtém instância existente"""
+        instance_key = f"{machine_name}:{entity_id}"
+        return self._instances.get(instance_key)
+    
+    async def process_transition(
+        self,
+        machine_name: str,
+        entity: Any,
+        trigger_event: str,
+        triggered_by: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> StateTransition:
+        """
+        Processa transição de estado de forma completa
+        
+        Args:
+            machine_name: Nome da máquina de estado
+            entity: Entidade com estado
+            trigger_event: Evento que dispara transição
+            triggered_by: Quem disparou
+            metadata: Metadados adicionais
+        
+        Returns:
+            StateTransition registrada
+        """
+        # Obtém ou cria instância
+        instance = self.get_instance(machine_name, str(entity.id))
+        if not instance:
+            instance = self.create_instance(machine_name, entity)
+        
+        # Executa transição
+        return await instance.transition(
+            trigger_event=trigger_event,
+            triggered_by=triggered_by,
+            metadata=metadata
+        )
+    
+    def get_machine_config(self, machine_name: str) -> Optional[StateMachineConfig]:
+        """Obtém configuração de máquina específica"""
+        return _state_machine_registry.get_machine(machine_name)
+    
+    def list_machines(self) -> List[str]:
+        """Lista máquinas de estado disponíveis"""
+        return list(_state_machine_registry._machines.keys())
+    
+    async def validate_state_transition(
+        self,
+        machine_name: str,
+        from_state: str,
+        trigger_event: str,
+        user_id: str
+    ) -> Dict[str, Any]:
+        """
+        Valida se transição é possível sem executá-la
+        """
+        config = self.get_machine_config(machine_name)
+        if not config:
+            return {
+                "valid": False,
+                "error": f"Máquina '{machine_name}' não encontrada"
+            }
+        
+        # Verifica se transição existe
+        transition_def = config.get_transition(from_state, trigger_event)
+        if not transition_def:
+            return {
+                "valid": False,
+                "error": f"Transição '{trigger_event}' não permitida de '{from_state}'"
+            }
+        
+        # Verifica entitlements
+        if transition_def.requires_entitlement and self.entitlement_resolver:
+            # Nota: precisa do tenant_id para verificação completa
+            # Esta é uma validação parcial
+            pass
+        
+        return {
+            "valid": True,
+            "transition": {
+                "from_state": from_state,
+                "to_state": transition_def.to_state,
+                "trigger_event": trigger_event,
+                "description": transition_def.description,
+                "requires_entitlement": transition_def.requires_entitlement
+            }
+        }

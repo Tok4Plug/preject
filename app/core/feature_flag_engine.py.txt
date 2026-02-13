@@ -1,0 +1,1490 @@
+"""
+Feature Flag Engine - Sistema de feature flags por tenant com rollout progressivo e kill switches
+
+Princípios:
+1. Feature flags por tenant com isolamento absoluto
+2. Rollout progressivo (usuário, porcentagem, grupos)
+3. Kill switches para desativação instantânea
+4. Sem dependência de deploy
+5. Auditoria completa de mudanças
+"""
+
+import json
+import hashlib
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Any, Tuple, Union, Callable, Set
+import uuid
+import asyncio
+from decimal import Decimal
+
+from app.models.tenant import Tenant
+from app.core.audit_logger import AuditLogger, AuditSeverity, AuditActionCategory
+from app.core.metrics_engine import MetricsEngine
+
+
+class FeatureFlagType(Enum):
+    """Tipos de feature flags"""
+    RELEASE = "release"        # Rollout progressivo de features
+    EXPERIMENT = "experiment"  # A/B testing
+    OPERATIONAL = "operational" # Kill switches
+    PERMISSION = "permission"  # Controle de acesso
+    CUSTOM = "custom"          # Flags personalizados
+
+
+class TargetingType(Enum):
+    """Tipos de targeting"""
+    ALL_USERS = "all_users"            # Todos os usuários
+    PERCENTAGE_ROLLOUT = "percentage"  # Porcentagem de usuários
+    USER_IDS = "user_ids"              # IDs específicos de usuários
+    USER_GROUPS = "user_groups"        # Grupos de usuários
+    ATTRIBUTES = "attributes"          # Atributos de usuário
+    CUSTOM_RULE = "custom_rule"        # Regra personalizada
+
+
+class VariationType(Enum):
+    """Tipos de variação"""
+    BOOLEAN = "boolean"        # True/False
+    STRING = "string"          # Valor string
+    NUMBER = "number"          # Valor numérico
+    JSON = "json"              # Objeto JSON
+    EXPERIMENT = "experiment"  # Variações para experimentos
+
+
+@dataclass
+class Variation:
+    """Variação de um feature flag"""
+    variation_id: str
+    name: str
+    value: Any
+    description: str = ""
+    weight: float = 100.0  # Peso para distribuição
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "variation_id": self.variation_id,
+            "name": self.name,
+            "value": self.value,
+            "description": self.description,
+            "weight": self.weight,
+            "metadata": self.metadata
+        }
+
+
+@dataclass
+class TargetingRule:
+    """Regra de targeting para feature flags"""
+    rule_id: str
+    targeting_type: TargetingType
+    conditions: Dict[str, Any]  # Depende do tipo de targeting
+    variations: List[str]       # IDs das variações aplicáveis
+    percentage: Optional[float] = None  # Para percentage rollout
+    user_ids: Optional[List[str]] = None  # Para targeting por user_ids
+    user_groups: Optional[List[str]] = None  # Para targeting por grupos
+    attributes: Optional[Dict[str, Any]] = None  # Para targeting por atributos
+    custom_rule: Optional[str] = None  # Código/expressão customizada
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        data = {
+            "rule_id": self.rule_id,
+            "targeting_type": self.targeting_type.value,
+            "conditions": self.conditions,
+            "variations": self.variations
+        }
+        
+        if self.percentage is not None:
+            data["percentage"] = self.percentage
+        if self.user_ids:
+            data["user_ids"] = self.user_ids
+        if self.user_groups:
+            data["user_groups"] = self.user_groups
+        if self.attributes:
+            data["attributes"] = self.attributes
+        if self.custom_rule:
+            data["custom_rule"] = self.custom_rule
+        
+        return data
+    
+    def matches_user(
+        self,
+        user_id: str,
+        user_attributes: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Verifica se usuário corresponde à regra"""
+        if self.targeting_type == TargetingType.ALL_USERS:
+            return True
+        
+        elif self.targeting_type == TargetingType.PERCENTAGE_ROLLOUT:
+            if self.percentage is None:
+                return False
+            
+            # Hash determinístico do user_id para porcentagem
+            hash_value = int(hashlib.md5(user_id.encode()).hexdigest(), 16)
+            user_percentage = (hash_value % 10000) / 100.0
+            return user_percentage < self.percentage
+        
+        elif self.targeting_type == TargetingType.USER_IDS:
+            return user_id in (self.user_ids or [])
+        
+        elif self.targeting_type == TargetingType.USER_GROUPS:
+            # Verificar se usuário pertence a algum dos grupos
+            # Em produção, seria verificado contra um serviço de grupos
+            return False  # Implementação simplificada
+        
+        elif self.targeting_type == TargetingType.ATTRIBUTES:
+            if not user_attributes or not self.attributes:
+                return False
+            
+            for key, value in self.attributes.items():
+                if user_attributes.get(key) != value:
+                    return False
+            return True
+        
+        elif self.targeting_type == TargetingType.CUSTOM_RULE:
+            # Em produção, avaliaria a regra customizada
+            # Por segurança, não executamos código arbitrário aqui
+            return False
+        
+        return False
+
+
+@dataclass
+class FeatureFlag:
+    """Feature flag completo"""
+    flag_id: str
+    tenant_id: str
+    key: str                    # Identificador único (ex: "new_checkout")
+    name: str
+    description: str
+    flag_type: FeatureFlagType
+    variation_type: VariationType
+    
+    # Variações possíveis
+    variations: Dict[str, Variation] = field(default_factory=dict)
+    
+    # Regras de targeting (ordem importa)
+    targeting_rules: List[TargetingRule] = field(default_factory=list)
+    
+    # Configurações
+    default_variation: Optional[str] = None  # ID da variação padrão (fallback)
+    enabled: bool = True
+    permanent: bool = False  # Se True, não pode ser desativado
+    
+    # Rollout
+    rollout_started_at: Optional[datetime] = None
+    rollout_percentage: float = 0.0  # Porcentagem atual do rollout
+    target_percentage: float = 100.0  # Porcentagem alvo
+    
+    # Segurança
+    kill_switch: bool = False  # Se True, força desativação imediata
+    
+    # Metadata
+    tags: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_by: str = "system"
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def get_variation(
+        self,
+        user_id: str,
+        user_attributes: Optional[Dict[str, Any]] = None
+    ) -> Optional[Variation]:
+        """Obtém variação para usuário específico"""
+        # Kill switch tem prioridade máxima
+        if self.kill_switch:
+            return None
+        
+        # Se desativado, retorna None
+        if not self.enabled:
+            return None
+        
+        # Aplica regras na ordem
+        for rule in self.targeting_rules:
+            if rule.matches_user(user_id, user_attributes):
+                # Escolhe variação baseada em peso
+                return self._select_variation_by_weight(rule.variations)
+        
+        # Fallback para variação padrão
+        if self.default_variation:
+            return self.variations.get(self.default_variation)
+        
+        return None
+    
+    def _select_variation_by_weight(self, variation_ids: List[str]) -> Optional[Variation]:
+        """Seleciona variação baseada em pesos"""
+        if not variation_ids:
+            return None
+        
+        # Filtra variações existentes
+        available_variations = []
+        weights = []
+        
+        for var_id in variation_ids:
+            variation = self.variations.get(var_id)
+            if variation:
+                available_variations.append(variation)
+                weights.append(variation.weight)
+        
+        if not available_variations:
+            return None
+        
+        # Normaliza pesos
+        total_weight = sum(weights)
+        if total_weight == 0:
+            return available_variations[0]
+        
+        # Seleção determinística baseada em hash
+        # Em produção, seria baseada em user_id ou contexto
+        selection_hash = int(hashlib.md5(str(datetime.utcnow().timestamp()).encode()).hexdigest(), 16)
+        selection = (selection_hash % 10000) / 100.0
+        
+        cumulative = 0
+        for i, weight in enumerate(weights):
+            normalized_weight = (weight / total_weight) * 100.0
+            cumulative += normalized_weight
+            if selection <= cumulative:
+                return available_variations[i]
+        
+        return available_variations[-1]
+    
+    def is_user_in_rollout(
+        self,
+        user_id: str,
+        user_attributes: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Verifica se usuário está incluído no rollout atual"""
+        if self.kill_switch or not self.enabled:
+            return False
+        
+        # Se rollout não começou, ninguém tem acesso
+        if self.rollout_started_at is None:
+            return False
+        
+        # Para cada regra, verifica se usuário está incluído
+        for rule in self.targeting_rules:
+            if rule.matches_user(user_id, user_attributes):
+                return True
+        
+        return False
+    
+    def to_dict(self, include_variations: bool = True) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        data = {
+            "flag_id": self.flag_id,
+            "tenant_id": self.tenant_id,
+            "key": self.key,
+            "name": self.name,
+            "description": self.description,
+            "type": self.flag_type.value,
+            "variation_type": self.variation_type.value,
+            "default_variation": self.default_variation,
+            "enabled": self.enabled,
+            "permanent": self.permanent,
+            "rollout_started_at": self.rollout_started_at.isoformat() if self.rollout_started_at else None,
+            "rollout_percentage": self.rollout_percentage,
+            "target_percentage": self.target_percentage,
+            "kill_switch": self.kill_switch,
+            "tags": self.tags,
+            "metadata": self.metadata,
+            "created_at": self.created_at.isoformat(),
+            "created_by": self.created_by,
+            "updated_at": self.updated_at.isoformat(),
+            "targeting_rules": [r.to_dict() for r in self.targeting_rules]
+        }
+        
+        if include_variations:
+            data["variations"] = {k: v.to_dict() for k, v in self.variations.items()}
+        
+        return data
+
+
+class FeatureFlagEvaluationResult:
+    """Resultado da avaliação de um feature flag"""
+    
+    def __init__(
+        self,
+        flag: FeatureFlag,
+        user_id: str,
+        variation: Optional[Variation],
+        reason: str,
+        timestamp: datetime
+    ):
+        self.flag = flag
+        self.user_id = user_id
+        self.variation = variation
+        self.reason = reason
+        self.timestamp = timestamp
+        self.metadata: Dict[str, Any] = {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "flag_key": self.flag.key,
+            "flag_type": self.flag.flag_type.value,
+            "user_id": self.user_id,
+            "variation": self.variation.to_dict() if self.variation else None,
+            "reason": self.reason,
+            "timestamp": self.timestamp.isoformat(),
+            "metadata": self.metadata
+        }
+    
+    @property
+    def enabled(self) -> bool:
+        """Se o flag está habilitado para o usuário"""
+        return self.variation is not None
+
+
+class FeatureFlagRegistry:
+    """Registro de feature flags por tenant"""
+    
+    def __init__(self, audit_logger: AuditLogger):
+        self.audit_logger = audit_logger
+        self._flags: Dict[str, Dict[str, FeatureFlag]] = {}  # tenant_id -> {flag_key -> FeatureFlag}
+        self._flag_ids: Dict[str, Dict[str, str]] = {}  # tenant_id -> {flag_id -> flag_key}
+        self._cache: Dict[str, FeatureFlag] = {}  # Cache por flag_key:tenant_id
+        
+        # Inicializa flags padrão do sistema
+        self._initialize_default_flags()
+    
+    def _initialize_default_flags(self):
+        """Inicializa flags padrão do sistema"""
+        # Flags operacionais padrão (kill switches)
+        system_flags = [
+            self._create_maintenance_mode_flag(),
+            self._create_rate_limiting_flag(),
+            self._create_experimental_features_flag()
+        ]
+        
+        for flag in system_flags:
+            if "system" not in self._flags:
+                self._flags["system"] = {}
+                self._flag_ids["system"] = {}
+            
+            self._flags["system"][flag.key] = flag
+            self._flag_ids["system"][flag.flag_id] = flag.key
+    
+    def _create_maintenance_mode_flag(self) -> FeatureFlag:
+        """Cria flag de modo de manutenção"""
+        flag_id = f"flag_{uuid.uuid4().hex[:16]}"
+        
+        variations = {
+            "enabled": Variation(
+                variation_id="enabled",
+                name="Maintenance Mode Enabled",
+                value=True,
+                description="Sistema em modo de manutenção"
+            ),
+            "disabled": Variation(
+                variation_id="disabled",
+                name="Maintenance Mode Disabled",
+                value=False,
+                description="Sistema operacional normal"
+            )
+        }
+        
+        return FeatureFlag(
+            flag_id=flag_id,
+            tenant_id="system",
+            key="maintenance_mode",
+            name="Maintenance Mode",
+            description="Ativa/desativa modo de manutenção do sistema",
+            flag_type=FeatureFlagType.OPERATIONAL,
+            variation_type=VariationType.BOOLEAN,
+            variations=variations,
+            default_variation="disabled",
+            enabled=True,
+            permanent=False,
+            tags=["operational", "maintenance", "kill_switch"]
+        )
+    
+    def _create_rate_limiting_flag(self) -> FeatureFlag:
+        """Cria flag para controle de rate limiting"""
+        flag_id = f"flag_{uuid.uuid4().hex[:16]}"
+        
+        variations = {
+            "strict": Variation(
+                variation_id="strict",
+                name="Strict Rate Limiting",
+                value={"limit": 100, "window": 3600},
+                description="Rate limiting estrito (100 req/hora)"
+            ),
+            "normal": Variation(
+                variation_id="normal",
+                name="Normal Rate Limiting",
+                value={"limit": 1000, "window": 3600},
+                description="Rate limiting normal (1000 req/hora)"
+            ),
+            "relaxed": Variation(
+                variation_id="relaxed",
+                name="Relaxed Rate Limiting",
+                value={"limit": 10000, "window": 3600},
+                description="Rate limit relaxado (10000 req/hora)"
+            )
+        }
+        
+        return FeatureFlag(
+            flag_id=flag_id,
+            tenant_id="system",
+            key="rate_limiting_mode",
+            name="Rate Limiting Mode",
+            description="Controla o nível de rate limiting do sistema",
+            flag_type=FeatureFlagType.OPERATIONAL,
+            variation_type=VariationType.JSON,
+            variations=variations,
+            default_variation="normal",
+            enabled=True,
+            permanent=False,
+            tags=["operational", "rate_limiting", "security"]
+        )
+    
+    def _create_experimental_features_flag(self) -> FeatureFlag:
+        """Cria flag para features experimentais"""
+        flag_id = f"flag_{uuid.uuid4().hex[:16]}"
+        
+        variations = {
+            "enabled": Variation(
+                variation_id="enabled",
+                name="Experimental Features Enabled",
+                value=True,
+                description="Features experimentais habilitadas",
+                weight=10.0  # Apenas 10% dos usuários
+            ),
+            "disabled": Variation(
+                variation_id="disabled",
+                name="Experimental Features Disabled",
+                value=False,
+                description="Features experimentais desabilitadas",
+                weight=90.0  # 90% dos usuários
+            )
+        }
+        
+        # Regra de porcentagem
+        targeting_rule = TargetingRule(
+            rule_id=f"rule_{uuid.uuid4().hex[:16]}",
+            targeting_type=TargetingType.PERCENTAGE_ROLLOUT,
+            conditions={"rollout_percentage": 10.0},
+            variations=["enabled", "disabled"],
+            percentage=10.0
+        )
+        
+        return FeatureFlag(
+            flag_id=flag_id,
+            tenant_id="system",
+            key="experimental_features",
+            name="Experimental Features",
+            description="Controla acesso a features experimentais",
+            flag_type=FeatureFlagType.EXPERIMENT,
+            variation_type=VariationType.BOOLEAN,
+            variations=variations,
+            targeting_rules=[targeting_rule],
+            default_variation="disabled",
+            enabled=True,
+            rollout_percentage=10.0,
+            target_percentage=50.0,  # Meta de rollout
+            tags=["experiment", "beta", "features"]
+        )
+    
+    def register_flag(self, flag: FeatureFlag) -> bool:
+        """Registra novo feature flag"""
+        if flag.tenant_id not in self._flags:
+            self._flags[flag.tenant_id] = {}
+            self._flag_ids[flag.tenant_id] = {}
+        
+        # Verifica unicidade da chave
+        if flag.key in self._flags[flag.tenant_id]:
+            return False
+        
+        self._flags[flag.tenant_id][flag.key] = flag
+        self._flag_ids[flag.tenant_id][flag.flag_id] = flag.key
+        
+        # Atualiza cache
+        cache_key = f"{flag.tenant_id}:{flag.key}"
+        self._cache[cache_key] = flag
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id=flag.tenant_id,
+            user_id=flag.created_by,
+            action="feature_flag.created",
+            action_category=AuditActionCategory.CONFIGURATION,
+            severity=AuditSeverity.INFO,
+            description=f"Feature flag '{flag.name}' criado",
+            metadata={
+                "flag_id": flag.flag_id,
+                "flag_key": flag.key,
+                "flag_type": flag.flag_type.value
+            },
+            tags=["feature_flag", "creation"]
+        ))
+        
+        return True
+    
+    def get_flag(self, tenant_id: str, flag_key: str) -> Optional[FeatureFlag]:
+        """Obtém feature flag por chave"""
+        # Tenta cache primeiro
+        cache_key = f"{tenant_id}:{flag_key}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
+        # Busca no registro
+        if tenant_id in self._flags and flag_key in self._flags[tenant_id]:
+            flag = self._flags[tenant_id][flag_key]
+            self._cache[cache_key] = flag
+            return flag
+        
+        # Tenta flags do sistema
+        if "system" in self._flags and flag_key in self._flags["system"]:
+            flag = self._flags["system"][flag_key]
+            self._cache[cache_key] = flag
+            return flag
+        
+        return None
+    
+    def get_flag_by_id(self, tenant_id: str, flag_id: str) -> Optional[FeatureFlag]:
+        """Obtém feature flag por ID"""
+        if tenant_id in self._flag_ids and flag_id in self._flag_ids[tenant_id]:
+            flag_key = self._flag_ids[tenant_id][flag_id]
+            return self.get_flag(tenant_id, flag_key)
+        
+        return None
+    
+    def update_flag(self, flag: FeatureFlag, updated_by: str) -> bool:
+        """Atualiza feature flag existente"""
+        if flag.tenant_id not in self._flags or flag.key not in self._flags[flag.tenant_id]:
+            return False
+        
+        old_flag = self._flags[flag.tenant_id][flag.key]
+        
+        # Não permite alterar tipo ou variação tipo
+        if old_flag.flag_type != flag.flag_type or old_flag.variation_type != flag.variation_type:
+            return False
+        
+        # Atualiza
+        flag.updated_at = datetime.utcnow()
+        self._flags[flag.tenant_id][flag.key] = flag
+        
+        # Atualiza cache
+        cache_key = f"{flag.tenant_id}:{flag.key}"
+        self._cache[cache_key] = flag
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id=flag.tenant_id,
+            user_id=updated_by,
+            action="feature_flag.updated",
+            action_category=AuditActionCategory.CONFIGURATION,
+            severity=AuditSeverity.INFO,
+            description=f"Feature flag '{flag.name}' atualizado",
+            metadata={
+                "flag_id": flag.flag_id,
+                "flag_key": flag.key,
+                "changes": ["general_update"]  # Em produção, seria diff detalhado
+            },
+            tags=["feature_flag", "update"]
+        ))
+        
+        return True
+    
+    def delete_flag(self, tenant_id: str, flag_key: str, deleted_by: str) -> bool:
+        """Remove feature flag"""
+        if tenant_id not in self._flags or flag_key not in self._flags[tenant_id]:
+            return False
+        
+        flag = self._flags[tenant_id].pop(flag_key)
+        
+        # Remove do índice de IDs
+        if flag.flag_id in self._flag_ids[tenant_id]:
+            del self._flag_ids[tenant_id][flag.flag_id]
+        
+        # Remove do cache
+        cache_key = f"{tenant_id}:{flag_key}"
+        if cache_key in self._cache:
+            del self._cache[cache_key]
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id=tenant_id,
+            user_id=deleted_by,
+            action="feature_flag.deleted",
+            action_category=AuditActionCategory.CONFIGURATION,
+            severity=AuditSeverity.INFO,
+            description=f"Feature flag '{flag.name}' removido",
+            metadata={
+                "flag_id": flag.flag_id,
+                "flag_key": flag_key
+            },
+            tags=["feature_flag", "deletion"]
+        ))
+        
+        return True
+    
+    def list_flags(
+        self,
+        tenant_id: str,
+        flag_type: Optional[FeatureFlagType] = None,
+        enabled_only: bool = False,
+        tags: Optional[List[str]] = None
+    ) -> List[FeatureFlag]:
+        """Lista feature flags com filtros"""
+        flags = []
+        
+        # Flags do tenant
+        tenant_flags = self._flags.get(tenant_id, {}).values()
+        flags.extend(tenant_flags)
+        
+        # Flags do sistema
+        system_flags = self._flags.get("system", {}).values()
+        flags.extend(system_flags)
+        
+        # Aplica filtros
+        filtered = []
+        for flag in flags:
+            if flag_type and flag.flag_type != flag_type:
+                continue
+            
+            if enabled_only and not flag.enabled:
+                continue
+            
+            if tags and not any(tag in flag.tags for tag in tags):
+                continue
+            
+            filtered.append(flag)
+        
+        return filtered
+    
+    def increment_rollout(
+        self,
+        tenant_id: str,
+        flag_key: str,
+        increment_percentage: float,
+        updated_by: str
+    ) -> bool:
+        """Incrementa porcentagem de rollout"""
+        flag = self.get_flag(tenant_id, flag_key)
+        if not flag:
+            return False
+        
+        new_percentage = min(flag.rollout_percentage + increment_percentage, flag.target_percentage)
+        
+        # Se começando rollout, marca timestamp
+        if flag.rollout_percentage == 0 and new_percentage > 0:
+            flag.rollout_started_at = datetime.utcnow()
+        
+        flag.rollout_percentage = new_percentage
+        flag.updated_at = datetime.utcnow()
+        
+        # Atualiza regras de porcentagem
+        for rule in flag.targeting_rules:
+            if rule.targeting_type == TargetingType.PERCENTAGE_ROLLOUT:
+                rule.percentage = new_percentage
+        
+        # Atualiza cache
+        cache_key = f"{tenant_id}:{flag_key}"
+        self._cache[cache_key] = flag
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id=tenant_id,
+            user_id=updated_by,
+            action="feature_flag.rollout_incremented",
+            action_category=AuditActionCategory.CONFIGURATION,
+            severity=AuditSeverity.INFO,
+            description=f"Rollout do flag '{flag.name}' incrementado para {new_percentage}%",
+            metadata={
+                "flag_id": flag.flag_id,
+                "flag_key": flag_key,
+                "old_percentage": flag.rollout_percentage - increment_percentage,
+                "new_percentage": new_percentage,
+                "increment": increment_percentage
+            },
+            tags=["feature_flag", "rollout"]
+        ))
+        
+        return True
+    
+    def toggle_kill_switch(
+        self,
+        tenant_id: str,
+        flag_key: str,
+        kill_switch: bool,
+        updated_by: str
+    ) -> bool:
+        """Ativa/desativa kill switch"""
+        flag = self.get_flag(tenant_id, flag_key)
+        if not flag:
+            return False
+        
+        flag.kill_switch = kill_switch
+        flag.updated_at = datetime.utcnow()
+        
+        # Atualiza cache
+        cache_key = f"{tenant_id}:{flag_key}"
+        self._cache[cache_key] = flag
+        
+        action = "enabled" if kill_switch else "disabled"
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id=tenant_id,
+            user_id=updated_by,
+            action=f"feature_flag.kill_switch_{action}",
+            action_category=AuditActionCategory.OPERATIONAL,
+            severity=AuditSeverity.HIGH if kill_switch else AuditSeverity.INFO,
+            description=f"Kill switch do flag '{flag.name}' {action}",
+            metadata={
+                "flag_id": flag.flag_id,
+                "flag_key": flag_key,
+                "kill_switch": kill_switch
+            },
+            tags=["feature_flag", "kill_switch"]
+        ))
+        
+        return True
+
+
+class FeatureFlagEngine:
+    """
+    Engine principal de feature flags
+    """
+    
+    def __init__(
+        self,
+        audit_logger: AuditLogger,
+        metrics_engine: Optional[MetricsEngine] = None
+    ):
+        self.audit_logger = audit_logger
+        self.metrics_engine = metrics_engine
+        self.registry = FeatureFlagRegistry(audit_logger)
+        
+        # Cache de avaliações recentes
+        self._evaluation_cache: Dict[str, FeatureFlagEvaluationResult] = {}
+        self._cache_max_size = 10000
+        self._cache_ttl = 300  # 5 minutos
+        
+        # Estatísticas
+        self._stats = {
+            "evaluations": 0,
+            "cache_hits": 0,
+            "flags_created": 0,
+            "flags_updated": 0
+        }
+        
+        # Inicia cleanup periódico do cache
+        self._cleanup_task = asyncio.create_task(self._periodic_cache_cleanup())
+    
+    async def _periodic_cache_cleanup(self):
+        """Limpeza periódica do cache"""
+        while True:
+            await asyncio.sleep(60)  # A cada minuto
+            
+            now = datetime.utcnow()
+            keys_to_remove = []
+            
+            for key, result in self._evaluation_cache.items():
+                cache_age = (now - result.timestamp).total_seconds()
+                if cache_age > self._cache_ttl:
+                    keys_to_remove.append(key)
+            
+            for key in keys_to_remove:
+                del self._evaluation_cache[key]
+    
+    def _generate_cache_key(
+        self,
+        tenant_id: str,
+        flag_key: str,
+        user_id: str,
+        user_attributes: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Gera chave de cache para avaliação"""
+        key_parts = [tenant_id, flag_key, user_id]
+        
+        if user_attributes:
+            # Ordena atributos para consistência
+            sorted_attrs = json.dumps(user_attributes, sort_keys=True)
+            key_parts.append(hashlib.md5(sorted_attrs.encode()).hexdigest())
+        
+        return hashlib.md5(":".join(key_parts).encode()).hexdigest()
+    
+    async def evaluate(
+        self,
+        tenant_id: str,
+        flag_key: str,
+        user_id: str,
+        user_attributes: Optional[Dict[str, Any]] = None,
+        use_cache: bool = True
+    ) -> FeatureFlagEvaluationResult:
+        """
+        Avalia feature flag para usuário específico
+        """
+        # Gera chave de cache
+        cache_key = self._generate_cache_key(tenant_id, flag_key, user_id, user_attributes)
+        
+        # Tenta cache
+        if use_cache and cache_key in self._evaluation_cache:
+            result = self._evaluation_cache[cache_key]
+            
+            # Verifica se cache ainda é válido
+            cache_age = (datetime.utcnow() - result.timestamp).total_seconds()
+            if cache_age < self._cache_ttl:
+                self._stats["cache_hits"] += 1
+                return result
+        
+        # Obtém flag
+        flag = self.registry.get_flag(tenant_id, flag_key)
+        
+        if not flag:
+            # Flag não encontrado
+            result = FeatureFlagEvaluationResult(
+                flag=None,  # Em produção, seria um objeto dummy
+                user_id=user_id,
+                variation=None,
+                reason="FLAG_NOT_FOUND",
+                timestamp=datetime.utcnow()
+            )
+            return result
+        
+        # Avalia flag
+        variation = flag.get_variation(user_id, user_attributes)
+        
+        if variation:
+            reason = "TARGETING_MATCH"
+        elif flag.default_variation:
+            variation = flag.variations.get(flag.default_variation)
+            reason = "DEFAULT_VARIATION"
+        else:
+            reason = "NO_VARIATION"
+        
+        # Cria resultado
+        result = FeatureFlagEvaluationResult(
+            flag=flag,
+            user_id=user_id,
+            variation=variation,
+            reason=reason,
+            timestamp=datetime.utcnow()
+        )
+        
+        # Registra métricas
+        if self.metrics_engine:
+            await self.metrics_engine.increment_counter(
+                tenant_id=tenant_id,
+                counter_name="feature_flag_evaluations_total",
+                labels={
+                    "flag_key": flag_key,
+                    "flag_type": flag.flag_type.value,
+                    "enabled": str(variation is not None),
+                    "reason": reason
+                }
+            )
+        
+        # Armazena em cache
+        if use_cache:
+            if len(self._evaluation_cache) >= self._cache_max_size:
+                # Remove entrada mais antiga
+                oldest_key = min(
+                    self._evaluation_cache.keys(),
+                    key=lambda k: self._evaluation_cache[k].timestamp
+                )
+                del self._evaluation_cache[oldest_key]
+            
+            self._evaluation_cache[cache_key] = result
+        
+        self._stats["evaluations"] += 1
+        
+        return result
+    
+    async def evaluate_boolean(
+        self,
+        tenant_id: str,
+        flag_key: str,
+        user_id: str,
+        user_attributes: Optional[Dict[str, Any]] = None,
+        default: bool = False
+    ) -> bool:
+        """Avalia feature flag booleano"""
+        result = await self.evaluate(tenant_id, flag_key, user_id, user_attributes)
+        
+        if not result.variation:
+            return default
+        
+        try:
+            return bool(result.variation.value)
+        except:
+            return default
+    
+    async def evaluate_string(
+        self,
+        tenant_id: str,
+        flag_key: str,
+        user_id: str,
+        user_attributes: Optional[Dict[str, Any]] = None,
+        default: str = ""
+    ) -> str:
+        """Avalia feature flag string"""
+        result = await self.evaluate(tenant_id, flag_key, user_id, user_attributes)
+        
+        if not result.variation:
+            return default
+        
+        try:
+            return str(result.variation.value)
+        except:
+            return default
+    
+    async def evaluate_json(
+        self,
+        tenant_id: str,
+        flag_key: str,
+        user_id: str,
+        user_attributes: Optional[Dict[str, Any]] = None,
+        default: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Avalia feature flag JSON"""
+        result = await self.evaluate(tenant_id, flag_key, user_id, user_attributes)
+        
+        if not result.variation:
+            return default or {}
+        
+        try:
+            if isinstance(result.variation.value, dict):
+                return result.variation.value
+            elif isinstance(result.variation.value, str):
+                return json.loads(result.variation.value)
+            else:
+                return default or {}
+        except:
+            return default or {}
+    
+    async def create_flag(
+        self,
+        tenant: Tenant,
+        key: str,
+        name: str,
+        description: str,
+        flag_type: FeatureFlagType,
+        variation_type: VariationType,
+        variations: List[Dict[str, Any]],
+        targeting_rules: Optional[List[Dict[str, Any]]] = None,
+        default_variation: Optional[str] = None,
+        enabled: bool = True,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        created_by: str = "system"
+    ) -> FeatureFlag:
+        """Cria novo feature flag"""
+        flag_id = f"flag_{uuid.uuid4().hex[:16]}"
+        
+        # Converte variações
+        flag_variations = {}
+        for var_data in variations:
+            variation = Variation(
+                variation_id=var_data.get("variation_id", f"var_{uuid.uuid4().hex[:8]}"),
+                name=var_data["name"],
+                value=var_data["value"],
+                description=var_data.get("description", ""),
+                weight=var_data.get("weight", 100.0),
+                metadata=var_data.get("metadata", {})
+            )
+            flag_variations[variation.variation_id] = variation
+        
+        # Converte regras de targeting
+        flag_targeting_rules = []
+        if targeting_rules:
+            for rule_data in targeting_rules:
+                rule = TargetingRule(
+                    rule_id=rule_data.get("rule_id", f"rule_{uuid.uuid4().hex[:8]}"),
+                    targeting_type=TargetingType(rule_data["targeting_type"]),
+                    conditions=rule_data.get("conditions", {}),
+                    variations=rule_data["variations"],
+                    percentage=rule_data.get("percentage"),
+                    user_ids=rule_data.get("user_ids"),
+                    user_groups=rule_data.get("user_groups"),
+                    attributes=rule_data.get("attributes"),
+                    custom_rule=rule_data.get("custom_rule")
+                )
+                flag_targeting_rules.append(rule)
+        
+        # Cria flag
+        flag = FeatureFlag(
+            flag_id=flag_id,
+            tenant_id=tenant.tenant_id,
+            key=key,
+            name=name,
+            description=description,
+            flag_type=flag_type,
+            variation_type=variation_type,
+            variations=flag_variations,
+            targeting_rules=flag_targeting_rules,
+            default_variation=default_variation,
+            enabled=enabled,
+            tags=tags or [],
+            metadata=metadata or {},
+            created_by=created_by
+        )
+        
+        # Registra
+        if self.registry.register_flag(flag):
+            self._stats["flags_created"] += 1
+            return flag
+        else:
+            raise ValueError(f"Feature flag com key '{key}' já existe")
+    
+    async def update_flag_targeting(
+        self,
+        tenant: Tenant,
+        flag_key: str,
+        targeting_rules: List[Dict[str, Any]],
+        updated_by: str
+    ) -> bool:
+        """Atualiza regras de targeting de um flag"""
+        flag = self.registry.get_flag(tenant.tenant_id, flag_key)
+        if not flag:
+            return False
+        
+        # Converte regras
+        new_targeting_rules = []
+        for rule_data in targeting_rules:
+            rule = TargetingRule(
+                rule_id=rule_data.get("rule_id", f"rule_{uuid.uuid4().hex[:8]}"),
+                targeting_type=TargetingType(rule_data["targeting_type"]),
+                conditions=rule_data.get("conditions", {}),
+                variations=rule_data["variations"],
+                percentage=rule_data.get("percentage"),
+                user_ids=rule_data.get("user_ids"),
+                user_groups=rule_data.get("user_groups"),
+                attributes=rule_data.get("attributes"),
+                custom_rule=rule_data.get("custom_rule")
+            )
+            new_targeting_rules.append(rule)
+        
+        # Atualiza flag
+        flag.targeting_rules = new_targeting_rules
+        flag.updated_at = datetime.utcnow()
+        
+        # Atualiza no registro
+        success = self.registry.update_flag(flag, updated_by)
+        if success:
+            self._stats["flags_updated"] += 1
+        
+        # Invalida cache para este flag
+        self._invalidate_cache_for_flag(tenant.tenant_id, flag_key)
+        
+        return success
+    
+    async def start_rollout(
+        self,
+        tenant: Tenant,
+        flag_key: str,
+        target_percentage: float = 100.0,
+        updated_by: str = "system"
+    ) -> bool:
+        """Inicia rollout de um feature flag"""
+        flag = self.registry.get_flag(tenant.tenant_id, flag_key)
+        if not flag:
+            return False
+        
+        flag.rollout_started_at = datetime.utcnow()
+        flag.target_percentage = target_percentage
+        flag.rollout_percentage = 0.0  # Começa do zero
+        flag.updated_at = datetime.utcnow()
+        
+        # Atualiza no registro
+        success = self.registry.update_flag(flag, updated_by)
+        
+        # Log de auditoria
+        await self.audit_logger.log(
+            tenant_id=tenant.tenant_id,
+            user_id=updated_by,
+            action="feature_flag.rollout_started",
+            action_category=AuditActionCategory.CONFIGURATION,
+            severity=AuditSeverity.INFO,
+            description=f"Rollout do flag '{flag.name}' iniciado",
+            metadata={
+                "flag_key": flag_key,
+                "target_percentage": target_percentage
+            },
+            tags=["feature_flag", "rollout"]
+        )
+        
+        return success
+    
+    async def get_flag_status(
+        self,
+        tenant_id: str,
+        flag_key: str
+    ) -> Dict[str, Any]:
+        """Obtém status detalhado de um feature flag"""
+        flag = self.registry.get_flag(tenant_id, flag_key)
+        if not flag:
+            return {"error": "FLAG_NOT_FOUND"}
+        
+        # Estatísticas de uso (simplificado)
+        total_evaluations = 0
+        enabled_evaluations = 0
+        
+        for result in self._evaluation_cache.values():
+            if result.flag and result.flag.key == flag_key:
+                total_evaluations += 1
+                if result.enabled:
+                    enabled_evaluations += 1
+        
+        return {
+            "flag": flag.to_dict(include_variations=True),
+            "status": {
+                "enabled": flag.enabled,
+                "kill_switch": flag.kill_switch,
+                "rollout_percentage": flag.rollout_percentage,
+                "target_percentage": flag.target_percentage,
+                "rollout_started": flag.rollout_started_at is not None,
+                "rollout_started_at": flag.rollout_started_at.isoformat() if flag.rollout_started_at else None
+            },
+            "statistics": {
+                "total_evaluations": total_evaluations,
+                "enabled_evaluations": enabled_evaluations,
+                "enabled_percentage": (enabled_evaluations / total_evaluations * 100) if total_evaluations > 0 else 0
+            }
+        }
+    
+    def _invalidate_cache_for_flag(self, tenant_id: str, flag_key: str):
+        """Invalida cache para um flag específico"""
+        keys_to_remove = []
+        
+        for key in self._evaluation_cache.keys():
+            # A chave de cache contém tenant_id:flag_key:user_id...
+            if f"{tenant_id}:{flag_key}" in key:
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            del self._evaluation_cache[key]
+    
+    async def get_user_flags(
+        self,
+        tenant_id: str,
+        user_id: str,
+        user_attributes: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Obtém todos os flags para um usuário específico"""
+        # Lista todos os flags do tenant
+        tenant_flags = self.registry.list_flags(tenant_id)
+        system_flags = self.registry.list_flags("system")
+        all_flags = tenant_flags + system_flags
+        
+        results = {}
+        
+        for flag in all_flags:
+            if not flag.enabled:
+                continue
+            
+            result = await self.evaluate(
+                tenant_id=flag.tenant_id,
+                flag_key=flag.key,
+                user_id=user_id,
+                user_attributes=user_attributes,
+                use_cache=True
+            )
+            
+            results[flag.key] = {
+                "enabled": result.enabled,
+                "variation": result.variation.to_dict() if result.variation else None,
+                "reason": result.reason,
+                "flag_type": flag.flag_type.value
+            }
+        
+        return {
+            "user_id": user_id,
+            "tenant_id": tenant_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "flags": results,
+            "total_flags": len(all_flags),
+            "enabled_flags": sum(1 for r in results.values() if r["enabled"])
+        }
+    
+    async def export_flags(self, tenant_id: str) -> List[Dict[str, Any]]:
+        """Exporta todos os flags de um tenant"""
+        flags = self.registry.list_flags(tenant_id)
+        return [flag.to_dict(include_variations=True) for flag in flags]
+    
+    async def import_flags(
+        self,
+        tenant_id: str,
+        flags_data: List[Dict[str, Any]],
+        imported_by: str
+    ) -> int:
+        """Importa flags de formato portável"""
+        imported_count = 0
+        
+        for flag_data in flags_data:
+            try:
+                # Converte enums
+                flag_data["flag_type"] = FeatureFlagType(flag_data["type"])
+                flag_data["variation_type"] = VariationType(flag_data["variation_type"])
+                
+                # Converte variações
+                variations = []
+                for var_id, var_data in flag_data["variations"].items():
+                    variations.append({
+                        "variation_id": var_id,
+                        "name": var_data["name"],
+                        "value": var_data["value"],
+                        "description": var_data.get("description", ""),
+                        "weight": var_data.get("weight", 100.0),
+                        "metadata": var_data.get("metadata", {})
+                    })
+                
+                # Converte regras de targeting
+                targeting_rules = []
+                for rule_data in flag_data.get("targeting_rules", []):
+                    targeting_rules.append({
+                        "rule_id": rule_data.get("rule_id"),
+                        "targeting_type": rule_data["targeting_type"],
+                        "conditions": rule_data.get("conditions", {}),
+                        "variations": rule_data["variations"],
+                        "percentage": rule_data.get("percentage"),
+                        "user_ids": rule_data.get("user_ids"),
+                        "user_groups": rule_data.get("user_groups"),
+                        "attributes": rule_data.get("attributes"),
+                        "custom_rule": rule_data.get("custom_rule")
+                    })
+                
+                # Cria flag
+                flag = await self.create_flag(
+                    tenant=type('Tenant', (), {'tenant_id': tenant_id})(),
+                    key=flag_data["key"],
+                    name=flag_data["name"],
+                    description=flag_data["description"],
+                    flag_type=flag_data["flag_type"],
+                    variation_type=flag_data["variation_type"],
+                    variations=variations,
+                    targeting_rules=targeting_rules,
+                    default_variation=flag_data.get("default_variation"),
+                    enabled=flag_data.get("enabled", True),
+                    tags=flag_data.get("tags", []),
+                    metadata=flag_data.get("metadata", {}),
+                    created_by=imported_by
+                )
+                
+                imported_count += 1
+                
+            except Exception as e:
+                print(f"Erro ao importar flag {flag_data.get('key', 'unknown')}: {e}")
+                continue
+        
+        return imported_count
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Obtém estatísticas do engine"""
+        return {
+            **self._stats,
+            "cache_size": len(self._evaluation_cache),
+            "total_flags": sum(len(flags) for flags in self.registry._flags.values()),
+            "cache_hit_rate": (
+                self._stats["cache_hits"] / self._stats["evaluations"]
+                if self._stats["evaluations"] > 0 else 0
+            )
+        }
+    
+    async def cleanup(self):
+        """Limpa recursos do engine"""
+        if hasattr(self, '_cleanup_task'):
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+
+# Utilitários para feature flags
+class FeatureFlagUtils:
+    """Utilitários para uso comum de feature flags"""
+    
+    @staticmethod
+    def create_boolean_flag(
+        tenant_id: str,
+        key: str,
+        name: str,
+        description: str,
+        enabled: bool = False,
+        rollout_percentage: float = 0.0
+    ) -> Dict[str, Any]:
+        """Cria configuração para flag booleano simples"""
+        variations = [
+            {
+                "variation_id": "enabled",
+                "name": "Enabled",
+                "value": True,
+                "weight": rollout_percentage
+            },
+            {
+                "variation_id": "disabled",
+                "name": "Disabled",
+                "value": False,
+                "weight": 100.0 - rollout_percentage
+            }
+        ]
+        
+        targeting_rules = []
+        if rollout_percentage > 0:
+            targeting_rules.append({
+                "targeting_type": "percentage",
+                "variations": ["enabled", "disabled"],
+                "percentage": rollout_percentage
+            })
+        
+        return {
+            "key": key,
+            "name": name,
+            "description": description,
+            "type": "release",
+            "variation_type": "boolean",
+            "variations": variations,
+            "targeting_rules": targeting_rules,
+            "default_variation": "disabled",
+            "enabled": enabled,
+            "tags": ["boolean", "release"]
+        }
+    
+    @staticmethod
+    def create_experiment_flag(
+        tenant_id: str,
+        key: str,
+        name: str,
+        description: str,
+        variations: List[Dict[str, Any]],
+        weights: Optional[List[float]] = None
+    ) -> Dict[str, Any]:
+        """Cria configuração para flag de experimento (A/B test)"""
+        if weights and len(weights) != len(variations):
+            raise ValueError("Número de weights deve corresponder ao número de variações")
+        
+        # Prepara variações com weights
+        prepared_variations = []
+        for i, var in enumerate(variations):
+            prepared_variations.append({
+                "variation_id": var.get("id", f"var_{i+1}"),
+                "name": var["name"],
+                "value": var["value"],
+                "description": var.get("description", ""),
+                "weight": weights[i] if weights else 100.0 / len(variations),
+                "metadata": var.get("metadata", {})
+            })
+        
+        targeting_rules = [{
+            "targeting_type": "percentage",
+            "variations": [v["variation_id"] for v in prepared_variations],
+            "percentage": 100.0  # Experimentos geralmente têm 100% de rollout
+        }]
+        
+        return {
+            "key": key,
+            "name": name,
+            "description": description,
+            "type": "experiment",
+            "variation_type": variations[0].get("type", "string"),
+            "variations": prepared_variations,
+            "targeting_rules": targeting_rules,
+            "default_variation": prepared_variations[0]["variation_id"],
+            "enabled": True,
+            "tags": ["experiment", "ab_test"]
+        }
+    
+    @staticmethod
+    def create_kill_switch_flag(
+        tenant_id: str,
+        key: str,
+        name: str,
+        description: str
+    ) -> Dict[str, Any]:
+        """Cria configuração para kill switch"""
+        variations = [
+            {
+                "variation_id": "enabled",
+                "name": "Kill Switch Enabled",
+                "value": True,
+                "description": "Feature desativada por kill switch"
+            },
+            {
+                "variation_id": "disabled",
+                "name": "Kill Switch Disabled",
+                "value": False,
+                "description": "Feature operacional normal"
+            }
+        ]
+        
+        return {
+            "key": key,
+            "name": name,
+            "description": description,
+            "type": "operational",
+            "variation_type": "boolean",
+            "variations": variations,
+            "targeting_rules": [{
+                "targeting_type": "all_users",
+                "variations": ["disabled"]  # Por padrão, kill switch desativado
+            }],
+            "default_variation": "disabled",
+            "enabled": True,
+            "permanent": False,
+            "kill_switch": False,
+            "tags": ["operational", "kill_switch", "safety"]
+        }
+
+
+# Decorator para feature flags
+def feature_flag(
+    flag_key: str,
+    default_value: Any = None,
+    tenant_id_field: str = "tenant_id",
+    user_id_field: str = "user_id"
+):
+    """
+    Decorator para habilitar feature flags em métodos
+    
+    Exemplo:
+        @feature_flag("new_checkout", default_value=False)
+        async def process_checkout(self, tenant_id, user_id, ...):
+            ...
+    """
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            # Obtém instância do engine (singleton)
+            from app.core.feature_flag_engine import FeatureFlagEngine
+            engine = FeatureFlagEngine._instance  # Em produção, seria um singleton
+            
+            # Extrai tenant_id e user_id dos argumentos
+            tenant_id = None
+            user_id = None
+            
+            # Tenta obter do primeiro argumento (self) se for método
+            if args and hasattr(args[0], tenant_id_field):
+                tenant_id = getattr(args[0], tenant_id_field, None)
+                user_id = getattr(args[0], user_id_field, None)
+            
+            # Tenta obter de kwargs
+            if not tenant_id:
+                tenant_id = kwargs.get(tenant_id_field)
+            if not user_id:
+                user_id = kwargs.get(user_id_field)
+            
+            # Se não encontrou, usa valores padrão
+            if not tenant_id:
+                tenant_id = "system"
+            if not user_id:
+                user_id = "anonymous"
+            
+            # Avalia flag
+            result = await engine.evaluate(tenant_id, flag_key, user_id)
+            
+            if result.enabled:
+                # Executa função original
+                return await func(*args, **kwargs)
+            else:
+                # Retorna valor padrão ou executa fallback
+                return default_value
+        
+        return wrapper
+    return decorator

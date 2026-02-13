@@ -1,0 +1,1182 @@
+# app/core/webhook_processor.py
+"""
+Processador idempotente de webhooks (EDGE-SIDE).
+Recebe webhooks externos, valida, persiste e orquestra engines internos.
+Nunca contém lógica de negócio - apenas orquestração e idempotência.
+"""
+
+import enum
+import hashlib
+import hmac
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+import asyncio
+from functools import lru_cache
+
+from app.core.audit_logger import audit_logger
+from app.core.billing_engine import BillingEngine
+from app.core.entitlement_engine import EntitlementEngine
+from app.core.notification_engine import NotificationEngine
+from app.models.webhook_event import WebhookEvent, WebhookEventStatus
+from app.models.payment_intent import PaymentIntent, PaymentIntentState
+from app.utils.idempotency import with_idempotency
+from app.utils.cryptography import verify_hmac_signature
+from app.queue.tasks import enqueue_webhook_task
+
+logger = logging.getLogger(__name__)
+
+
+class WebhookProvider(Enum):
+    """Providers de webhook suportados."""
+    STRIPE = "stripe"
+    MERCADO_PAGO = "mercado_pago"
+    PAGAR_ME = "pagar_me"
+    PIX_STATIC_PROVIDER = "pix_static_provider"
+    SEPA_PROVIDER = "sepa_provider"
+    MBWAY_PROVIDER = "mbway_provider"
+    CASH_APP_PROVIDER = "cash_app_provider"
+    PAYPAL = "paypal"
+    CUSTOM = "custom"
+
+
+class WebhookType(Enum):
+    """Tipos de webhook processáveis."""
+    PAYMENT_SUCCEEDED = "payment_succeeded"
+    PAYMENT_FAILED = "payment_failed"
+    PAYMENT_REFUNDED = "payment_refunded"
+    CHARGEBACK = "chargeback"
+    SUBSCRIPTION_CREATED = "subscription_created"
+    SUBSCRIPTION_RENEWED = "subscription_renewed"
+    SUBSCRIPTION_CANCELLED = "subscription_cancelled"
+    DISPUTE_OPENED = "dispute_opened"
+    DISPUTE_CLOSED = "dispute_closed"
+    CUSTOM_EVENT = "custom_event"
+
+
+@dataclass
+class WebhookValidation:
+    """Resultado da validação de webhook."""
+    is_valid: bool
+    provider: WebhookProvider
+    event_type: WebhookType
+    provider_event_id: str
+    validation_errors: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class WebhookContext:
+    """Contexto completo para processamento de webhook."""
+    raw_payload: Dict[str, Any]
+    provider: WebhookProvider
+    event_type: WebhookType
+    provider_event_id: str
+    signature: Optional[str] = None
+    headers: Dict[str, str] = field(default_factory=dict)
+    received_at: datetime = field(default_factory=datetime.utcnow)
+    
+    # Dados extraídos
+    tenant_id: Optional[str] = None
+    payment_intent_id: Optional[str] = None
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def get_idempotency_key(self) -> str:
+        """Gera chave de idempotência única para este webhook."""
+        return f"{self.provider.value}:{self.provider_event_id}"
+
+
+class WebhookProcessor:
+    """
+    Processador de webhooks externos.
+    Edge-side: apenas recebe, valida, persiste e delega para engines internos.
+    """
+    
+    def __init__(
+        self,
+        billing_engine: Optional[BillingEngine] = None,
+        entitlement_engine: Optional[EntitlementEngine] = None,
+        notification_engine: Optional[NotificationEngine] = None
+    ):
+        self.billing_engine = billing_engine or BillingEngine()
+        self.entitlement_engine = entitlement_engine or EntitlementEngine()
+        self.notification_engine = notification_engine or NotificationEngine()
+        
+        # Handlers por tipo de webhook
+        self._webhook_handlers: Dict[str, Callable] = {}
+        self._register_handlers()
+        
+        # Configuração por provider
+        self._provider_configs: Dict[WebhookProvider, Dict[str, Any]] = {}
+        self._load_provider_configs()
+        
+        # Cache de webhooks processados recentemente (para validação rápida)
+        self._processed_cache: Dict[str, datetime] = {}
+        
+    def _register_handlers(self) -> None:
+        """Registra handlers para diferentes tipos de webhook."""
+        self._webhook_handlers = {
+            WebhookType.PAYMENT_SUCCEEDED.value: self._handle_payment_succeeded,
+            WebhookType.PAYMENT_FAILED.value: self._handle_payment_failed,
+            WebhookType.PAYMENT_REFUNDED.value: self._handle_payment_refunded,
+            WebhookType.CHARGEBACK.value: self._handle_chargeback,
+            WebhookType.SUBSCRIPTION_CREATED.value: self._handle_subscription_created,
+            WebhookType.SUBSCRIPTION_RENEWED.value: self._handle_subscription_renewed,
+            WebhookType.SUBSCRIPTION_CANCELLED.value: self._handle_subscription_cancelled,
+            WebhookType.DISPUTE_OPENED.value: self._handle_dispute_opened,
+            WebhookType.DISPUTE_CLOSED.value: self._handle_dispute_closed,
+            WebhookType.CUSTOM_EVENT.value: self._handle_custom_event,
+        }
+    
+    def _load_provider_configs(self) -> None:
+        """Carrega configuração de validação por provider."""
+        # Em produção, isso viria de configuração ou banco de dados
+        self._provider_configs = {
+            WebhookProvider.STRIPE: {
+                "signature_header": "Stripe-Signature",
+                "signature_algorithm": "sha256",
+                "tolerance_seconds": 300,
+                "webhook_secret_env_var": "STRIPE_WEBHOOK_SECRET",
+            },
+            WebhookProvider.MERCADO_PAGO: {
+                "signature_header": "X-Signature",
+                "signature_algorithm": "sha1",
+                "tolerance_seconds": 300,
+                "webhook_secret_env_var": "MERCADO_PAGO_WEBHOOK_SECRET",
+            },
+            WebhookProvider.PAGAR_ME: {
+                "signature_header": "X-Hub-Signature",
+                "signature_algorithm": "sha1",
+                "tolerance_seconds": 300,
+                "webhook_secret_env_var": "PAGAR_ME_WEBHOOK_SECRET",
+            },
+            WebhookProvider.PIX_STATIC_PROVIDER: {
+                "signature_header": "X-Provider-Signature",
+                "signature_algorithm": "sha256",
+                "tolerance_seconds": 300,
+                "webhook_secret_env_var": "PIX_PROVIDER_WEBHOOK_SECRET",
+            },
+            WebhookProvider.CUSTOM: {
+                "signature_header": None,  # Sem validação de assinatura
+                "signature_algorithm": None,
+                "tolerance_seconds": 300,
+                "webhook_secret_env_var": None,
+            }
+        }
+    
+    @with_idempotency(key_fields=["provider", "provider_event_id"])
+    async def process_webhook(
+        self,
+        raw_payload: Dict[str, Any],
+        provider: str,
+        signature: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        ip_address: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Processa um webhook recebido.
+        Ponto de entrada principal do WebhookProcessor.
+        
+        Args:
+            raw_payload: Payload bruto do webhook
+            provider: Nome do provider (ex: "stripe", "mercado_pago")
+            signature: Assinatura do webhook (se aplicável)
+            headers: Headers HTTP recebidos
+            ip_address: Endereço IP do remetente
+            
+        Returns:
+            Dict com resultado do processamento
+        """
+        start_time = datetime.utcnow()
+        
+        try:
+            # 1. Validar provider
+            provider_enum = self._parse_provider(provider)
+            if not provider_enum:
+                raise ValueError(f"Provider não suportado: {provider}")
+            
+            # 2. Criar contexto do webhook
+            context = WebhookContext(
+                raw_payload=raw_payload,
+                provider=provider_enum,
+                signature=signature,
+                headers=headers or {},
+                received_at=datetime.utcnow()
+            )
+            
+            # 3. Validar webhook
+            validation = await self._validate_webhook(context, ip_address)
+            
+            if not validation.is_valid:
+                await self._handle_validation_failure(context, validation)
+                return {
+                    "success": False,
+                    "error": "Webhook validation failed",
+                    "validation_errors": validation.validation_errors,
+                    "processed": False
+                }
+            
+            context.event_type = validation.event_type
+            context.provider_event_id = validation.provider_event_id
+            
+            # 4. Persistir webhook bruto (imutável)
+            webhook_event = await self._persist_webhook_event(context, validation)
+            
+            # 5. Extrair dados relevantes do payload
+            await self._extract_context_data(context)
+            
+            # 6. Processar webhook baseado no tipo
+            processing_result = await self._process_by_type(context, webhook_event)
+            
+            # 7. Atualizar status do webhook event
+            await webhook_event.update_status(
+                new_status=WebhookEventStatus.PROCESSED,
+                processing_result=processing_result
+            )
+            
+            # 8. Registrar auditoria
+            await self._audit_webhook_processing(
+                context=context,
+                webhook_event=webhook_event,
+                processing_result=processing_result,
+                start_time=start_time
+            )
+            
+            logger.info(
+                f"Webhook processed successfully - "
+                f"Provider: {provider_enum.value}, "
+                f"Event: {validation.event_type.value}, "
+                f"ID: {validation.provider_event_id}"
+            )
+            
+            return {
+                "success": True,
+                "processed": True,
+                "webhook_event_id": webhook_event.id,
+                "event_type": validation.event_type.value,
+                "provider_event_id": validation.provider_event_id,
+                "processing_result": processing_result
+            }
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing webhook - Provider: {provider}, Error: {str(e)}",
+                exc_info=True
+            )
+            
+            # Registrar falha de processamento
+            try:
+                error_context = WebhookContext(
+                    raw_payload=raw_payload,
+                    provider=WebhookProvider.CUSTOM,
+                    event_type=WebhookType.CUSTOM_EVENT,
+                    provider_event_id=f"error_{int(datetime.utcnow().timestamp())}"
+                )
+                
+                await audit_logger.log_async(
+                    resource_type="webhook_processing",
+                    resource_id=f"error_{provider}",
+                    action="error",
+                    actor="system",
+                    description=f"Erro no processamento de webhook: {str(e)}",
+                    metadata={
+                        "provider": provider,
+                        "error": str(e),
+                        "raw_payload_keys": list(raw_payload.keys()) if isinstance(raw_payload, dict) else [],
+                        "headers": headers or {}
+                    }
+                )
+            except Exception as audit_error:
+                logger.error(f"Error logging webhook failure: {audit_error}")
+            
+            return {
+                "success": False,
+                "error": str(e),
+                "processed": False
+            }
+    
+    def _parse_provider(self, provider_str: str) -> Optional[WebhookProvider]:
+        """Converte string para enum WebhookProvider."""
+        try:
+            return WebhookProvider(provider_str.lower())
+        except ValueError:
+            # Tentar mapeamento de strings alternativas
+            provider_map = {
+                "stripe": WebhookProvider.STRIPE,
+                "mercadopago": WebhookProvider.MERCADO_PAGO,
+                "mercado_pago": WebhookProvider.MERCADO_PAGO,
+                "pagar.me": WebhookProvider.PAGAR_ME,
+                "pagar_me": WebhookProvider.PAGAR_ME,
+                "pix": WebhookProvider.PIX_STATIC_PROVIDER,
+                "pix_static": WebhookProvider.PIX_STATIC_PROVIDER,
+                "sepa": WebhookProvider.SEPA_PROVIDER,
+                "mbway": WebhookProvider.MBWAY_PROVIDER,
+                "cashapp": WebhookProvider.CASH_APP_PROVIDER,
+                "cash_app": WebhookProvider.CASH_APP_PROVIDER,
+                "paypal": WebhookProvider.PAYPAL,
+                "custom": WebhookProvider.CUSTOM,
+            }
+            return provider_map.get(provider_str.lower())
+    
+    async def _validate_webhook(
+        self,
+        context: WebhookContext,
+        ip_address: Optional[str]
+    ) -> WebhookValidation:
+        """
+        Valida um webhook recebido.
+        """
+        validation = WebhookValidation(
+            is_valid=False,
+            provider=context.provider,
+            event_type=WebhookType.CUSTOM_EVENT,
+            provider_event_id=""
+        )
+        
+        # 1. Verificar se o provider é suportado
+        provider_config = self._provider_configs.get(context.provider)
+        if not provider_config:
+            validation.validation_errors.append(f"Provider não configurado: {context.provider}")
+            return validation
+        
+        # 2. Validar assinatura (se necessário)
+        if provider_config["signature_header"]:
+            is_signature_valid = await self._validate_signature(context, provider_config)
+            if not is_signature_valid:
+                validation.validation_errors.append("Assinatura inválida")
+                return validation
+        
+        # 3. Validar estrutura básica do payload
+        is_payload_valid, payload_errors = self._validate_payload_structure(
+            context.raw_payload, context.provider
+        )
+        if not is_payload_valid:
+            validation.validation_errors.extend(payload_errors)
+            return validation
+        
+        # 4. Extrair informações básicas
+        provider_event_id = self._extract_provider_event_id(
+            context.raw_payload, context.provider
+        )
+        if not provider_event_id:
+            validation.validation_errors.append("Não foi possível extrair ID do evento")
+            return validation
+        
+        # 5. Verificar se já foi processado
+        is_duplicate = await self._check_duplicate_webhook(
+            context.provider, provider_event_id
+        )
+        if is_duplicate:
+            validation.validation_errors.append("Webhook duplicado")
+            return validation
+        
+        # 6. Determinar tipo do evento
+        event_type = self._determine_event_type(context.raw_payload, context.provider)
+        
+        # 7. Validações específicas por tipo
+        type_specific_errors = self._validate_by_event_type(
+            context.raw_payload, event_type, context.provider
+        )
+        if type_specific_errors:
+            validation.validation_errors.extend(type_specific_errors)
+            return validation
+        
+        # Webhook válido
+        validation.is_valid = True
+        validation.event_type = event_type
+        validation.provider_event_id = provider_event_id
+        
+        return validation
+    
+    async def _validate_signature(
+        self,
+        context: WebhookContext,
+        provider_config: Dict[str, Any]
+    ) -> bool:
+        """Valida assinatura do webhook."""
+        try:
+            signature_header = provider_config["signature_header"]
+            signature = context.headers.get(signature_header) or context.signature
+            
+            if not signature:
+                logger.warning(f"Missing signature for provider {context.provider}")
+                return False
+            
+            # Obter segredo do webhook
+            secret_env_var = provider_config.get("webhook_secret_env_var")
+            if not secret_env_var:
+                logger.warning(f"No secret env var configured for {context.provider}")
+                return False
+            
+            import os
+            webhook_secret = os.getenv(secret_env_var)
+            if not webhook_secret:
+                logger.warning(f"Webhook secret not set in env: {secret_env_var}")
+                return False
+            
+            # Preparar payload para verificação
+            if isinstance(context.raw_payload, dict):
+                payload_str = json.dumps(context.raw_payload, separators=(',', ':'))
+            else:
+                payload_str = str(context.raw_payload)
+            
+            # Verificar assinatura baseada no algoritmo
+            algorithm = provider_config.get("signature_algorithm", "sha256")
+            
+            if algorithm == "sha256":
+                expected_signature = hmac.new(
+                    webhook_secret.encode(),
+                    payload_str.encode(),
+                    hashlib.sha256
+                ).hexdigest()
+                
+                # Stripe usa formato timestamp.payload
+                if context.provider == WebhookProvider.STRIPE:
+                    # Implementação específica do Stripe
+                    return self._verify_stripe_signature(
+                        signature, payload_str, webhook_secret
+                    )
+                
+                return hmac.compare_digest(
+                    f"sha256={expected_signature}",
+                    signature
+                )
+            
+            elif algorithm == "sha1":
+                expected_signature = hmac.new(
+                    webhook_secret.encode(),
+                    payload_str.encode(),
+                    hashlib.sha1
+                ).hexdigest()
+                
+                return hmac.compare_digest(
+                    f"sha1={expected_signature}",
+                    signature
+                )
+            
+            else:
+                logger.warning(f"Unsupported signature algorithm: {algorithm}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error validating signature: {e}")
+            return False
+    
+    def _verify_stripe_signature(
+        self,
+        signature: str,
+        payload: str,
+        secret: str
+    ) -> bool:
+        """Implementação específica para verificar assinatura do Stripe."""
+        try:
+            import time
+            from stripe import Webhook
+            
+            # Extrair timestamp do payload para validação
+            # Stripe signature format: t=timestamp,v1=signature
+            signature_parts = signature.split(',')
+            timestamp_part = [p for p in signature_parts if p.startswith('t=')][0]
+            timestamp = int(timestamp_part.split('=')[1])
+            
+            # Verificar se o timestamp está dentro da tolerância
+            current_time = int(time.time())
+            tolerance = 300  # 5 minutos
+            
+            if abs(current_time - timestamp) > tolerance:
+                logger.warning(f"Stripe webhook timestamp outside tolerance: {timestamp}")
+                return False
+            
+            # Verificar assinatura usando a biblioteca Stripe
+            # Em produção, usaríamos a biblioteca oficial
+            # Por enquanto, implementação simplificada
+            
+            signed_payload = f"{timestamp}.{payload}"
+            expected_signature = hmac.new(
+                secret.encode(),
+                signed_payload.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            
+            signature_part = [p for p in signature_parts if p.startswith('v1=')][0]
+            received_signature = signature_part.split('=')[1]
+            
+            return hmac.compare_digest(received_signature, expected_signature)
+            
+        except Exception as e:
+            logger.error(f"Error verifying Stripe signature: {e}")
+            return False
+    
+    def _validate_payload_structure(
+        self,
+        payload: Dict[str, Any],
+        provider: WebhookProvider
+    ) -> Tuple[bool, List[str]]:
+        """Valida estrutura básica do payload."""
+        errors = []
+        
+        if not isinstance(payload, dict):
+            errors.append("Payload deve ser um objeto JSON")
+            return False, errors
+        
+        # Validações específicas por provider
+        if provider == WebhookProvider.STRIPE:
+            if "id" not in payload or "type" not in payload:
+                errors.append("Payload do Stripe deve conter 'id' e 'type'")
+        
+        elif provider == WebhookProvider.MERCADO_PAGO:
+            if "id" not in payload or "type" not in payload:
+                errors.append("Payload do Mercado Pago deve conter 'id' e 'type'")
+        
+        elif provider == WebhookProvider.PIX_STATIC_PROVIDER:
+            if "transaction_id" not in payload or "status" not in payload:
+                errors.append("Payload Pix deve conter 'transaction_id' e 'status'")
+        
+        return len(errors) == 0, errors
+    
+    def _extract_provider_event_id(
+        self,
+        payload: Dict[str, Any],
+        provider: WebhookProvider
+    ) -> Optional[str]:
+        """Extrai ID único do evento do provider."""
+        if provider == WebhookProvider.STRIPE:
+            return payload.get("id")
+        elif provider == WebhookProvider.MERCADO_PAGO:
+            return payload.get("id")
+        elif provider == WebhookProvider.PIX_STATIC_PROVIDER:
+            return payload.get("transaction_id")
+        elif provider == WebhookProvider.CUSTOM:
+            return payload.get("event_id") or f"custom_{int(datetime.utcnow().timestamp())}"
+        else:
+            return payload.get("id") or payload.get("event_id")
+    
+    async def _check_duplicate_webhook(
+        self,
+        provider: WebhookProvider,
+        provider_event_id: str
+    ) -> bool:
+        """Verifica se o webhook já foi processado."""
+        # Verificar cache local primeiro
+        cache_key = f"{provider.value}:{provider_event_id}"
+        if cache_key in self._processed_cache:
+            cached_time = self._processed_cache[cache_key]
+            if (datetime.utcnow() - cached_time).seconds < 300:  # 5 minutos
+                return True
+        
+        # Verificar no banco de dados
+        existing_event = await WebhookEvent.get_by_provider_event(
+            provider=provider.value,
+            provider_event_id=provider_event_id
+        )
+        
+        if existing_event:
+            # Atualizar cache
+            self._processed_cache[cache_key] = datetime.utcnow()
+            return True
+        
+        return False
+    
+    def _determine_event_type(
+        self,
+        payload: Dict[str, Any],
+        provider: WebhookProvider
+    ) -> WebhookType:
+        """Determina o tipo do evento baseado no payload e provider."""
+        
+        if provider == WebhookProvider.STRIPE:
+            event_type = payload.get("type", "")
+            
+            # Mapear tipos do Stripe para nossos tipos
+            stripe_type_map = {
+                "payment_intent.succeeded": WebhookType.PAYMENT_SUCCEEDED,
+                "payment_intent.payment_failed": WebhookType.PAYMENT_FAILED,
+                "charge.refunded": WebhookType.PAYMENT_REFUNDED,
+                "charge.dispute.created": WebhookType.DISPUTE_OPENED,
+                "charge.dispute.closed": WebhookType.DISPUTE_CLOSED,
+                "customer.subscription.created": WebhookType.SUBSCRIPTION_CREATED,
+                "customer.subscription.updated": WebhookType.SUBSCRIPTION_RENEWED,
+                "customer.subscription.deleted": WebhookType.SUBSCRIPTION_CANCELLED,
+            }
+            
+            return stripe_type_map.get(event_type, WebhookType.CUSTOM_EVENT)
+        
+        elif provider == WebhookProvider.PIX_STATIC_PROVIDER:
+            status = payload.get("status", "").lower()
+            
+            if status in ["paid", "completed", "confirmed"]:
+                return WebhookType.PAYMENT_SUCCEEDED
+            elif status in ["failed", "expired", "cancelled"]:
+                return WebhookType.PAYMENT_FAILED
+            elif status in ["refunded"]:
+                return WebhookType.PAYMENT_REFUNDED
+            else:
+                return WebhookType.CUSTOM_EVENT
+        
+        else:
+            # Para outros providers, usar mapeamento genérico
+            event_type_str = payload.get("type", "").lower()
+            
+            type_map = {
+                "payment.succeeded": WebhookType.PAYMENT_SUCCEEDED,
+                "payment.failed": WebhookType.PAYMENT_FAILED,
+                "payment.refunded": WebhookType.PAYMENT_REFUNDED,
+                "subscription.created": WebhookType.SUBSCRIPTION_CREATED,
+                "subscription.renewed": WebhookType.SUBSCRIPTION_RENEWED,
+                "subscription.cancelled": WebhookType.SUBSCRIPTION_CANCELLED,
+                "chargeback": WebhookType.CHARGEBACK,
+                "dispute.opened": WebhookType.DISPUTE_OPENED,
+                "dispute.closed": WebhookType.DISPUTE_CLOSED,
+            }
+            
+            return type_map.get(event_type_str, WebhookType.CUSTOM_EVENT)
+    
+    def _validate_by_event_type(
+        self,
+        payload: Dict[str, Any],
+        event_type: WebhookType,
+        provider: WebhookProvider
+    ) -> List[str]:
+        """Validações específicas por tipo de evento."""
+        errors = []
+        
+        if event_type in [
+            WebhookType.PAYMENT_SUCCEEDED,
+            WebhookType.PAYMENT_FAILED,
+            WebhookType.PAYMENT_REFUNDED
+        ]:
+            # Verificar campos obrigatórios para eventos de pagamento
+            required_fields = ["amount", "currency"]
+            
+            # Tentar encontrar amount em diferentes locais baseado no provider
+            if provider == WebhookProvider.STRIPE:
+                data = payload.get("data", {}).get("object", {})
+                if not data.get("amount") and not data.get("amount_total"):
+                    errors.append("Campo 'amount' não encontrado no payload")
+            else:
+                if not payload.get("amount"):
+                    errors.append("Campo 'amount' não encontrado no payload")
+        
+        return errors
+    
+    async def _handle_validation_failure(
+        self,
+        context: WebhookContext,
+        validation: WebhookValidation
+    ) -> None:
+        """Lida com falha na validação do webhook."""
+        try:
+            # Persistir webhook inválido para auditoria
+            await WebhookEvent.create(
+                provider=context.provider.value,
+                provider_event_id=context.provider_event_id or "invalid",
+                event_type=validation.event_type.value,
+                status=WebhookEventStatus.FAILED,
+                raw_payload=context.raw_payload,
+                validation_errors=validation.validation_errors,
+                metadata={
+                    "headers": context.headers,
+                    "received_at": context.received_at.isoformat(),
+                    "validation_result": validation.metadata
+                }
+            )
+            
+            # Registrar auditoria
+            await audit_logger.log_async(
+                resource_type="webhook",
+                resource_id=f"{context.provider.value}:invalid",
+                action="validation_failed",
+                actor="system",
+                description=f"Falha na validação do webhook: {', '.join(validation.validation_errors)}",
+                metadata={
+                    "provider": context.provider.value,
+                    "validation_errors": validation.validation_errors,
+                    "headers": context.headers
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error handling validation failure: {e}")
+    
+    async def _persist_webhook_event(
+        self,
+        context: WebhookContext,
+        validation: WebhookValidation
+    ) -> WebhookEvent:
+        """Persiste o webhook bruto no banco de dados."""
+        webhook_event = await WebhookEvent.create(
+            provider=context.provider.value,
+            provider_event_id=validation.provider_event_id,
+            event_type=validation.event_type.value,
+            status=WebhookEventStatus.RECEIVED,
+            raw_payload=context.raw_payload,
+            metadata={
+                "headers": context.headers,
+                "signature": context.signature,
+                "received_at": context.received_at.isoformat(),
+                "validation_metadata": validation.metadata
+            }
+        )
+        
+        # Adicionar ao cache de processados
+        cache_key = f"{context.provider.value}:{validation.provider_event_id}"
+        self._processed_cache[cache_key] = datetime.utcnow()
+        
+        return webhook_event
+    
+    async def _extract_context_data(self, context: WebhookContext) -> None:
+        """Extrai dados relevantes do payload para o contexto."""
+        
+        if context.provider == WebhookProvider.STRIPE:
+            data = context.raw_payload.get("data", {}).get("object", {})
+            
+            # Extrair payment_intent_id
+            context.payment_intent_id = data.get("payment_intent") or data.get("id")
+            
+            # Extrair amount e currency
+            context.amount = data.get("amount") or data.get("amount_total")
+            if context.amount and isinstance(context.amount, int):
+                context.amount = context.amount / 100  # Stripe usa centavos
+            
+            context.currency = data.get("currency")
+            
+            # Extrair metadata
+            context.metadata = data.get("metadata", {})
+            context.tenant_id = context.metadata.get("tenant_id") or context.metadata.get("bot_id")
+        
+        elif context.provider == WebhookProvider.PIX_STATIC_PROVIDER:
+            context.payment_intent_id = context.raw_payload.get("reference_id")
+            context.amount = context.raw_payload.get("amount")
+            context.currency = context.raw_payload.get("currency", "BRL")
+            context.tenant_id = context.raw_payload.get("tenant_id")
+            context.metadata = context.raw_payload.get("metadata", {})
+        
+        else:
+            # Extração genérica
+            context.payment_intent_id = context.raw_payload.get("payment_intent_id") or \
+                                      context.raw_payload.get("reference")
+            context.amount = context.raw_payload.get("amount")
+            context.currency = context.raw_payload.get("currency")
+            context.tenant_id = context.raw_payload.get("tenant_id")
+            context.metadata = context.raw_payload.get("metadata", {})
+    
+    async def _process_by_type(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Processa o webhook baseado no tipo de evento."""
+        
+        # Atualizar status para PROCESSING
+        await webhook_event.update_status(
+            new_status=WebhookEventStatus.PROCESSING,
+            processing_metadata={"started_at": datetime.utcnow().isoformat()}
+        )
+        
+        # Executar handler específico
+        handler = self._webhook_handlers.get(context.event_type.value)
+        if not handler:
+            logger.warning(f"No handler for webhook type: {context.event_type.value}")
+            return {"error": "No handler for webhook type"}
+        
+        try:
+            result = await handler(context, webhook_event)
+            return result
+            
+        except Exception as e:
+            logger.error(
+                f"Error in webhook handler for {context.event_type.value}: {e}",
+                exc_info=True
+            )
+            
+            # Atualizar status para FAILED
+            await webhook_event.update_status(
+                new_status=WebhookEventStatus.FAILED,
+                processing_result={"error": str(e)}
+            )
+            
+            # Re-lançar exceção
+            raise
+    
+    async def _handle_payment_succeeded(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """
+        Handler para pagamento bem-sucedido.
+        Orquestra BillingEngine → EntitlementEngine → NotificationEngine.
+        """
+        
+        # 1. Validar payment_intent
+        if not context.payment_intent_id:
+            return {"error": "payment_intent_id não encontrado no webhook"}
+        
+        payment_intent = await PaymentIntent.get_by_id(context.payment_intent_id)
+        if not payment_intent:
+            return {"error": f"PaymentIntent não encontrado: {context.payment_intent_id}"}
+        
+        # 2. Validar amount (se disponível)
+        if context.amount and abs(context.amount - payment_intent.amount) > 0.01:
+            return {
+                "error": "Discrepância no valor do pagamento",
+                "webhook_amount": context.amount,
+                "expected_amount": payment_intent.amount
+            }
+        
+        # 3. Processar no BillingEngine (cria invoice, confirma pagamento)
+        billing_result = await self.billing_engine.process_payment_confirmation(
+            payment_intent_id=payment_intent.id,
+            provider=context.provider.value,
+            provider_event_id=context.provider_event_id,
+            amount=context.amount or payment_intent.amount,
+            currency=context.currency or payment_intent.currency,
+            metadata={
+                "webhook_event_id": webhook_event.id,
+                **context.metadata
+            }
+        )
+        
+        if not billing_result.get("success"):
+            return billing_result
+        
+        # 4. Conceder acesso via EntitlementEngine
+        entitlement_result = await self.entitlement_engine.grant_access(
+            user_id=payment_intent.user_id,
+            bot_id=payment_intent.bot_id,
+            offer_id=payment_intent.offer_id,
+            payment_intent_id=payment_intent.id,
+            fingerprint=payment_intent.fingerprint
+        )
+        
+        if not entitlement_result.get("success"):
+            # Pagamento confirmado mas erro ao conceder acesso
+            # Registrar alerta crítico
+            await self._log_critical_error(
+                "payment_confirmed_but_access_failed",
+                f"Pagamento confirmado mas erro ao conceder acesso: {payment_intent.id}",
+                {
+                    "payment_intent_id": payment_intent.id,
+                    "entitlement_error": entitlement_result.get("error")
+                }
+            )
+        
+        # 5. Enviar notificação de confirmação
+        notification_task = await enqueue_webhook_task(
+            task_type="send_payment_notification",
+            payment_intent_id=payment_intent.id,
+            notification_type="payment_confirmed",
+            user_id=payment_intent.user_id,
+            bot_id=payment_intent.bot_id
+        )
+        
+        # 6. Registrar auditoria detalhada
+        await audit_logger.log_async(
+            resource_type="payment",
+            resource_id=payment_intent.id,
+            action="confirmed",
+            actor="webhook",
+            description=f"Pagamento confirmado via webhook {context.provider.value}",
+            metadata={
+                "provider": context.provider.value,
+                "provider_event_id": context.provider_event_id,
+                "webhook_event_id": webhook_event.id,
+                "amount": context.amount or payment_intent.amount,
+                "currency": context.currency or payment_intent.currency,
+                "billing_result": billing_result,
+                "entitlement_result": entitlement_result
+            }
+        )
+        
+        return {
+            "success": True,
+            "payment_intent_id": payment_intent.id,
+            "billing_processed": billing_result.get("success", False),
+            "access_granted": entitlement_result.get("success", False),
+            "notification_queued": notification_task is not None
+        }
+    
+    async def _handle_payment_failed(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Handler para pagamento falhado."""
+        if not context.payment_intent_id:
+            return {"error": "payment_intent_id não encontrado no webhook"}
+        
+        payment_intent = await PaymentIntent.get_by_id(context.payment_intent_id)
+        if not payment_intent:
+            return {"error": f"PaymentIntent não encontrado: {context.payment_intent_id}"}
+        
+        # Atualizar status do payment_intent
+        await payment_intent.update_status(
+            new_status=PaymentIntentState.FAILED.value,
+            metadata={
+                "failure_reason": "webhook_failure",
+                "provider": context.provider.value,
+                "provider_event_id": context.provider_event_id,
+                "webhook_event_id": webhook_event.id
+            }
+        )
+        
+        # Enfileirar notificação de falha
+        await enqueue_webhook_task(
+            task_type="send_payment_notification",
+            payment_intent_id=payment_intent.id,
+            notification_type="payment_failed",
+            user_id=payment_intent.user_id,
+            bot_id=payment_intent.bot_id
+        )
+        
+        return {
+            "success": True,
+            "payment_intent_id": payment_intent.id,
+            "status_updated": True,
+            "notification_queued": True
+        }
+    
+    async def _handle_payment_refunded(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Handler para pagamento reembolsado."""
+        if not context.payment_intent_id:
+            return {"error": "payment_intent_id não encontrado no webhook"}
+        
+        # Processar refund no BillingEngine
+        refund_result = await self.billing_engine.process_refund(
+            payment_intent_id=context.payment_intent_id,
+            provider=context.provider.value,
+            provider_event_id=context.provider_event_id,
+            amount=context.amount,
+            reason=context.metadata.get("reason", "webhook_refund")
+        )
+        
+        return refund_result
+    
+    async def _handle_chargeback(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Handler para chargeback."""
+        if not context.payment_intent_id:
+            return {"error": "payment_intent_id não encontrado no webhook"}
+        
+        # Processar chargeback no BillingEngine
+        chargeback_result = await self.billing_engine.process_chargeback(
+            payment_intent_id=context.payment_intent_id,
+            provider=context.provider.value,
+            provider_event_id=context.provider_event_id,
+            amount=context.amount,
+            reason=context.metadata.get("reason", "webhook_chargeback")
+        )
+        
+        return chargeback_result
+    
+    async def _handle_subscription_created(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Handler para criação de assinatura."""
+        # Este handler seria implementado quando tivermos SubscriptionEngine
+        return {
+            "success": True,
+            "message": "Subscription created handler - to be implemented",
+            "event_type": "subscription_created"
+        }
+    
+    async def _handle_subscription_renewed(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Handler para renovação de assinatura."""
+        return {
+            "success": True,
+            "message": "Subscription renewed handler - to be implemented",
+            "event_type": "subscription_renewed"
+        }
+    
+    async def _handle_subscription_cancelled(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Handler para cancelamento de assinatura."""
+        return {
+            "success": True,
+            "message": "Subscription cancelled handler - to be implemented",
+            "event_type": "subscription_cancelled"
+        }
+    
+    async def _handle_dispute_opened(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Handler para abertura de disputa."""
+        if not context.payment_intent_id:
+            return {"error": "payment_intent_id não encontrado no webhook"}
+        
+        # Processar disputa no BillingEngine
+        dispute_result = await self.billing_engine.process_dispute(
+            payment_intent_id=context.payment_intent_id,
+            provider=context.provider.value,
+            provider_event_id=context.provider_event_id,
+            dispute_type="opened",
+            metadata=context.metadata
+        )
+        
+        return dispute_result
+    
+    async def _handle_dispute_closed(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Handler para fechamento de disputa."""
+        if not context.payment_intent_id:
+            return {"error": "payment_intent_id não encontrado no webhook"}
+        
+        dispute_result = await self.billing_engine.process_dispute(
+            payment_intent_id=context.payment_intent_id,
+            provider=context.provider.value,
+            provider_event_id=context.provider_event_id,
+            dispute_type="closed",
+            metadata=context.metadata
+        )
+        
+        return dispute_result
+    
+    async def _handle_custom_event(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent
+    ) -> Dict[str, Any]:
+        """Handler para eventos customizados."""
+        # Registrar evento customizado para possível processamento futuro
+        await audit_logger.log_async(
+            resource_type="webhook_custom",
+            resource_id=webhook_event.id,
+            action="received",
+            actor="system",
+            description=f"Webhook customizado recebido: {context.provider.value}",
+            metadata={
+                "provider": context.provider.value,
+                "provider_event_id": context.provider_event_id,
+                "payload_keys": list(context.raw_payload.keys())
+            }
+        )
+        
+        return {
+            "success": True,
+            "message": "Custom event logged",
+            "event_type": "custom_event",
+            "logged": True
+        }
+    
+    async def _audit_webhook_processing(
+        self,
+        context: WebhookContext,
+        webhook_event: WebhookEvent,
+        processing_result: Dict[str, Any],
+        start_time: datetime
+    ) -> None:
+        """Registra auditoria detalhada do processamento do webhook."""
+        try:
+            processing_time = (datetime.utcnow() - start_time).total_seconds()
+            
+            await audit_logger.log_async(
+                resource_type="webhook_processing",
+                resource_id=webhook_event.id,
+                action="processed",
+                actor="system",
+                description=f"Webhook processado com sucesso em {processing_time:.2f}s",
+                metadata={
+                    "provider": context.provider.value,
+                    "event_type": context.event_type.value,
+                    "provider_event_id": context.provider_event_id,
+                    "processing_time_seconds": processing_time,
+                    "processing_result": processing_result,
+                    "payment_intent_id": context.payment_intent_id,
+                    "amount": context.amount,
+                    "currency": context.currency
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error auditing webhook processing: {e}")
+    
+    async def _log_critical_error(
+        self,
+        error_type: str,
+        description: str,
+        metadata: Dict[str, Any]
+    ) -> None:
+        """Registra erro crítico para monitoramento."""
+        try:
+            await audit_logger.log_async(
+                resource_type="system_error",
+                resource_id=f"critical_{error_type}_{int(datetime.utcnow().timestamp())}",
+                action="critical_error",
+                actor="system",
+                description=description,
+                metadata={
+                    "error_type": error_type,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    **metadata
+                },
+                severity="critical"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error logging critical error: {e}")
+    
+    async def cleanup_processed_cache(self, hours: int = 24) -> int:
+        """Limpa cache de webhooks processados."""
+        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        keys_to_delete = []
+        
+        for key, timestamp in self._processed_cache.items():
+            if timestamp < cutoff:
+                keys_to_delete.append(key)
+        
+        for key in keys_to_delete:
+            del self._processed_cache[key]
+        
+        logger.info(f"Cleaned up {len(keys_to_delete)} entries from webhook cache")
+        return len(keys_to_delete)
+
+
+# Factory para criação do WebhookProcessor
+def create_webhook_processor(
+    billing_engine: Optional[BillingEngine] = None,
+    entitlement_engine: Optional[EntitlementEngine] = None,
+    notification_engine: Optional[NotificationEngine] = None
+) -> WebhookProcessor:
+    """Cria uma instância configurada do WebhookProcessor."""
+    return WebhookProcessor(
+        billing_engine=billing_engine,
+        entitlement_engine=entitlement_engine,
+        notification_engine=notification_engine
+    )
+
+
+# Singleton para uso global (opcional)
+_webhook_processor_instance: Optional[WebhookProcessor] = None
+
+def get_webhook_processor() -> WebhookProcessor:
+    """Retorna instância singleton do WebhookProcessor."""
+    global _webhook_processor_instance
+    if _webhook_processor_instance is None:
+        _webhook_processor_instance = create_webhook_processor()
+    return _webhook_processor_instance

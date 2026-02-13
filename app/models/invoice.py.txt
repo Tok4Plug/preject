@@ -1,0 +1,603 @@
+# app/models/invoice.py
+"""
+Modelo de Invoice - Fatura gerada a partir de pagamentos bem-sucedidos.
+Imutável e auditável, fonte da verdade financeira.
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text, Enum, Numeric
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+import enum
+
+from app.database import Base
+
+
+class InvoiceStatus(enum.Enum):
+    """Status da fatura."""
+    DRAFT = "draft"                 # Rascunho, não finalizada
+    OPEN = "open"                   # Emitida, aguardando pagamento
+    PAID = "paid"                   # Paga
+    PARTIALLY_PAID = "partially_paid"  # Parcialmente paga
+    VOID = "void"                   # Cancelada/anulada
+    UNCOLLECTIBLE = "uncollectible" # Inadimplente
+    REFUNDED = "refunded"           # Reembolsada
+    CHARGEBACK = "chargeback"       # Chargeback/disputa
+
+
+class InvoiceType(enum.Enum):
+    """Tipo de fatura."""
+    ONE_TIME = "one_time"           # Compra única
+    SUBSCRIPTION = "subscription"   # Assinatura recorrente
+    UPGRADE = "upgrade"             # Upgrade de plano
+    DOWNGRADE = "downgrade"         # Downgrade de plano
+    CREDIT = "credit"               # Crédito
+    REFUND = "refund"               # Reembolso
+    ADJUSTMENT = "adjustment"       # Ajuste manual
+
+
+class TaxType(enum.Enum):
+    """Tipo de imposto."""
+    VAT = "vat"                     # IVA (Europa)
+    GST = "gst"                     # GST (Índia, Austrália)
+    SALES_TAX = "sales_tax"         # Sales Tax (EUA)
+    IRRF = "irrf"                   # IRRF (Brasil)
+    PIS_COFINS = "pis_cofins"       # PIS/COFINS (Brasil)
+    OTHER = "other"                 # Outros
+
+
+class Invoice(Base):
+    """
+    Fatura - documento financeiro imutável.
+    
+    Princípios:
+    1. Imutabilidade: Uma vez criada, não pode ser alterada
+    2. Auditabilidade: Histórico completo de alterações
+    3. Isolamento por tenant
+    4. Fonte da verdade financeira
+    5. Suporte a multi-moeda e impostos
+    """
+    
+    __tablename__ = "invoices"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    invoice_number: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # Número sequencial: INV-0001
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Entidades envolvidas
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.users.id"), nullable=False, index=True)
+    bot_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.bots.id"), index=True)
+    offer_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.offers.id"), index=True)
+    payment_intent_id: Mapped[Optional[str]] = mapped_column(String(50), ForeignKey("saas.payment_intents.intent_id"), index=True)
+    subscription_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.subscriptions.id"), index=True)
+    
+    # Dados da fatura
+    invoice_type: Mapped[InvoiceType] = mapped_column(Enum(InvoiceType), nullable=False)
+    status: Mapped[InvoiceStatus] = mapped_column(Enum(InvoiceStatus), nullable=False, default=InvoiceStatus.DRAFT)
+    
+    # Período da fatura (para assinaturas)
+    period_start: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    period_end: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Valores monetários
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)  # Moeda da fatura
+    subtotal_amount: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False, default=0.0)  # Valor sem impostos
+    tax_amount: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False, default=0.0)  # Valor dos impostos
+    total_amount: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False, default=0.0)  # Valor total (subtotal + tax)
+    amount_paid: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False, default=0.0)  # Valor já pago
+    amount_due: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False, default=0.0)  # Valor pendente
+    
+    # Impostos
+    tax_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # Taxa de imposto (%)
+    tax_type: Mapped[Optional[TaxType]] = mapped_column(Enum(TaxType))
+    tax_details: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Itens da fatura
+    line_items: Mapped[List[Dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    
+    # Datas importantes
+    invoice_date: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    due_date: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    void_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Dados de pagamento
+    payment_method: Mapped[Optional[str]] = mapped_column(String(50))
+    payment_provider: Mapped[Optional[str]] = mapped_column(String(50))
+    payment_transaction_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    
+    # Metadata e auditoria
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    footer_text: Mapped[Optional[str]] = mapped_column(Text)  # Texto do rodapé
+    
+    # Controle de versão (para faturas ajustadas)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_latest_version: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    previous_version_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    finalized_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="invoices")
+    user: Mapped["User"] = relationship(back_populates="invoices")
+    bot: Mapped["Bot"] = relationship(back_populates="invoices")
+    offer: Mapped["Offer"] = relationship(back_populates="invoices")
+    payment_intent: Mapped["PaymentIntent"] = relationship(back_populates="invoice")
+    subscription: Mapped["Subscription"] = relationship(back_populates="invoices")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="invoice", cascade="all, delete-orphan")
+    refunds: Mapped[List["Refund"]] = relationship(back_populates="invoice", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_invoices_tenant_status', 'tenant_id', 'status'),
+        Index('ix_invoices_user_status', 'user_id', 'status'),
+        Index('ix_invoices_due_date_status', 'due_date', 'status'),
+        Index('ix_invoices_created', 'created_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<Invoice(id='{self.id}', invoice_number='{self.invoice_number}', total={self.total_amount} {self.currency}, status='{self.status.value}')>"
+    
+    def to_dict(self, include_line_items: bool = True) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "id": self.id,
+            "invoice_number": self.invoice_number,
+            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
+            "bot_id": self.bot_id,
+            "offer_id": self.offer_id,
+            "payment_intent_id": self.payment_intent_id,
+            "subscription_id": self.subscription_id,
+            "invoice_type": self.invoice_type.value,
+            "status": self.status.value,
+            "period_start": self.period_start.isoformat() if self.period_start else None,
+            "period_end": self.period_end.isoformat() if self.period_end else None,
+            "currency": self.currency,
+            "subtotal_amount": float(self.subtotal_amount),
+            "tax_amount": float(self.tax_amount),
+            "total_amount": float(self.total_amount),
+            "amount_paid": float(self.amount_paid),
+            "amount_due": float(self.amount_due),
+            "tax_rate": self.tax_rate,
+            "tax_type": self.tax_type.value if self.tax_type else None,
+            "tax_details": self.tax_details,
+            "invoice_date": self.invoice_date.isoformat() if self.invoice_date else None,
+            "due_date": self.due_date.isoformat() if self.due_date else None,
+            "paid_at": self.paid_at.isoformat() if self.paid_at else None,
+            "void_at": self.void_at.isoformat() if self.void_at else None,
+            "refunded_at": self.refunded_at.isoformat() if self.refunded_at else None,
+            "payment_method": self.payment_method,
+            "payment_provider": self.payment_provider,
+            "payment_transaction_id": self.payment_transaction_id,
+            "metadata": self.metadata,
+            "notes": self.notes,
+            "footer_text": self.footer_text,
+            "version": self.version,
+            "is_latest_version": self.is_latest_version,
+            "previous_version_id": self.previous_version_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "finalized_at": self.finalized_at.isoformat() if self.finalized_at else None,
+            "is_finalized": self.is_finalized,
+            "is_paid": self.is_paid,
+            "is_overdue": self.is_overdue,
+            "days_overdue": self.days_overdue
+        }
+        
+        if include_line_items:
+            data["line_items"] = [
+                {
+                    **item,
+                    "total_amount": float(item.get("total_amount", 0)),
+                    "unit_amount": float(item.get("unit_amount", 0))
+                }
+                for item in self.line_items
+            ]
+        
+        return data
+    
+    @property
+    def is_finalized(self) -> bool:
+        """Verifica se a fatura está finalizada (não é draft)."""
+        return self.status != InvoiceStatus.DRAFT
+    
+    @property
+    def is_paid(self) -> bool:
+        """Verifica se a fatura está totalmente paga."""
+        return self.status in [
+            InvoiceStatus.PAID,
+            InvoiceStatus.REFUNDED,  # Foi paga, depois reembolsada
+            InvoiceStatus.CHARGEBACK  # Foi paga, depois chargeback
+        ]
+    
+    @property
+    def is_overdue(self) -> bool:
+        """Verifica se a fatura está vencida."""
+        if self.is_paid or self.status in [InvoiceStatus.VOID, InvoiceStatus.UNCOLLECTIBLE]:
+            return False
+        
+        if not self.due_date:
+            return False
+        
+        now = datetime.utcnow()
+        return now > self.due_date
+    
+    @property
+    def days_overdue(self) -> Optional[int]:
+        """Retorna dias de atraso, se aplicável."""
+        if not self.is_overdue or not self.due_date:
+            return None
+        
+        now = datetime.utcnow()
+        return (now - self.due_date).days
+    
+    @property
+    def can_be_paid(self) -> bool:
+        """Verifica se a fatura pode ser paga."""
+        return self.status in [
+            InvoiceStatus.OPEN,
+            InvoiceStatus.PARTIALLY_PAID
+        ] and self.amount_due > 0
+    
+    @property
+    def can_be_refunded(self) -> bool:
+        """Verifica se a fatura pode ser reembolsada."""
+        return self.status == InvoiceStatus.PAID and self.amount_paid > 0
+    
+    def finalize(self) -> bool:
+        """
+        Finaliza a fatura (muda de DRAFT para OPEN).
+        
+        Retorna:
+            bool: True se finalizada com sucesso
+        """
+        if self.status != InvoiceStatus.DRAFT:
+            return False
+        
+        # Atualiza status
+        self.status = InvoiceStatus.OPEN
+        self.finalized_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        # Calcula amount_due
+        self.amount_due = float(self.total_amount) - float(self.amount_paid)
+        
+        return True
+    
+    def add_line_item(
+        self,
+        description: str,
+        unit_amount: float,
+        quantity: int = 1,
+        tax_rate: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Adiciona um item à fatura.
+        
+        Só pode ser feito enquanto a fatura está em DRAFT.
+        """
+        if self.status != InvoiceStatus.DRAFT:
+            raise ValueError("Cannot add line items to a finalized invoice")
+        
+        # Calcula totais
+        item_total = unit_amount * quantity
+        item_tax = item_total * (tax_rate or 0) / 100
+        item_total_with_tax = item_total + item_tax
+        
+        # Cria item
+        line_item = {
+            "id": str(uuid.uuid4()),
+            "description": description,
+            "unit_amount": unit_amount,
+            "quantity": quantity,
+            "total_amount": item_total,
+            "tax_rate": tax_rate or 0.0,
+            "tax_amount": item_tax,
+            "total_amount_with_tax": item_total_with_tax,
+            "metadata": metadata or {},
+            "added_at": datetime.utcnow().isoformat()
+        }
+        
+        self.line_items.append(line_item)
+        
+        # Recalcula totais
+        self._recalculate_totals()
+        
+        return line_item
+    
+    def _recalculate_totals(self):
+        """Recalcula todos os totais da fatura."""
+        subtotal = 0.0
+        tax_total = 0.0
+        
+        for item in self.line_items:
+            subtotal += float(item.get("total_amount", 0))
+            tax_total += float(item.get("tax_amount", 0))
+        
+        self.subtotal_amount = subtotal
+        self.tax_amount = tax_total
+        self.total_amount = subtotal + tax_total
+        
+        # Se não for DRAFT, também recalcula amount_due
+        if self.status != InvoiceStatus.DRAFT:
+            self.amount_due = float(self.total_amount) - float(self.amount_paid)
+        
+        self.updated_at = datetime.utcnow()
+    
+    def record_payment(
+        self,
+        amount: float,
+        payment_method: str,
+        payment_provider: str,
+        transaction_id: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Registra um pagamento na fatura.
+        
+        Retorna:
+            bool: True se o pagamento foi aplicado com sucesso
+        """
+        if not self.can_be_paid:
+            return False
+        
+        # Valida valor
+        amount = float(amount)
+        if amount <= 0:
+            return False
+        
+        if amount > self.amount_due:
+            # Aceita pagamento maior que o devido (gera crédito)
+            amount = self.amount_due
+        
+        # Atualiza valores
+        self.amount_paid += amount
+        self.amount_due = float(self.total_amount) - float(self.amount_paid)
+        
+        # Atualiza status
+        if self.amount_due <= 0:
+            self.status = InvoiceStatus.PAID
+            self.paid_at = datetime.utcnow()
+        else:
+            self.status = InvoiceStatus.PARTIALLY_PAID
+        
+        # Registra dados do pagamento
+        self.payment_method = payment_method
+        self.payment_provider = payment_provider
+        self.payment_transaction_id = transaction_id
+        
+        # Adiciona ao histórico de pagamentos
+        if "payment_history" not in self.metadata:
+            self.metadata["payment_history"] = []
+        
+        self.metadata["payment_history"].append({
+            "amount": amount,
+            "currency": self.currency,
+            "payment_method": payment_method,
+            "payment_provider": payment_provider,
+            "transaction_id": transaction_id,
+            "paid_at": datetime.utcnow().isoformat(),
+            "metadata": metadata or {}
+        })
+        
+        self.updated_at = datetime.utcnow()
+        
+        return True
+    
+    def record_refund(
+        self,
+        amount: float,
+        reason: str,
+        refunded_by: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Registra um reembolso na fatura.
+        
+        Retorna:
+            bool: True se o reembolso foi registrado com sucesso
+        """
+        if not self.can_be_refunded:
+            return False
+        
+        # Valida valor
+        amount = float(amount)
+        if amount <= 0 or amount > self.amount_paid:
+            return False
+        
+        # Atualiza valores
+        self.amount_paid -= amount
+        self.amount_due = -amount  # Negativo indica crédito
+        
+        # Atualiza status
+        if self.amount_paid <= 0:
+            self.status = InvoiceStatus.REFUNDED
+            self.refunded_at = datetime.utcnow()
+        
+        # Adiciona ao histórico de reembolsos
+        if "refund_history" not in self.metadata:
+            self.metadata["refund_history"] = []
+        
+        self.metadata["refund_history"].append({
+            "amount": amount,
+            "currency": self.currency,
+            "reason": reason,
+            "refunded_by": refunded_by,
+            "refunded_at": datetime.utcnow().isoformat(),
+            "metadata": metadata or {}
+        })
+        
+        self.updated_at = datetime.utcnow()
+        
+        return True
+    
+    def void(self, reason: str, voided_by: str):
+        """Anula a fatura."""
+        if self.status != InvoiceStatus.DRAFT and self.status != InvoiceStatus.OPEN:
+            raise ValueError("Only DRAFT or OPEN invoices can be voided")
+        
+        self.status = InvoiceStatus.VOID
+        self.void_at = datetime.utcnow()
+        
+        # Registra motivo
+        self.metadata["void_reason"] = reason
+        self.metadata["voided_by"] = voided_by
+        self.metadata["voided_at"] = self.void_at.isoformat()
+        
+        self.updated_at = datetime.utcnow()
+    
+    def mark_as_uncollectible(self, reason: str):
+        """Marca a fatura como inadimplente."""
+        if self.status != InvoiceStatus.OPEN and self.status != InvoiceStatus.PARTIALLY_PAID:
+            raise ValueError("Only OPEN or PARTIALLY_PAID invoices can be marked as uncollectible")
+        
+        self.status = InvoiceStatus.UNCOLLECTIBLE
+        
+        # Registra motivo
+        self.metadata["uncollectible_reason"] = reason
+        self.metadata["marked_uncollectible_at"] = datetime.utcnow().isoformat()
+        
+        self.updated_at = datetime.utcnow()
+    
+    def create_credit_note(self) -> "Invoice":
+        """
+        Cria uma nota de crédito a partir desta fatura.
+        
+        Usado para reembolsos parciais ou ajustes.
+        """
+        # Cria nova fatura do tipo CREDIT
+        credit_note = Invoice(
+            tenant_id=self.tenant_id,
+            user_id=self.user_id,
+            bot_id=self.bot_id,
+            offer_id=self.offer_id,
+            payment_intent_id=self.payment_intent_id,
+            subscription_id=self.subscription_id,
+            invoice_type=InvoiceType.CREDIT,
+            status=InvoiceStatus.OPEN,
+            currency=self.currency,
+            subtotal_amount=-self.subtotal_amount,  # Negativo
+            tax_amount=-self.tax_amount,  # Negativo
+            total_amount=-self.total_amount,  # Negativo
+            amount_due=-self.total_amount,  # Negativo (crédito a ser usado)
+            tax_rate=self.tax_rate,
+            tax_type=self.tax_type,
+            tax_details=self.tax_details,
+            invoice_date=datetime.utcnow(),
+            metadata={
+                "original_invoice_id": self.id,
+                "original_invoice_number": self.invoice_number,
+                "credit_reason": "refund",
+                "created_at": datetime.utcnow().isoformat()
+            },
+            notes=f"Credit note for invoice {self.invoice_number}",
+            footer_text="This is a credit note"
+        )
+        
+        # Copia line items (com valores negativos)
+        for item in self.line_items:
+            credit_note.add_line_item(
+                description=f"Credit: {item.get('description', '')}",
+                unit_amount=-float(item.get("unit_amount", 0)),
+                quantity=item.get("quantity", 1),
+                tax_rate=item.get("tax_rate"),
+                metadata=item.get("metadata", {})
+            )
+        
+        credit_note.finalize()
+        
+        return credit_note
+    
+    def apply_tax(self, tax_rate: float, tax_type: TaxType, tax_details: Optional[Dict[str, Any]] = None):
+        """Aplica imposto à fatura."""
+        if self.status != InvoiceStatus.DRAFT:
+            raise ValueError("Tax can only be applied to DRAFT invoices")
+        
+        self.tax_rate = tax_rate
+        self.tax_type = tax_type
+        
+        if tax_details:
+            self.tax_details = tax_details
+        
+        # Recalcula impostos para cada item
+        for item in self.line_items:
+            item_total = float(item.get("total_amount", 0))
+            item_tax = item_total * tax_rate / 100
+            item["tax_rate"] = tax_rate
+            item["tax_amount"] = item_tax
+            item["total_amount_with_tax"] = item_total + item_tax
+        
+        # Recalcula totais
+        self._recalculate_totals()
+    
+    def generate_invoice_number(self, prefix: str = "INV", padding: int = 6) -> str:
+        """Gera número sequencial da fatura."""
+        # Em produção, isso usaria uma sequência do banco
+        # Por simplicidade, usa timestamp
+        timestamp = int(datetime.utcnow().timestamp())
+        return f"{prefix}-{timestamp:0{padding}}"
+
+
+class Refund(Base):
+    """
+    Reembolso associado a uma fatura.
+    """
+    
+    __tablename__ = "refunds"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    refund_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # REF-0001
+    invoice_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.invoices.id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Dados do reembolso
+    amount: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    reason: Mapped[str] = mapped_column(String(255), nullable=False)
+    
+    # Status
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")  # pending, processing, completed, failed
+    provider_refund_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    
+    # Metadados
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    invoice: Mapped["Invoice"] = relationship(back_populates="refunds")
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_refunds_invoice_status', 'invoice_id', 'status'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<Refund(id='{self.id}', refund_id='{self.refund_id}', amount={self.amount} {self.currency}, status='{self.status}')>"
+
+
+# Adiciona relação de créditos no Invoice
+Invoice.credit_notes = relationship(
+    "Invoice",
+    primaryjoin="and_(Invoice.metadata['original_invoice_id'].astext == foreign(Invoice.id), Invoice.invoice_type == 'CREDIT')",
+    viewonly=True
+)

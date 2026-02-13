@@ -1,0 +1,44 @@
+"""
+Módulo core da plataforma SaaS.
+Contém todas as engines centrais do sistema.
+"""
+
+from .flow_engine import FlowEngine
+from .webhook_processor import WebhookProcessor
+from .billing_engine import BillingEngine
+from .subscription_engine import SubscriptionEngine
+from .entitlement_engine import EntitlementEngine
+from .entitlement_resolver import EntitlementResolver
+from .notification_engine import NotificationEngine
+from .template_engine import TemplateEngine
+from .feature_flag_engine import FeatureFlagEngine
+from .metrics_engine import MetricsEngine
+from .healthcheck_engine import HealthcheckEngine
+from .audit_logger import AuditLogger
+from .pricing_engine import PricingEngine
+from .plan_catalog import PlanCatalog
+from .antifraud import AntiFraudEngine
+from .state_machine import StateMachine
+from .geo_resolver import GeoResolver
+from .offer_engine import OfferEngine
+
+__all__ = [
+    'FlowEngine',
+    'WebhookProcessor',
+    'BillingEngine',
+    'SubscriptionEngine',
+    'EntitlementEngine',
+    'EntitlementResolver',
+    'NotificationEngine',
+    'TemplateEngine',
+    'FeatureFlagEngine',
+    'MetricsEngine',
+    'HealthcheckEngine',
+    'AuditLogger',
+    'PricingEngine',
+    'PlanCatalog',
+    'AntiFraudEngine',
+    'StateMachine',
+    'GeoResolver',
+    'OfferEngine',
+]

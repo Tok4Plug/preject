@@ -1,0 +1,1154 @@
+"""
+Subscription Engine - Gerenciador de ciclo de vida de assinaturas.
+Renovação, expiração, upgrades, downgrades e integração com billing.
+"""
+
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Dict, List, Optional, Tuple, Any
+import asyncio
+import json
+import uuid
+from collections import defaultdict
+
+from app.core.state_machine import StateMachine, StateTransitionError
+from app.core.audit_logger import AuditLogger
+from app.core.plan_catalog import PlanCatalog, PlanVersion, BillingCycle
+from app.models.subscription import Subscription, SubscriptionStatus
+from app.engines.payment_engine import PaymentEngine
+
+
+class SubscriptionAction(Enum):
+    """Ações de assinatura."""
+    CREATE = "create"
+    RENEW = "renew"
+    UPGRADE = "upgrade"
+    DOWNGRADE = "downgrade"
+    CANCEL = "cancel"
+    REACTIVATE = "reactivate"
+    PAUSE = "pause"
+    RESUME = "resume"
+    CHANGE_QUANTITY = "change_quantity"
+    CHANGE_BILLING_CYCLE = "change_billing_cycle"
+
+
+@dataclass
+class SubscriptionChange:
+    """Mudança em uma assinatura."""
+    change_id: str
+    subscription_id: str
+    action: SubscriptionAction
+    old_plan_id: Optional[str] = None
+    new_plan_id: Optional[str] = None
+    old_quantity: int = 1
+    new_quantity: int = 1
+    old_billing_cycle: Optional[BillingCycle] = None
+    new_billing_cycle: Optional[BillingCycle] = None
+    prorated_amount: Optional[Decimal] = None
+    effective_date: Optional[datetime] = None
+    processed: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    processed_at: Optional[datetime] = None
+
+
+class SubscriptionEngine:
+    """
+    Engine de gerenciamento de assinaturas com foco em ciclo de vida.
+    Integração com Payment Engine para renovação automática.
+    """
+    
+    def __init__(
+        self,
+        db_pool,
+        audit_logger: AuditLogger,
+        plan_catalog: PlanCatalog,
+        payment_engine: Optional[PaymentEngine] = None,
+        redis_client=None
+    ):
+        """
+        Inicializa o Subscription Engine.
+        
+        Args:
+            db_pool: Pool de conexões com banco
+            audit_logger: Logger de auditoria
+            plan_catalog: Catálogo de planos
+            payment_engine: Engine de pagamento (para renovação)
+            redis_client: Cliente Redis (opcional)
+        """
+        self.db_pool = db_pool
+        self.audit_logger = audit_logger
+        self.plan_catalog = plan_catalog
+        self.payment_engine = payment_engine
+        self.redis = redis_client
+        
+        # Cache de assinaturas
+        self.subscriptions_cache: Dict[str, Subscription] = {}
+        
+        # Queue de mudanças pendentes
+        self.pending_changes: Dict[str, List[SubscriptionChange]] = defaultdict(list)
+        
+        # Máquina de estados
+        self.state_machine = StateMachine(
+            initial_states=[SubscriptionStatus.PENDING.value],
+            transitions={
+                SubscriptionStatus.PENDING.value: [
+                    SubscriptionStatus.TRIALING.value,
+                    SubscriptionStatus.ACTIVE.value,
+                    SubscriptionStatus.CANCELLED.value,
+                    SubscriptionStatus.ERROR.value
+                ],
+                SubscriptionStatus.TRIALING.value: [
+                    SubscriptionStatus.ACTIVE.value,
+                    SubscriptionStatus.CANCELLED.value,
+                    SubscriptionStatus.EXPIRED.value,
+                    SubscriptionStatus.PAST_DUE.value
+                ],
+                SubscriptionStatus.ACTIVE.value: [
+                    SubscriptionStatus.PAST_DUE.value,
+                    SubscriptionStatus.CANCELLED.value,
+                    SubscriptionStatus.SUSPENDED.value,
+                    SubscriptionStatus.UPGRADING.value,
+                    SubscriptionStatus.DOWNGRADING.value,
+                    SubscriptionStatus.EXPIRED.value
+                ],
+                SubscriptionStatus.PAST_DUE.value: [
+                    SubscriptionStatus.ACTIVE.value,
+                    SubscriptionStatus.SUSPENDED.value,
+                    SubscriptionStatus.EXPIRED.value,
+                    SubscriptionStatus.CANCELLED.value
+                ],
+                SubscriptionStatus.SUSPENDED.value: [
+                    SubscriptionStatus.ACTIVE.value,
+                    SubscriptionStatus.EXPIRED.value,
+                    SubscriptionStatus.CANCELLED.value
+                ],
+                SubscriptionStatus.UPGRADING.value: [
+                    SubscriptionStatus.ACTIVE.value,
+                    SubscriptionStatus.ERROR.value
+                ],
+                SubscriptionStatus.DOWNGRADING.value: [
+                    SubscriptionStatus.ACTIVE.value,
+                    SubscriptionStatus.ERROR.value
+                ],
+                SubscriptionStatus.CANCELLED.value: [],
+                SubscriptionStatus.EXPIRED.value: [],
+                SubscriptionStatus.ERROR.value: [
+                    SubscriptionStatus.ACTIVE.value,
+                    SubscriptionStatus.CANCELLED.value
+                ]
+            },
+            state_field="status",
+            resource_id_field="subscription_id"
+        )
+        
+        # Inicia worker de processamento
+        self._processing_task = asyncio.create_task(self._process_pending_changes())
+        self._renewal_task = asyncio.create_task(self._process_renewals())
+    
+    async def create_subscription(
+        self,
+        tenant_id: str,
+        user_id: str,
+        external_user_id: str,
+        plan_id: str,
+        payment_intent_id: Optional[str] = None,
+        quantity: int = 1,
+        trial_days: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        created_by: str = "system"
+    ) -> Tuple[bool, Optional[Subscription], List[str]]:
+        """
+        Cria uma nova assinatura.
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário
+            external_user_id: ID externo
+            plan_id: ID do plano
+            payment_intent_id: ID do payment intent (se já pago)
+            quantity: Quantidade
+            trial_days: Dias de teste
+            metadata: Metadados
+            created_by: Quem criou
+            
+        Returns:
+            Tuple[success, subscription, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Busca plano
+                    plan = await self.plan_catalog.get_latest_plan_version(tenant_id, plan_id)
+                    if not plan:
+                        return False, None, [f"Plan not found: {plan_id}"]
+                    
+                    # Verifica limites do plano
+                    if plan.max_subscribers:
+                        active_count = await self._get_active_subscription_count(
+                            conn, tenant_id, plan_id, plan.version
+                        )
+                        if active_count >= plan.max_subscribers:
+                            return False, None, [f"Plan limit reached: {plan.max_subscribers}"]
+                    
+                    # Determina status inicial
+                    now = datetime.utcnow()
+                    actual_trial_days = trial_days if trial_days is not None else plan.trial_days
+                    
+                    if actual_trial_days > 0:
+                        trial_start = now
+                        trial_end = now + timedelta(days=actual_trial_days)
+                        period_start = trial_end
+                        status = SubscriptionStatus.TRIALING
+                    else:
+                        trial_start = None
+                        trial_end = None
+                        period_start = now
+                        status = SubscriptionStatus.ACTIVE
+                    
+                    # Se já tem payment intent, verifica se está pago
+                    if payment_intent_id:
+                        # Em produção, validaria payment intent
+                        status = SubscriptionStatus.ACTIVE
+                    
+                    # Calcula período
+                    period_end = self._calculate_period_end(period_start, plan.billing_cycle)
+                    
+                    # Cria assinatura
+                    subscription_id = f"sub_{uuid.uuid4().hex[:12]}"
+                    subscription = Subscription(
+                        subscription_id=subscription_id,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        external_user_id=external_user_id,
+                        plan_id=plan_id,
+                        plan_version=plan.version,
+                        status=status,
+                        billing_cycle=plan.billing_cycle,
+                        quantity=quantity,
+                        start_date=now,
+                        current_period_start=period_start,
+                        current_period_end=period_end,
+                        trial_start=trial_start,
+                        trial_end=trial_end,
+                        payment_intent_id=payment_intent_id,
+                        metadata=metadata or {},
+                        created_at=now,
+                        updated_at=now
+                    )
+                    
+                    # Persiste
+                    await conn.execute(
+                        """
+                        INSERT INTO subscriptions (
+                            subscription_id, tenant_id, user_id, external_user_id,
+                            plan_id, plan_version, status, billing_cycle, quantity,
+                            start_date, current_period_start, current_period_end,
+                            trial_start, trial_end, payment_intent_id, metadata,
+                            created_at, updated_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                                 $13, $14, $15, $16, $17, $18)
+                        """,
+                        subscription.subscription_id,
+                        subscription.tenant_id,
+                        subscription.user_id,
+                        subscription.external_user_id,
+                        subscription.plan_id,
+                        subscription.plan_version,
+                        subscription.status.value,
+                        subscription.billing_cycle.value,
+                        subscription.quantity,
+                        subscription.start_date,
+                        subscription.current_period_start,
+                        subscription.current_period_end,
+                        subscription.trial_start,
+                        subscription.trial_end,
+                        subscription.payment_intent_id,
+                        json.dumps(subscription.metadata),
+                        subscription.created_at,
+                        subscription.updated_at
+                    )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        action="subscription.created",
+                        resource_type="subscription",
+                        resource_id=subscription_id,
+                        changes={
+                            "plan_id": plan_id,
+                            "plan_version": plan.version,
+                            "status": status.value,
+                            "trial_days": actual_trial_days,
+                            "quantity": quantity
+                        },
+                        metadata=subscription.to_dict()
+                    )
+                    
+                    # Cache
+                    self.subscriptions_cache[subscription_id] = subscription
+                    
+                    return True, subscription, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def renew_subscription(
+        self,
+        subscription_id: str,
+        payment_intent_id: Optional[str] = None,
+        renewed_by: str = "system"
+    ) -> Tuple[bool, Optional[Subscription], List[str]]:
+        """
+        Renova uma assinatura.
+        
+        Args:
+            subscription_id: ID da assinatura
+            payment_intent_id: ID do pagamento (opcional)
+            renewed_by: Quem renovou
+            
+        Returns:
+            Tuple[success, subscription, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    subscription = await self._get_subscription(conn, subscription_id)
+                    if not subscription:
+                        return False, None, [f"Subscription not found: {subscription_id}"]
+                    
+                    # Verifica se pode renovar
+                    if not subscription.is_active():
+                        return False, None, [f"Cannot renew {subscription.status.value} subscription"]
+                    
+                    # Se está em trial, transita para ativo
+                    if subscription.status == SubscriptionStatus.TRIALING:
+                        await self._update_subscription_status(
+                            conn, subscription, SubscriptionStatus.ACTIVE,
+                            renewed_by, "Trial ended"
+                        )
+                    
+                    # Calcula novo período
+                    new_period_start = subscription.current_period_end
+                    new_period_end = self._calculate_period_end(
+                        new_period_start, subscription.billing_cycle
+                    )
+                    
+                    # Atualiza período
+                    await conn.execute(
+                        """
+                        UPDATE subscriptions 
+                        SET current_period_start = $1,
+                            current_period_end = $2,
+                            updated_at = $3
+                        WHERE subscription_id = $4
+                        """,
+                        new_period_start,
+                        new_period_end,
+                        datetime.utcnow(),
+                        subscription_id
+                    )
+                    
+                    # Se estava past_due, volta para active
+                    if subscription.status == SubscriptionStatus.PAST_DUE:
+                        await self._update_subscription_status(
+                            conn, subscription, SubscriptionStatus.ACTIVE,
+                            renewed_by, "Payment received"
+                        )
+                    
+                    # Atualiza payment intent
+                    if payment_intent_id:
+                        await conn.execute(
+                            """
+                            UPDATE subscriptions 
+                            SET payment_intent_id = $1
+                            WHERE subscription_id = $2
+                            """,
+                            payment_intent_id,
+                            subscription_id
+                        )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=subscription.tenant_id,
+                        user_id=subscription.user_id,
+                        action="subscription.renewed",
+                        resource_type="subscription",
+                        resource_id=subscription_id,
+                        changes={
+                            "new_period_start": new_period_start.isoformat(),
+                            "new_period_end": new_period_end.isoformat(),
+                            "payment_intent_id": payment_intent_id
+                        }
+                    )
+                    
+                    # Busca atualizado
+                    subscription = await self._get_subscription(conn, subscription_id)
+                    self.subscriptions_cache[subscription_id] = subscription
+                    
+                    return True, subscription, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def upgrade_subscription(
+        self,
+        subscription_id: str,
+        new_plan_id: str,
+        prorate: bool = True,
+        effective_date: Optional[datetime] = None,
+        upgraded_by: str = "system"
+    ) -> Tuple[bool, Optional[SubscriptionChange], List[str]]:
+        """
+        Agenda upgrade de assinatura.
+        
+        Args:
+            subscription_id: ID da assinatura
+            new_plan_id: Novo plano
+            prorate: Se deve proratar
+            effective_date: Data de efetivação
+            upgraded_by: Quem solicitou
+            
+        Returns:
+            Tuple[success, change, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    subscription = await self._get_subscription(conn, subscription_id)
+                    if not subscription:
+                        return False, None, [f"Subscription not found: {subscription_id}"]
+                    
+                    # Verifica se pode fazer upgrade
+                    if not subscription.is_active():
+                        return False, None, [f"Cannot upgrade {subscription.status.value} subscription"]
+                    
+                    # Busca novo plano
+                    new_plan = await self.plan_catalog.get_latest_plan_version(
+                        subscription.tenant_id, new_plan_id
+                    )
+                    if not new_plan:
+                        return False, None, [f"New plan not found: {new_plan_id}"]
+                    
+                    # Cria change record
+                    change_id = f"chg_{uuid.uuid4().hex[:8]}"
+                    change = SubscriptionChange(
+                        change_id=change_id,
+                        subscription_id=subscription_id,
+                        action=SubscriptionAction.UPGRADE,
+                        old_plan_id=subscription.plan_id,
+                        new_plan_id=new_plan_id,
+                        old_quantity=subscription.quantity,
+                        new_quantity=subscription.quantity,
+                        old_billing_cycle=subscription.billing_cycle,
+                        new_billing_cycle=new_plan.billing_cycle,
+                        effective_date=effective_date or datetime.utcnow(),
+                        metadata={
+                            "prorate": prorate,
+                            "requested_by": upgraded_by
+                        }
+                    )
+                    
+                    # Persiste
+                    await conn.execute(
+                        """
+                        INSERT INTO subscription_changes (
+                            change_id, subscription_id, action, old_plan_id,
+                            new_plan_id, old_quantity, new_quantity,
+                            old_billing_cycle, new_billing_cycle, prorated_amount,
+                            effective_date, processed, metadata, created_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                        """,
+                        change.change_id,
+                        change.subscription_id,
+                        change.action.value,
+                        change.old_plan_id,
+                        change.new_plan_id,
+                        change.old_quantity,
+                        change.new_quantity,
+                        change.old_billing_cycle.value if change.old_billing_cycle else None,
+                        change.new_billing_cycle.value if change.new_billing_cycle else None,
+                        str(change.prorated_amount) if change.prorated_amount else None,
+                        change.effective_date,
+                        change.processed,
+                        json.dumps(change.metadata),
+                        change.created_at
+                    )
+                    
+                    # Adiciona à queue
+                    self.pending_changes[subscription_id].append(change)
+                    
+                    # Atualiza status da assinatura
+                    await self._update_subscription_status(
+                        conn, subscription, SubscriptionStatus.UPGRADING,
+                        upgraded_by, f"Upgrade to {new_plan_id} scheduled"
+                    )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=subscription.tenant_id,
+                        user_id=subscription.user_id,
+                        action="subscription.upgrade_scheduled",
+                        resource_type="subscription",
+                        resource_id=subscription_id,
+                        changes={
+                            "old_plan": subscription.plan_id,
+                            "new_plan": new_plan_id,
+                            "effective_date": change.effective_date.isoformat()
+                        },
+                        metadata=change.metadata
+                    )
+                    
+                    return True, change, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def cancel_subscription(
+        self,
+        subscription_id: str,
+        cancel_immediately: bool = False,
+        cancelled_by: str = "system",
+        reason: str = "User requested"
+    ) -> Tuple[bool, Optional[Subscription], List[str]]:
+        """
+        Cancela uma assinatura.
+        
+        Args:
+            subscription_id: ID da assinatura
+            cancel_immediately: Se True, cancela agora; se False, no fim do período
+            cancelled_by: Quem cancelou
+            reason: Motivo
+            
+        Returns:
+            Tuple[success, subscription, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    subscription = await self._get_subscription(conn, subscription_id)
+                    if not subscription:
+                        return False, None, [f"Subscription not found: {subscription_id}"]
+                    
+                    if subscription.status == SubscriptionStatus.CANCELLED:
+                        return True, subscription, ["Already cancelled"]
+                    
+                    if cancel_immediately:
+                        # Cancela imediatamente
+                        await self._update_subscription_status(
+                            conn, subscription, SubscriptionStatus.CANCELLED,
+                            cancelled_by, reason
+                        )
+                        
+                        # Marca fim do período como agora
+                        await conn.execute(
+                            """
+                            UPDATE subscriptions 
+                            SET current_period_end = $1,
+                                ended_at = $2,
+                                updated_at = $3
+                            WHERE subscription_id = $4
+                            """,
+                            datetime.utcnow(),
+                            datetime.utcnow(),
+                            datetime.utcnow(),
+                            subscription_id
+                        )
+                    else:
+                        # Cancela no fim do período
+                        await conn.execute(
+                            """
+                            UPDATE subscriptions 
+                            SET cancel_at_period_end = true,
+                                cancellation_reason = $1,
+                                cancelled_by = $2,
+                                updated_at = $3
+                            WHERE subscription_id = $4
+                            """,
+                            reason,
+                            cancelled_by,
+                            datetime.utcnow(),
+                            subscription_id
+                        )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=subscription.tenant_id,
+                        user_id=subscription.user_id,
+                        action="subscription.cancelled",
+                        resource_type="subscription",
+                        resource_id=subscription_id,
+                        changes={
+                            "immediate": cancel_immediately,
+                            "reason": reason
+                        }
+                    )
+                    
+                    # Busca atualizado
+                    subscription = await self._get_subscription(conn, subscription_id)
+                    self.subscriptions_cache[subscription_id] = subscription
+                    
+                    return True, subscription, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def get_subscription(
+        self,
+        subscription_id: str
+    ) -> Optional[Subscription]:
+        """Obtém uma assinatura."""
+        # Tenta cache
+        if subscription_id in self.subscriptions_cache:
+            return self.subscriptions_cache[subscription_id]
+        
+        async with self.db_pool.acquire() as conn:
+            subscription = await self._get_subscription(conn, subscription_id)
+            if subscription:
+                self.subscriptions_cache[subscription_id] = subscription
+            return subscription
+    
+    async def get_user_subscriptions(
+        self,
+        tenant_id: str,
+        user_id: str,
+        active_only: bool = True
+    ) -> List[Subscription]:
+        """Obtém assinaturas de um usuário."""
+        async with self.db_pool.acquire() as conn:
+            query = """
+                SELECT * FROM subscriptions 
+                WHERE tenant_id = $1 AND user_id = $2
+            """
+            params = [tenant_id, user_id]
+            
+            if active_only:
+                query += " AND status IN ('active', 'trialing', 'upgrading', 'downgrading')"
+            
+            query += " ORDER BY created_at DESC"
+            
+            rows = await conn.fetch(query, *params)
+            subscriptions = [self._row_to_subscription(row) for row in rows]
+            
+            # Atualiza cache
+            for sub in subscriptions:
+                self.subscriptions_cache[sub.subscription_id] = sub
+            
+            return subscriptions
+    
+    async def get_subscriptions_due_for_renewal(
+        self,
+        days_ahead: int = 7,
+        limit: int = 100
+    ) -> List[Subscription]:
+        """
+        Obtém assinaturas que precisam ser renovadas.
+        
+        Args:
+            days_ahead: Dias antes do vencimento
+            limit: Limite de resultados
+            
+        Returns:
+            Lista de assinaturas
+        """
+        async with self.db_pool.acquire() as conn:
+            now = datetime.utcnow()
+            renewal_date = now + timedelta(days=days_ahead)
+            
+            rows = await conn.fetch(
+                """
+                SELECT * FROM subscriptions 
+                WHERE status IN ('active', 'trialing')
+                  AND current_period_end <= $1
+                  AND current_period_end > $2
+                  AND cancel_at_period_end = false
+                ORDER BY current_period_end ASC
+                LIMIT $3
+                """,
+                renewal_date, now, limit
+            )
+            
+            return [self._row_to_subscription(row) for row in rows]
+    
+    async def handle_payment_success(
+        self,
+        tenant_id: str,
+        subscription_id: str,
+        payment_intent_id: str,
+        amount: Decimal,
+        currency: str
+    ) -> Tuple[bool, Optional[Subscription], List[str]]:
+        """
+        Processa pagamento bem-sucedido para uma assinatura.
+        
+        Args:
+            tenant_id: ID do tenant
+            subscription_id: ID da assinatura
+            payment_intent_id: ID do pagamento
+            amount: Valor
+            currency: Moeda
+            
+        Returns:
+            Tuple[success, subscription, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    subscription = await self._get_subscription(conn, subscription_id)
+                    if not subscription or subscription.tenant_id != tenant_id:
+                        return False, None, [f"Subscription not found: {subscription_id}"]
+                    
+                    # Renova assinatura
+                    success, renewed_sub, errors = await self.renew_subscription(
+                        subscription_id, payment_intent_id, "payment_system"
+                    )
+                    
+                    if not success:
+                        return False, None, errors
+                    
+                    # Log específico de pagamento
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=subscription.user_id,
+                        action="subscription.payment_success",
+                        resource_type="subscription",
+                        resource_id=subscription_id,
+                        changes={
+                            "payment_intent_id": payment_intent_id,
+                            "amount": str(amount),
+                            "currency": currency
+                        }
+                    )
+                    
+                    return True, renewed_sub, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def handle_payment_failure(
+        self,
+        tenant_id: str,
+        subscription_id: str,
+        failure_reason: str
+    ) -> Tuple[bool, Optional[Subscription], List[str]]:
+        """
+        Processa falha de pagamento para uma assinatura.
+        
+        Args:
+            tenant_id: ID do tenant
+            subscription_id: ID da assinatura
+            failure_reason: Motivo da falha
+            
+        Returns:
+            Tuple[success, subscription, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    subscription = await self._get_subscription(conn, subscription_id)
+                    if not subscription or subscription.tenant_id != tenant_id:
+                        return False, None, [f"Subscription not found: {subscription_id}"]
+                    
+                    # Se é a primeira falha, marca como past_due
+                    if subscription.status == SubscriptionStatus.ACTIVE:
+                        await self._update_subscription_status(
+                            conn, subscription, SubscriptionStatus.PAST_DUE,
+                            "payment_system", f"Payment failed: {failure_reason}"
+                        )
+                    
+                    # Se já estava past_due, pode suspender
+                    elif subscription.status == SubscriptionStatus.PAST_DUE:
+                        # Verifica histórico de falhas
+                        failures = await self._get_recent_payment_failures(
+                            conn, subscription_id, days=30
+                        )
+                        
+                        if len(failures) >= 3:
+                            await self._update_subscription_status(
+                                conn, subscription, SubscriptionStatus.SUSPENDED,
+                                "payment_system", "Multiple payment failures"
+                            )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=subscription.user_id,
+                        action="subscription.payment_failed",
+                        resource_type="subscription",
+                        resource_id=subscription_id,
+                        changes={
+                            "reason": failure_reason,
+                            "new_status": subscription.status.value
+                        },
+                        severity="warning"
+                    )
+                    
+                    # Busca atualizado
+                    subscription = await self._get_subscription(conn, subscription_id)
+                    self.subscriptions_cache[subscription_id] = subscription
+                    
+                    return True, subscription, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    # Métodos privados
+    async def _get_subscription(self, conn, subscription_id: str) -> Optional[Subscription]:
+        """Busca assinatura do banco."""
+        row = await conn.fetchrow(
+            "SELECT * FROM subscriptions WHERE subscription_id = $1",
+            subscription_id
+        )
+        return self._row_to_subscription(row) if row else None
+    
+    async def _get_active_subscription_count(
+        self,
+        conn,
+        tenant_id: str,
+        plan_id: str,
+        plan_version: int
+    ) -> int:
+        """Conta assinaturas ativas de um plano."""
+        return await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM subscriptions 
+            WHERE tenant_id = $1 AND plan_id = $2 AND plan_version = $3
+              AND status IN ('active', 'trialing')
+            """,
+            tenant_id, plan_id, plan_version
+        )
+    
+    async def _get_recent_payment_failures(
+        self,
+        conn,
+        subscription_id: str,
+        days: int
+    ) -> List[Dict]:
+        """Obtém falhas de pagamento recentes."""
+        rows = await conn.fetch(
+            """
+            SELECT * FROM payment_failures 
+            WHERE subscription_id = $1 AND created_at >= $2
+            ORDER BY created_at DESC
+            """,
+            subscription_id,
+            datetime.utcnow() - timedelta(days=days)
+        )
+        return [dict(row) for row in rows]
+    
+    async def _update_subscription_status(
+        self,
+        conn,
+        subscription: Subscription,
+        new_status: SubscriptionStatus,
+        actor: str,
+        reason: str,
+        metadata: Optional[Dict] = None
+    ):
+        """Atualiza status de uma assinatura."""
+        old_status = subscription.status
+        
+        # Valida transição
+        if not self.state_machine.can_transition(old_status.value, new_status.value):
+            raise StateTransitionError(
+                f"Cannot transition subscription from {old_status.value} to {new_status.value}"
+            )
+        
+        # Atualiza
+        updated_at = datetime.utcnow()
+        await conn.execute(
+            """
+            UPDATE subscriptions 
+            SET status = $1, updated_at = $2
+            WHERE subscription_id = $3
+            """,
+            new_status.value,
+            updated_at,
+            subscription.subscription_id
+        )
+        
+        # Adiciona timestamps específicos
+        if new_status == SubscriptionStatus.CANCELLED:
+            await conn.execute(
+                """
+                UPDATE subscriptions 
+                SET cancelled_at = $1
+                WHERE subscription_id = $2
+                """,
+                updated_at,
+                subscription.subscription_id
+            )
+        elif new_status == SubscriptionStatus.EXPIRED:
+            await conn.execute(
+                """
+                UPDATE subscriptions 
+                SET ended_at = $1
+                WHERE subscription_id = $2
+                """,
+                updated_at,
+                subscription.subscription_id
+            )
+        
+        # Log
+        await self.audit_logger.log(
+            tenant_id=subscription.tenant_id,
+            user_id=subscription.user_id,
+            action="subscription.status_changed",
+            resource_type="subscription",
+            resource_id=subscription.subscription_id,
+            changes={
+                "old_status": old_status.value,
+                "new_status": new_status.value,
+                "reason": reason,
+                "actor": actor
+            },
+            metadata=metadata or {}
+        )
+    
+    def _calculate_period_end(self, start_date: datetime, billing_cycle: BillingCycle) -> datetime:
+        """Calcula fim do período."""
+        if billing_cycle == BillingCycle.DAILY:
+            return start_date + timedelta(days=1)
+        elif billing_cycle == BillingCycle.WEEKLY:
+            return start_date + timedelta(weeks=1)
+        elif billing_cycle == BillingCycle.MONTHLY:
+            return start_date + timedelta(days=30)
+        elif billing_cycle == BillingCycle.QUARTERLY:
+            return start_date + timedelta(days=90)
+        elif billing_cycle == BillingCycle.BIANNUAL:
+            return start_date + timedelta(days=180)
+        elif billing_cycle == BillingCycle.ANNUAL:
+            return start_date + timedelta(days=365)
+        elif billing_cycle == BillingCycle.LIFETIME:
+            return start_date + timedelta(days=365 * 100)
+        else:
+            return start_date + timedelta(days=30)
+    
+    async def _process_pending_changes(self):
+        """Processa mudanças pendentes de assinatura."""
+        while True:
+            try:
+                async with self.db_pool.acquire() as conn:
+                    # Busca changes pendentes
+                    rows = await conn.fetch(
+                        """
+                        SELECT * FROM subscription_changes 
+                        WHERE processed = false AND effective_date <= $1
+                        ORDER BY effective_date ASC
+                        LIMIT 100
+                        """,
+                        datetime.utcnow()
+                    )
+                    
+                    for row in rows:
+                        change = self._row_to_subscription_change(row)
+                        await self._process_change(conn, change)
+                
+                # Aguarda antes da próxima execução
+                await asyncio.sleep(60)  # 1 minuto
+                
+            except Exception as e:
+                print(f"Error processing pending changes: {e}")
+                await asyncio.sleep(300)  # 5 minutos em caso de erro
+    
+    async def _process_change(self, conn, change: SubscriptionChange):
+        """Processa uma mudança específica."""
+        try:
+            subscription = await self._get_subscription(conn, change.subscription_id)
+            if not subscription:
+                return
+            
+            if change.action == SubscriptionAction.UPGRADE:
+                await self._apply_upgrade(conn, subscription, change)
+            elif change.action == SubscriptionAction.DOWNGRADE:
+                await self._apply_downgrade(conn, subscription, change)
+            elif change.action == SubscriptionAction.CHANGE_QUANTITY:
+                await self._apply_quantity_change(conn, subscription, change)
+            elif change.action == SubscriptionAction.CHANGE_BILLING_CYCLE:
+                await self._apply_billing_cycle_change(conn, subscription, change)
+            
+            # Marca como processada
+            await conn.execute(
+                """
+                UPDATE subscription_changes 
+                SET processed = true, processed_at = $1
+                WHERE change_id = $2
+                """,
+                datetime.utcnow(),
+                change.change_id
+            )
+            
+            # Remove da queue
+            if change.subscription_id in self.pending_changes:
+                self.pending_changes[change.subscription_id] = [
+                    c for c in self.pending_changes[change.subscription_id]
+                    if c.change_id != change.change_id
+                ]
+            
+        except Exception as e:
+            print(f"Error processing change {change.change_id}: {e}")
+    
+    async def _apply_upgrade(self, conn, subscription: Subscription, change: SubscriptionChange):
+        """Aplica upgrade."""
+        # Atualiza plano
+        await conn.execute(
+            """
+            UPDATE subscriptions 
+            SET plan_id = $1, plan_version = $2,
+                billing_cycle = $3, updated_at = $4
+            WHERE subscription_id = $5
+            """,
+            change.new_plan_id,
+            change.metadata.get("new_plan_version"),
+            change.new_billing_cycle.value if change.new_billing_cycle else None,
+            datetime.utcnow(),
+            subscription.subscription_id
+        )
+        
+        # Atualiza status
+        await self._update_subscription_status(
+            conn, subscription, SubscriptionStatus.ACTIVE,
+            "system", "Upgrade completed"
+        )
+        
+        # Log
+        await self.audit_logger.log(
+            tenant_id=subscription.tenant_id,
+            user_id=subscription.user_id,
+            action="subscription.upgraded",
+            resource_type="subscription",
+            resource_id=subscription.subscription_id,
+            changes={
+                "old_plan": change.old_plan_id,
+                "new_plan": change.new_plan_id
+            }
+        )
+    
+    async def _apply_downgrade(self, conn, subscription: Subscription, change: SubscriptionChange):
+        """Aplica downgrade."""
+        # Similar ao upgrade
+        await self._apply_upgrade(conn, subscription, change)
+    
+    async def _apply_quantity_change(self, conn, subscription: Subscription, change: SubscriptionChange):
+        """Aplica mudança de quantidade."""
+        await conn.execute(
+            """
+            UPDATE subscriptions 
+            SET quantity = $1, updated_at = $2
+            WHERE subscription_id = $3
+            """,
+            change.new_quantity,
+            datetime.utcnow(),
+            subscription.subscription_id
+        )
+    
+    async def _apply_billing_cycle_change(self, conn, subscription: Subscription, change: SubscriptionChange):
+        """Aplica mudança de ciclo de cobrança."""
+        await conn.execute(
+            """
+            UPDATE subscriptions 
+            SET billing_cycle = $1, updated_at = $2
+            WHERE subscription_id = $3
+            """,
+            change.new_billing_cycle.value,
+            datetime.utcnow(),
+            subscription.subscription_id
+        )
+        
+        # Recalcula período
+        new_period_end = self._calculate_period_end(
+            subscription.current_period_start, change.new_billing_cycle
+        )
+        
+        await conn.execute(
+            """
+            UPDATE subscriptions 
+            SET current_period_end = $1
+            WHERE subscription_id = $2
+            """,
+            new_period_end,
+            subscription.subscription_id
+        )
+    
+    async def _process_renewals(self):
+        """Processa renovações automáticas."""
+        while True:
+            try:
+                # Busca assinaturas para renovar
+                subscriptions = await self.get_subscriptions_due_for_renewal(days_ahead=1)
+                
+                for subscription in subscriptions:
+                    # Se tem payment engine, tenta cobrança automática
+                    if self.payment_engine and subscription.payment_intent_id:
+                        # Em produção, processaria cobrança automática
+                        pass
+                    else:
+                        # Marca como past_due se não tem pagamento automático
+                        if subscription.status == SubscriptionStatus.ACTIVE:
+                            await self.handle_payment_failure(
+                                subscription.tenant_id,
+                                subscription.subscription_id,
+                                "Automatic payment not configured"
+                            )
+                
+                # Aguarda antes da próxima execução
+                await asyncio.sleep(3600)  # 1 hora
+                
+            except Exception as e:
+                print(f"Error processing renewals: {e}")
+                await asyncio.sleep(300)  # 5 minutos em caso de erro
+    
+    def _row_to_subscription(self, row) -> Subscription:
+        """Converte linha do banco para Subscription."""
+        return Subscription(
+            subscription_id=row["subscription_id"],
+            tenant_id=row["tenant_id"],
+            user_id=row["user_id"],
+            external_user_id=row["external_user_id"],
+            plan_id=row["plan_id"],
+            plan_version=row["plan_version"],
+            status=SubscriptionStatus(row["status"]),
+            billing_cycle=BillingCycle(row["billing_cycle"]),
+            quantity=row["quantity"],
+            start_date=row["start_date"],
+            current_period_start=row["current_period_start"],
+            current_period_end=row["current_period_end"],
+            trial_start=row.get("trial_start"),
+            trial_end=row.get("trial_end"),
+            cancelled_at=row.get("cancelled_at"),
+            ended_at=row.get("ended_at"),
+            payment_intent_id=row.get("payment_intent_id"),
+            metadata=json.loads(row["metadata"]) if row.get("metadata") else {},
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )
+    
+    def _row_to_subscription_change(self, row) -> SubscriptionChange:
+        """Converte linha do banco para SubscriptionChange."""
+        return SubscriptionChange(
+            change_id=row["change_id"],
+            subscription_id=row["subscription_id"],
+            action=SubscriptionAction(row["action"]),
+            old_plan_id=row["old_plan_id"],
+            new_plan_id=row["new_plan_id"],
+            old_quantity=row["old_quantity"],
+            new_quantity=row["new_quantity"],
+            old_billing_cycle=(
+                BillingCycle(row["old_billing_cycle"])
+                if row.get("old_billing_cycle") else None
+            ),
+            new_billing_cycle=(
+                BillingCycle(row["new_billing_cycle"])
+                if row.get("new_billing_cycle") else None
+            ),
+            prorated_amount=(
+                Decimal(str(row["prorated_amount"]))
+                if row.get("prorated_amount") else None
+            ),
+            effective_date=row["effective_date"],
+            processed=row["processed"],
+            metadata=json.loads(row["metadata"]) if row.get("metadata") else {},
+            created_at=row["created_at"],
+            processed_at=row.get("processed_at")
+        )

@@ -1,0 +1,1508 @@
+# app/core/billing_engine.py
+"""
+Engine de faturamento (WRITE-SIDE).
+Responsável por criar invoices, confirmar pagamentos, processar refunds e chargebacks.
+Traduz pagamentos → entitlement via eventos, nunca concede acesso diretamente.
+"""
+
+import enum
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from enum import Enum
+from decimal import Decimal
+import uuid
+
+from app.core.audit_logger import audit_logger
+from app.core.state_machine import StateMachineEngine, StateMachine, StateTransitionError
+from app.models.invoice import Invoice, InvoiceStatus, InvoiceType
+from app.models.payment_intent import PaymentIntent, PaymentIntentState
+from app.models.user import User
+from app.models.offer import Offer
+from app.models.subscription import Subscription, SubscriptionState
+from app.utils.idempotency import with_idempotency
+from app.queue.tasks import enqueue_billing_task
+
+logger = logging.getLogger(__name__)
+
+
+class BillingAction(Enum):
+    """Ações de faturamento que podem ser executadas."""
+    CREATE_INVOICE = "create_invoice"
+    CONFIRM_PAYMENT = "confirm_payment"
+    PROCESS_REFUND = "process_refund"
+    PROCESS_CHARGEBACK = "process_chargeback"
+    PROCESS_DISPUTE = "process_dispute"
+    CANCEL_INVOICE = "cancel_invoice"
+    RENEW_SUBSCRIPTION = "renew_subscription"
+
+
+class BillingError(Exception):
+    """Exceção para erros de faturamento."""
+    pass
+
+
+class PaymentValidationError(BillingError):
+    """Exceção para erros de validação de pagamento."""
+    pass
+
+
+@dataclass
+class BillingResult:
+    """Resultado de uma operação de faturamento."""
+    success: bool
+    action: BillingAction
+    resource_id: str  # invoice_id, payment_intent_id, etc.
+    resource_type: str
+    timestamp: datetime
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    errors: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "action": self.action.value,
+            "resource_id": self.resource_id,
+            "resource_type": self.resource_type,
+            "timestamp": self.timestamp.isoformat(),
+            "metadata": self.metadata,
+            "errors": self.errors
+        }
+
+
+@dataclass
+class PaymentConfirmation:
+    """Dados de confirmação de pagamento."""
+    payment_intent_id: str
+    provider: str
+    provider_event_id: str
+    confirmed_amount: Decimal
+    confirmed_currency: str
+    provider_fee: Optional[Decimal] = None
+    net_amount: Optional[Decimal] = None
+    confirmed_at: datetime = field(default_factory=datetime.utcnow)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class BillingEngine:
+    """
+    Engine de faturamento responsável por todas as operações financeiras.
+    Stateless, idempotente, com auditoria completa.
+    """
+    
+    def __init__(self):
+        # Configuração de comissões por provider (em produção viria de banco/config)
+        self._provider_fees = {
+            "stripe": Decimal("0.029") + Decimal("0.30"),  # 2.9% + R$0.30
+            "mercado_pago": Decimal("0.0349"),  # 3.49%
+            "pix_static_provider": Decimal("0.019"),  # 1.9%
+            "pix_dynamic_provider": Decimal("0.0149"),  # 1.49%
+            "sepa_provider": Decimal("0.009"),  # 0.9%
+            "mbway_provider": Decimal("0.015"),  # 1.5%
+            "cash_app_provider": Decimal("0.025"),  # 2.5%
+            "paypal": Decimal("0.0349") + Decimal("0.30"),  # 3.49% + $0.30
+            "p2p_us": Decimal("0.01"),  # 1%
+            "wallet_global": Decimal("0.025"),  # 2.5%
+        }
+        
+        # Configuração de limites e regras
+        self._config = {
+            "max_refund_period_days": 90,
+            "chargeback_fee": Decimal("15.00"),  # Taxa fixa por chargeback
+            "min_invoice_amount": Decimal("0.50"),
+            "currency_precision": {
+                "BRL": 2,
+                "USD": 2,
+                "EUR": 2,
+                "GBP": 2,
+            }
+        }
+    
+    @with_idempotency(key_fields=["payment_intent_id", "action"])
+    async def process_payment_confirmation(
+        self,
+        payment_intent_id: str,
+        provider: str,
+        provider_event_id: str,
+        amount: float,
+        currency: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> BillingResult:
+        """
+        Processa confirmação de pagamento via webhook.
+        
+        Args:
+            payment_intent_id: ID do PaymentIntent
+            provider: Provider que confirmou o pagamento
+            provider_event_id: ID do evento no provider
+            amount: Valor confirmado
+            currency: Moeda
+            metadata: Metadados adicionais
+            
+        Returns:
+            BillingResult com resultado do processamento
+        """
+        start_time = datetime.utcnow()
+        metadata = metadata or {}
+        
+        try:
+            # 1. Buscar PaymentIntent
+            payment_intent = await PaymentIntent.get_by_id(payment_intent_id)
+            if not payment_intent:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.CONFIRM_PAYMENT,
+                    resource_id=payment_intent_id,
+                    resource_type="payment_intent",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"PaymentIntent não encontrado: {payment_intent_id}"]
+                )
+            
+            # 2. Validar pagamento
+            validation_result = await self._validate_payment_confirmation(
+                payment_intent=payment_intent,
+                provider=provider,
+                amount=amount,
+                currency=currency
+            )
+            
+            if not validation_result["is_valid"]:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.CONFIRM_PAYMENT,
+                    resource_id=payment_intent_id,
+                    resource_type="payment_intent",
+                    timestamp=datetime.utcnow(),
+                    errors=validation_result["errors"],
+                    metadata=validation_result["metadata"]
+                )
+            
+            # 3. Criar confirmação de pagamento
+            confirmation = PaymentConfirmation(
+                payment_intent_id=payment_intent_id,
+                provider=provider,
+                provider_event_id=provider_event_id,
+                confirmed_amount=Decimal(str(amount)),
+                confirmed_currency=currency,
+                confirmed_at=datetime.utcnow(),
+                metadata=metadata
+            )
+            
+            # 4. Calcular taxas e valores líquidos
+            confirmation = await self._calculate_payment_fees(confirmation)
+            
+            # 5. Criar invoice (se não existir)
+            invoice = await self._create_or_get_invoice(
+                payment_intent=payment_intent,
+                confirmation=confirmation
+            )
+            
+            # 6. Atualizar status do PaymentIntent para PAID
+            await payment_intent.update_status(
+                new_status=PaymentIntentState.PAID.value,
+                metadata={
+                    "confirmed_at": confirmation.confirmed_at.isoformat(),
+                    "provider": provider,
+                    "provider_event_id": provider_event_id,
+                    "confirmed_amount": float(confirmation.confirmed_amount),
+                    "confirmed_currency": confirmation.confirmed_currency,
+                    "provider_fee": float(confirmation.provider_fee) if confirmation.provider_fee else None,
+                    "net_amount": float(confirmation.net_amount) if confirmation.net_amount else None,
+                    "invoice_id": invoice.id,
+                    **metadata
+                }
+            )
+            
+            # 7. Atualizar invoice para PAID
+            await invoice.update_status(
+                new_status=InvoiceStatus.PAID.value,
+                metadata={
+                    "payment_confirmed_at": confirmation.confirmed_at.isoformat(),
+                    "provider": provider,
+                    "provider_event_id": provider_event_id,
+                    "provider_fee": float(confirmation.provider_fee) if confirmation.provider_fee else None,
+                    "net_amount": float(confirmation.net_amount) if confirmation.net_amount else None,
+                    **metadata
+                }
+            )
+            
+            # 8. Se for assinatura, criar/atualizar subscription
+            if payment_intent.offer_id:
+                await self._handle_subscription_creation(
+                    payment_intent=payment_intent,
+                    invoice=invoice,
+                    confirmation=confirmation
+                )
+            
+            # 9. Registrar auditoria
+            await self._audit_payment_confirmation(
+                payment_intent=payment_intent,
+                invoice=invoice,
+                confirmation=confirmation,
+                start_time=start_time
+            )
+            
+            # 10. Enfileirar tarefa para emitir evento de entitlement
+            await enqueue_billing_task(
+                task_type="emit_payment_confirmed_event",
+                payment_intent_id=payment_intent.id,
+                invoice_id=invoice.id,
+                user_id=payment_intent.user_id,
+                bot_id=payment_intent.bot_id
+            )
+            
+            logger.info(
+                f"Payment confirmed - Intent: {payment_intent_id}, "
+                f"Invoice: {invoice.id}, Amount: {amount} {currency}"
+            )
+            
+            return BillingResult(
+                success=True,
+                action=BillingAction.CONFIRM_PAYMENT,
+                resource_id=payment_intent_id,
+                resource_type="payment_intent",
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "invoice_id": invoice.id,
+                    "confirmed_amount": float(confirmation.confirmed_amount),
+                    "confirmed_currency": confirmation.confirmed_currency,
+                    "provider_fee": float(confirmation.provider_fee) if confirmation.provider_fee else None,
+                    "net_amount": float(confirmation.net_amount) if confirmation.net_amount else None,
+                    "processing_time": (datetime.utcnow() - start_time).total_seconds()
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing payment confirmation for {payment_intent_id}: {e}",
+                exc_info=True
+            )
+            
+            # Registrar erro de processamento
+            await self._log_billing_error(
+                action=BillingAction.CONFIRM_PAYMENT.value,
+                resource_id=payment_intent_id,
+                error=str(e),
+                metadata=metadata
+            )
+            
+            return BillingResult(
+                success=False,
+                action=BillingAction.CONFIRM_PAYMENT,
+                resource_id=payment_intent_id,
+                resource_type="payment_intent",
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def _validate_payment_confirmation(
+        self,
+        payment_intent: PaymentIntent,
+        provider: str,
+        amount: float,
+        currency: str
+    ) -> Dict[str, Any]:
+        """
+        Valida confirmação de pagamento.
+        """
+        errors = []
+        metadata = {}
+        
+        # 1. Verificar status atual
+        if payment_intent.status == PaymentIntentState.PAID.value:
+            errors.append("PaymentIntent já está pago")
+            metadata["current_status"] = payment_intent.status
+        
+        elif payment_intent.status == PaymentIntentState.CANCELLED.value:
+            errors.append("PaymentIntent foi cancelado")
+            metadata["current_status"] = payment_intent.status
+        
+        elif payment_intent.status == PaymentIntentState.EXPIRED.value:
+            errors.append("PaymentIntent expirou")
+            metadata["current_status"] = payment_intent.status
+        
+        # 2. Verificar valor
+        amount_decimal = Decimal(str(amount))
+        expected_amount = Decimal(str(payment_intent.amount))
+        
+        # Permitir pequena diferença por arredondamento
+        tolerance = Decimal("0.01")  # 1 centavo
+        amount_difference = abs(amount_decimal - expected_amount)
+        
+        if amount_difference > tolerance:
+            errors.append(
+                f"Valor discrepante: recebido {amount} {currency}, "
+                f"esperado {payment_intent.amount} {payment_intent.currency}"
+            )
+            metadata["amount_difference"] = float(amount_difference)
+            metadata["received_amount"] = amount
+            metadata["expected_amount"] = float(payment_intent.amount)
+        
+        # 3. Verificar moeda
+        if currency.upper() != payment_intent.currency.upper():
+            errors.append(
+                f"Moeda discrepante: recebido {currency}, "
+                f"esperado {payment_intent.currency}"
+            )
+            metadata["received_currency"] = currency
+            metadata["expected_currency"] = payment_intent.currency
+        
+        # 4. Verificar se o PaymentIntent não expirou
+        if payment_intent.expires_at and payment_intent.expires_at < datetime.utcnow():
+            errors.append("PaymentIntent expirado")
+            metadata["expires_at"] = payment_intent.expires_at.isoformat()
+        
+        return {
+            "is_valid": len(errors) == 0,
+            "errors": errors,
+            "metadata": metadata
+        }
+    
+    async def _calculate_payment_fees(
+        self,
+        confirmation: PaymentConfirmation
+    ) -> PaymentConfirmation:
+        """
+        Calcula taxas do provider e valor líquido.
+        """
+        try:
+            # Obter taxa do provider
+            fee_percentage = self._provider_fees.get(confirmation.provider, Decimal("0.03"))  # 3% default
+            
+            # Calcular taxa
+            if "." in str(fee_percentage):
+                # Porcentagem (ex: 0.029 para 2.9%)
+                provider_fee = confirmation.confirmed_amount * fee_percentage
+            else:
+                # Taxa fixa
+                provider_fee = fee_percentage
+            
+            # Arredondar para precisão da moeda
+            precision = self._config["currency_precision"].get(
+                confirmation.confirmed_currency, 2
+            )
+            
+            provider_fee = provider_fee.quantize(Decimal(f"1.{'0' * precision}"))
+            
+            # Calcular valor líquido
+            net_amount = confirmation.confirmed_amount - provider_fee
+            
+            # Garantir que o valor líquido não seja negativo
+            if net_amount < Decimal("0"):
+                net_amount = Decimal("0")
+                logger.warning(
+                    f"Net amount would be negative for payment {confirmation.payment_intent_id}. "
+                    f"Setting to 0."
+                )
+            
+            confirmation.provider_fee = provider_fee
+            confirmation.net_amount = net_amount
+            
+        except Exception as e:
+            logger.error(f"Error calculating payment fees: {e}")
+            # Continuar sem taxas calculadas
+        
+        return confirmation
+    
+    async def _create_or_get_invoice(
+        self,
+        payment_intent: PaymentIntent,
+        confirmation: PaymentConfirmation
+    ) -> Invoice:
+        """
+        Cria ou recupera invoice para o PaymentIntent.
+        """
+        # Verificar se já existe invoice para este PaymentIntent
+        existing_invoice = await Invoice.get_by_payment_intent(payment_intent.id)
+        
+        if existing_invoice:
+            return existing_invoice
+        
+        # Buscar dados do usuário
+        user = await User.get_by_id(payment_intent.user_id)
+        if not user:
+            raise BillingError(f"Usuário não encontrado: {payment_intent.user_id}")
+        
+        # Buscar dados da oferta (se aplicável)
+        offer = None
+        if payment_intent.offer_id:
+            offer = await Offer.get_by_id(payment_intent.offer_id)
+        
+        # Criar nova invoice
+        invoice_data = {
+            "user_id": payment_intent.user_id,
+            "bot_id": payment_intent.bot_id,
+            "payment_intent_id": payment_intent.id,
+            "offer_id": payment_intent.offer_id,
+            "amount": float(confirmation.confirmed_amount),
+            "currency": confirmation.confirmed_currency,
+            "status": InvoiceStatus.PAID.value,  # Será pago após confirmação
+            "invoice_type": InvoiceType.ONE_TIME.value,
+            "provider": confirmation.provider,
+            "provider_event_id": confirmation.provider_event_id,
+            "provider_fee": float(confirmation.provider_fee) if confirmation.provider_fee else None,
+            "net_amount": float(confirmation.net_amount) if confirmation.net_amount else None,
+            "metadata": {
+                "user_email": user.email,
+                "user_name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
+                "user_username": user.username,
+                "offer_name": offer.name if offer else None,
+                "offer_description": offer.description if offer else None,
+                "payment_method": payment_intent.payment_method,
+                "region": payment_intent.region,
+                "fingerprint": payment_intent.fingerprint,
+                **confirmation.metadata
+            }
+        }
+        
+        # Se for assinatura, ajustar tipo
+        if offer and offer.is_recurring:
+            invoice_data["invoice_type"] = InvoiceType.SUBSCRIPTION.value
+            invoice_data["subscription_period"] = offer.billing_interval
+            invoice_data["subscription_interval"] = offer.billing_interval_count or 1
+        
+        invoice = await Invoice.create(**invoice_data)
+        
+        logger.info(f"Created invoice {invoice.id} for payment intent {payment_intent.id}")
+        
+        return invoice
+    
+    async def _handle_subscription_creation(
+        self,
+        payment_intent: PaymentIntent,
+        invoice: Invoice,
+        confirmation: PaymentConfirmation
+    ) -> None:
+        """
+        Cria ou atualiza subscription baseada no pagamento.
+        """
+        if not payment_intent.offer_id:
+            return
+        
+        offer = await Offer.get_by_id(payment_intent.offer_id)
+        if not offer or not offer.is_recurring:
+            return
+        
+        # Verificar se já existe subscription ativa
+        existing_subscription = await Subscription.get_active_subscription(
+            user_id=payment_intent.user_id,
+            bot_id=payment_intent.bot_id,
+            offer_id=payment_intent.offer_id
+        )
+        
+        if existing_subscription:
+            # Renovar subscription existente
+            await existing_subscription.renew(
+                renewal_invoice_id=invoice.id,
+                renewed_at=confirmation.confirmed_at
+            )
+            
+            logger.info(
+                f"Renewed subscription {existing_subscription.id} "
+                f"for user {payment_intent.user_id}"
+            )
+            
+        else:
+            # Criar nova subscription
+            subscription = await Subscription.create(
+                user_id=payment_intent.user_id,
+                bot_id=payment_intent.bot_id,
+                offer_id=payment_intent.offer_id,
+                status=SubscriptionState.ACTIVE.value,
+                current_period_start=confirmation.confirmed_at,
+                current_period_end=confirmation.confirmed_at + timedelta(days=30),  # Exemplo: 30 dias
+                cancel_at_period_end=False,
+                invoice_ids=[invoice.id],
+                metadata={
+                    "created_via": "payment",
+                    "payment_intent_id": payment_intent.id,
+                    "initial_invoice_id": invoice.id,
+                    "provider": confirmation.provider,
+                    "region": payment_intent.region
+                }
+            )
+            
+            logger.info(
+                f"Created subscription {subscription.id} "
+                f"for user {payment_intent.user_id}, offer {payment_intent.offer_id}"
+            )
+    
+    async def _audit_payment_confirmation(
+        self,
+        payment_intent: PaymentIntent,
+        invoice: Invoice,
+        confirmation: PaymentConfirmation,
+        start_time: datetime
+    ) -> None:
+        """Registra auditoria da confirmação de pagamento."""
+        try:
+            processing_time = (datetime.utcnow() - start_time).total_seconds()
+            
+            await audit_logger.log_async(
+                resource_type="payment",
+                resource_id=payment_intent.id,
+                action="confirmed",
+                actor="billing_engine",
+                description=f"Pagamento confirmado via {confirmation.provider}",
+                metadata={
+                    "invoice_id": invoice.id,
+                    "provider": confirmation.provider,
+                    "provider_event_id": confirmation.provider_event_id,
+                    "amount": float(confirmation.confirmed_amount),
+                    "currency": confirmation.confirmed_currency,
+                    "provider_fee": float(confirmation.provider_fee) if confirmation.provider_fee else None,
+                    "net_amount": float(confirmation.net_amount) if confirmation.net_amount else None,
+                    "processing_time": processing_time,
+                    "user_id": payment_intent.user_id,
+                    "bot_id": payment_intent.bot_id,
+                    "offer_id": payment_intent.offer_id
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error auditing payment confirmation: {e}")
+    
+    @with_idempotency(key_fields=["payment_intent_id", "action"])
+    async def process_refund(
+        self,
+        payment_intent_id: str,
+        provider: str,
+        provider_event_id: str,
+        amount: Optional[float] = None,
+        reason: str = "customer_request",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> BillingResult:
+        """
+        Processa reembolso de um pagamento.
+        
+        Args:
+            payment_intent_id: ID do PaymentIntent
+            provider: Provider que processou o reembolso
+            provider_event_id: ID do evento no provider
+            amount: Valor a reembolsar (None = reembolso total)
+            reason: Motivo do reembolso
+            metadata: Metadados adicionais
+            
+        Returns:
+            BillingResult com resultado do processamento
+        """
+        metadata = metadata or {}
+        
+        try:
+            # 1. Buscar PaymentIntent
+            payment_intent = await PaymentIntent.get_by_id(payment_intent_id)
+            if not payment_intent:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.PROCESS_REFUND,
+                    resource_id=payment_intent_id,
+                    resource_type="payment_intent",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"PaymentIntent não encontrado: {payment_intent_id}"]
+                )
+            
+            # 2. Validar se pode reembolsar
+            validation_result = await self._validate_refund(
+                payment_intent=payment_intent,
+                amount=amount
+            )
+            
+            if not validation_result["is_valid"]:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.PROCESS_REFUND,
+                    resource_id=payment_intent_id,
+                    resource_type="payment_intent",
+                    timestamp=datetime.utcnow(),
+                    errors=validation_result["errors"],
+                    metadata=validation_result["metadata"]
+                )
+            
+            # 3. Buscar invoice
+            invoice = await Invoice.get_by_payment_intent(payment_intent_id)
+            if not invoice:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.PROCESS_REFUND,
+                    resource_id=payment_intent_id,
+                    resource_type="payment_intent",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Invoice não encontrada para PaymentIntent: {payment_intent_id}"]
+                )
+            
+            # 4. Calcular valor do reembolso
+            refund_amount_decimal = Decimal(str(amount)) if amount is not None else invoice.amount_decimal
+            
+            # 5. Criar invoice de reembolso
+            refund_invoice = await Invoice.create_refund_invoice(
+                original_invoice=invoice,
+                refund_amount=float(refund_amount_decimal),
+                provider=provider,
+                provider_event_id=provider_event_id,
+                reason=reason,
+                metadata=metadata
+            )
+            
+            # 6. Atualizar invoice original
+            await invoice.add_refund(
+                refund_invoice_id=refund_invoice.id,
+                refund_amount=float(refund_amount_decimal),
+                refund_reason=reason
+            )
+            
+            # 7. Se for assinatura, cancelar/ajustar
+            if payment_intent.offer_id:
+                await self._handle_subscription_refund(
+                    payment_intent=payment_intent,
+                    invoice=invoice,
+                    refund_amount=float(refund_amount_decimal),
+                    reason=reason
+                )
+            
+            # 8. Registrar auditoria
+            await audit_logger.log_async(
+                resource_type="payment",
+                resource_id=payment_intent_id,
+                action="refunded",
+                actor="billing_engine",
+                description=f"Reembolso processado: {reason}",
+                metadata={
+                    "original_invoice_id": invoice.id,
+                    "refund_invoice_id": refund_invoice.id,
+                    "refund_amount": float(refund_amount_decimal),
+                    "refund_currency": invoice.currency,
+                    "provider": provider,
+                    "provider_event_id": provider_event_id,
+                    "reason": reason,
+                    **metadata
+                }
+            )
+            
+            # 9. Enfileirar tarefa para emitir evento de entitlement (revogação)
+            if refund_amount_decimal == invoice.amount_decimal:  # Reembolso total
+                await enqueue_billing_task(
+                    task_type="emit_refund_event",
+                    payment_intent_id=payment_intent.id,
+                    invoice_id=invoice.id,
+                    refund_invoice_id=refund_invoice.id,
+                    user_id=payment_intent.user_id,
+                    bot_id=payment_intent.bot_id,
+                    is_full_refund=True
+                )
+            
+            logger.info(
+                f"Refund processed - PaymentIntent: {payment_intent_id}, "
+                f"Amount: {refund_amount_decimal} {invoice.currency}"
+            )
+            
+            return BillingResult(
+                success=True,
+                action=BillingAction.PROCESS_REFUND,
+                resource_id=payment_intent_id,
+                resource_type="payment_intent",
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "original_invoice_id": invoice.id,
+                    "refund_invoice_id": refund_invoice.id,
+                    "refund_amount": float(refund_amount_decimal),
+                    "refund_currency": invoice.currency,
+                    "reason": reason,
+                    "is_full_refund": refund_amount_decimal == invoice.amount_decimal
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing refund for {payment_intent_id}: {e}",
+                exc_info=True
+            )
+            
+            await self._log_billing_error(
+                action=BillingAction.PROCESS_REFUND.value,
+                resource_id=payment_intent_id,
+                error=str(e),
+                metadata=metadata
+            )
+            
+            return BillingResult(
+                success=False,
+                action=BillingAction.PROCESS_REFUND,
+                resource_id=payment_intent_id,
+                resource_type="payment_intent",
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def _validate_refund(
+        self,
+        payment_intent: PaymentIntent,
+        amount: Optional[float]
+    ) -> Dict[str, Any]:
+        """Valida se um reembolso pode ser processado."""
+        errors = []
+        metadata = {}
+        
+        # 1. Verificar se o pagamento está pago
+        if payment_intent.status != PaymentIntentState.PAID.value:
+            errors.append(f"Pagamento não está pago (status: {payment_intent.status})")
+            metadata["current_status"] = payment_intent.status
+        
+        # 2. Verificar idade do pagamento
+        invoice = await Invoice.get_by_payment_intent(payment_intent.id)
+        if invoice:
+            payment_age = (datetime.utcnow() - invoice.created_at).days
+            max_refund_days = self._config["max_refund_period_days"]
+            
+            if payment_age > max_refund_days:
+                errors.append(
+                    f"Pagamento muito antigo para reembolso "
+                    f"({payment_age} dias > {max_refund_days} dias)"
+                )
+                metadata["payment_age_days"] = payment_age
+                metadata["max_refund_days"] = max_refund_days
+        
+        # 3. Verificar se já foi reembolsado
+        if invoice and invoice.total_refunded > 0:
+            remaining_amount = invoice.amount_decimal - invoice.total_refunded_decimal
+            
+            if amount is None:
+                # Reembolso total solicitado
+                if remaining_amount <= Decimal("0"):
+                    errors.append("Pagamento já totalmente reembolsado")
+                metadata["remaining_amount"] = float(remaining_amount)
+            
+            else:
+                amount_decimal = Decimal(str(amount))
+                if amount_decimal > remaining_amount:
+                    errors.append(
+                        f"Valor de reembolso excede valor restante "
+                        f"({amount_decimal} > {remaining_amount})"
+                    )
+                metadata["requested_amount"] = float(amount_decimal)
+                metadata["remaining_amount"] = float(remaining_amount)
+        
+        return {
+            "is_valid": len(errors) == 0,
+            "errors": errors,
+            "metadata": metadata
+        }
+    
+    async def _handle_subscription_refund(
+        self,
+        payment_intent: PaymentIntent,
+        invoice: Invoice,
+        refund_amount: float,
+        reason: str
+    ) -> None:
+        """Lida com reembolso de assinatura."""
+        # Buscar subscription ativa
+        subscription = await Subscription.get_active_subscription(
+            user_id=payment_intent.user_id,
+            bot_id=payment_intent.bot_id,
+            offer_id=payment_intent.offer_id
+        )
+        
+        if not subscription:
+            return
+        
+        # Se for reembolso total, cancelar assinatura
+        if abs(Decimal(str(refund_amount)) - invoice.amount_decimal) < Decimal("0.01"):
+            await subscription.cancel(
+                cancelled_at=datetime.utcnow(),
+                cancel_reason=f"refund_{reason}",
+                refund_invoice_id=invoice.id
+            )
+            
+            logger.info(
+                f"Cancelled subscription {subscription.id} due to full refund"
+            )
+    
+    @with_idempotency(key_fields=["payment_intent_id", "action"])
+    async def process_chargeback(
+        self,
+        payment_intent_id: str,
+        provider: str,
+        provider_event_id: str,
+        amount: Optional[float] = None,
+        reason: str = "dispute",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> BillingResult:
+        """
+        Processa chargeback (contestações).
+        
+        Args:
+            payment_intent_id: ID do PaymentIntent
+            provider: Provider que processou o chargeback
+            provider_event_id: ID do evento no provider
+            amount: Valor do chargeback (None = valor total)
+            reason: Motivo do chargeback
+            metadata: Metadados adicionais
+            
+        Returns:
+            BillingResult com resultado do processamento
+        """
+        metadata = metadata or {}
+        
+        try:
+            # 1. Buscar PaymentIntent e invoice
+            payment_intent = await PaymentIntent.get_by_id(payment_intent_id)
+            if not payment_intent:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.PROCESS_CHARGEBACK,
+                    resource_id=payment_intent_id,
+                    resource_type="payment_intent",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"PaymentIntent não encontrado: {payment_intent_id}"]
+                )
+            
+            invoice = await Invoice.get_by_payment_intent(payment_intent_id)
+            if not invoice:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.PROCESS_CHARGEBACK,
+                    resource_id=payment_intent_id,
+                    resource_type="payment_intent",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Invoice não encontrada para PaymentIntent: {payment_intent_id}"]
+                )
+            
+            # 2. Calcular valor do chargeback
+            chargeback_amount_decimal = Decimal(str(amount)) if amount is not None else invoice.amount_decimal
+            
+            # 3. Adicionar taxa de chargeback
+            chargeback_fee = self._config["chargeback_fee"]
+            total_chargeback = chargeback_amount_decimal + chargeback_fee
+            
+            # 4. Criar invoice de chargeback
+            chargeback_invoice = await Invoice.create_chargeback_invoice(
+                original_invoice=invoice,
+                chargeback_amount=float(chargeback_amount_decimal),
+                chargeback_fee=float(chargeback_fee),
+                provider=provider,
+                provider_event_id=provider_event_id,
+                reason=reason,
+                metadata=metadata
+            )
+            
+            # 5. Atualizar invoice original
+            await invoice.add_chargeback(
+                chargeback_invoice_id=chargeback_invoice.id,
+                chargeback_amount=float(chargeback_amount_decimal),
+                chargeback_fee=float(chargeback_fee),
+                chargeback_reason=reason
+            )
+            
+            # 6. Se for assinatura, cancelar imediatamente
+            if payment_intent.offer_id:
+                await self._handle_subscription_chargeback(
+                    payment_intent=payment_intent,
+                    invoice=invoice,
+                    chargeback_amount=float(chargeback_amount_decimal)
+                )
+            
+            # 7. Registrar auditoria
+            await audit_logger.log_async(
+                resource_type="payment",
+                resource_id=payment_intent_id,
+                action="chargeback",
+                actor="billing_engine",
+                description=f"Chargeback processado: {reason}",
+                metadata={
+                    "original_invoice_id": invoice.id,
+                    "chargeback_invoice_id": chargeback_invoice.id,
+                    "chargeback_amount": float(chargeback_amount_decimal),
+                    "chargeback_fee": float(chargeback_fee),
+                    "total_chargeback": float(total_chargeback),
+                    "chargeback_currency": invoice.currency,
+                    "provider": provider,
+                    "provider_event_id": provider_event_id,
+                    "reason": reason,
+                    **metadata
+                }
+            )
+            
+            # 8. Enfileirar tarefa para emitir evento de entitlement (revogação imediata)
+            await enqueue_billing_task(
+                task_type="emit_chargeback_event",
+                payment_intent_id=payment_intent.id,
+                invoice_id=invoice.id,
+                chargeback_invoice_id=chargeback_invoice.id,
+                user_id=payment_intent.user_id,
+                bot_id=payment_intent.bot_id
+            )
+            
+            logger.info(
+                f"Chargeback processed - PaymentIntent: {payment_intent_id}, "
+                f"Amount: {chargeback_amount_decimal} {invoice.currency}, "
+                f"Fee: {chargeback_fee} {invoice.currency}"
+            )
+            
+            return BillingResult(
+                success=True,
+                action=BillingAction.PROCESS_CHARGEBACK,
+                resource_id=payment_intent_id,
+                resource_type="payment_intent",
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "original_invoice_id": invoice.id,
+                    "chargeback_invoice_id": chargeback_invoice.id,
+                    "chargeback_amount": float(chargeback_amount_decimal),
+                    "chargeback_fee": float(chargeback_fee),
+                    "total_chargeback": float(total_chargeback),
+                    "chargeback_currency": invoice.currency,
+                    "reason": reason
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing chargeback for {payment_intent_id}: {e}",
+                exc_info=True
+            )
+            
+            await self._log_billing_error(
+                action=BillingAction.PROCESS_CHARGEBACK.value,
+                resource_id=payment_intent_id,
+                error=str(e),
+                metadata=metadata
+            )
+            
+            return BillingResult(
+                success=False,
+                action=BillingAction.PROCESS_CHARGEBACK,
+                resource_id=payment_intent_id,
+                resource_type="payment_intent",
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def _handle_subscription_chargeback(
+        self,
+        payment_intent: PaymentIntent,
+        invoice: Invoice,
+        chargeback_amount: float
+    ) -> None:
+        """Lida com chargeback de assinatura (cancelamento imediato)."""
+        subscription = await Subscription.get_active_subscription(
+            user_id=payment_intent.user_id,
+            bot_id=payment_intent.bot_id,
+            offer_id=payment_intent.offer_id
+        )
+        
+        if not subscription:
+            return
+        
+        # Cancelar imediatamente devido a chargeback
+        await subscription.cancel(
+            cancelled_at=datetime.utcnow(),
+            cancel_reason="chargeback",
+            immediate=True,
+            chargeback_invoice_id=invoice.id
+        )
+        
+        # Registrar flag de fraude
+        await audit_logger.log_async(
+            resource_type="user",
+            resource_id=str(payment_intent.user_id),
+            action="fraud_flag",
+            actor="system",
+            description="Usuário marcado por chargeback",
+            metadata={
+                "subscription_id": subscription.id,
+                "payment_intent_id": payment_intent.id,
+                "invoice_id": invoice.id,
+                "chargeback_amount": chargeback_amount
+            }
+        )
+        
+        logger.warning(
+            f"Subscription {subscription.id} cancelled due to chargeback, "
+            f"user {payment_intent.user_id} flagged for fraud"
+        )
+    
+    async def process_dispute(
+        self,
+        payment_intent_id: str,
+        provider: str,
+        provider_event_id: str,
+        dispute_type: str,  # "opened" ou "closed"
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> BillingResult:
+        """
+        Processa abertura/fechamento de disputas.
+        
+        Args:
+            payment_intent_id: ID do PaymentIntent
+            provider: Provider que processou a disputa
+            provider_event_id: ID do evento no provider
+            dispute_type: "opened" ou "closed"
+            metadata: Metadados adicionais
+            
+        Returns:
+            BillingResult com resultado do processamento
+        """
+        metadata = metadata or {}
+        
+        try:
+            payment_intent = await PaymentIntent.get_by_id(payment_intent_id)
+            if not payment_intent:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.PROCESS_DISPUTE,
+                    resource_id=payment_intent_id,
+                    resource_type="payment_intent",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"PaymentIntent não encontrado: {payment_intent_id}"]
+                )
+            
+            invoice = await Invoice.get_by_payment_intent(payment_intent_id)
+            
+            action = "dispute_opened" if dispute_type == "opened" else "dispute_closed"
+            
+            await audit_logger.log_async(
+                resource_type="payment",
+                resource_id=payment_intent_id,
+                action=action,
+                actor="billing_engine",
+                description=f"Disputa {dispute_type} via {provider}",
+                metadata={
+                    "payment_intent_id": payment_intent_id,
+                    "invoice_id": invoice.id if invoice else None,
+                    "provider": provider,
+                    "provider_event_id": provider_event_id,
+                    "dispute_type": dispute_type,
+                    **metadata
+                }
+            )
+            
+            # Se disputa aberta, suspender acessos temporariamente
+            if dispute_type == "opened" and invoice:
+                await enqueue_billing_task(
+                    task_type="suspend_access_for_dispute",
+                    payment_intent_id=payment_intent.id,
+                    invoice_id=invoice.id,
+                    user_id=payment_intent.user_id,
+                    bot_id=payment_intent.bot_id
+                )
+            
+            logger.info(
+                f"Dispute {dispute_type} processed - PaymentIntent: {payment_intent_id}"
+            )
+            
+            return BillingResult(
+                success=True,
+                action=BillingAction.PROCESS_DISPUTE,
+                resource_id=payment_intent_id,
+                resource_type="payment_intent",
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "dispute_type": dispute_type,
+                    "provider": provider,
+                    "provider_event_id": provider_event_id,
+                    "invoice_id": invoice.id if invoice else None
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing dispute for {payment_intent_id}: {e}",
+                exc_info=True
+            )
+            
+            return BillingResult(
+                success=False,
+                action=BillingAction.PROCESS_DISPUTE,
+                resource_id=payment_intent_id,
+                resource_type="payment_intent",
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def cancel_invoice(
+        self,
+        invoice_id: str,
+        reason: str,
+        cancelled_by: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> BillingResult:
+        """
+        Cancela uma invoice (manual ou por timeout).
+        
+        Args:
+            invoice_id: ID da invoice
+            reason: Motivo do cancelamento
+            cancelled_by: Quem cancelou (user_id ou 'system')
+            metadata: Metadados adicionais
+            
+        Returns:
+            BillingResult com resultado do processamento
+        """
+        metadata = metadata or {}
+        
+        try:
+            invoice = await Invoice.get_by_id(invoice_id)
+            if not invoice:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.CANCEL_INVOICE,
+                    resource_id=invoice_id,
+                    resource_type="invoice",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Invoice não encontrada: {invoice_id}"]
+                )
+            
+            # Validar se pode ser cancelada
+            if invoice.status not in [InvoiceStatus.PENDING.value, InvoiceStatus.OPEN.value]:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.CANCEL_INVOICE,
+                    resource_id=invoice_id,
+                    resource_type="invoice",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Invoice não pode ser cancelada (status: {invoice.status})"]
+                )
+            
+            # Atualizar status
+            await invoice.update_status(
+                new_status=InvoiceStatus.CANCELLED.value,
+                metadata={
+                    "cancelled_at": datetime.utcnow().isoformat(),
+                    "cancelled_by": cancelled_by,
+                    "cancellation_reason": reason,
+                    **metadata
+                }
+            )
+            
+            # Atualizar PaymentIntent associado
+            if invoice.payment_intent_id:
+                payment_intent = await PaymentIntent.get_by_id(invoice.payment_intent_id)
+                if payment_intent and payment_intent.status == PaymentIntentState.AWAITING_PAYMENT.value:
+                    await payment_intent.update_status(
+                        new_status=PaymentIntentState.CANCELLED.value,
+                        metadata={
+                            "cancelled_via": "invoice_cancellation",
+                            "cancelled_by": cancelled_by,
+                            "cancellation_reason": reason
+                        }
+                    )
+            
+            await audit_logger.log_async(
+                resource_type="invoice",
+                resource_id=invoice_id,
+                action="cancelled",
+                actor=cancelled_by,
+                description=f"Invoice cancelada: {reason}",
+                metadata={
+                    "reason": reason,
+                    "original_status": invoice.status,
+                    "payment_intent_id": invoice.payment_intent_id,
+                    **metadata
+                }
+            )
+            
+            logger.info(f"Invoice {invoice_id} cancelled by {cancelled_by}: {reason}")
+            
+            return BillingResult(
+                success=True,
+                action=BillingAction.CANCEL_INVOICE,
+                resource_id=invoice_id,
+                resource_type="invoice",
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "cancelled_by": cancelled_by,
+                    "reason": reason,
+                    "payment_intent_id": invoice.payment_intent_id
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error cancelling invoice {invoice_id}: {e}",
+                exc_info=True
+            )
+            
+            return BillingResult(
+                success=False,
+                action=BillingAction.CANCEL_INVOICE,
+                resource_id=invoice_id,
+                resource_type="invoice",
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def renew_subscription(
+        self,
+        subscription_id: str,
+        renewal_date: datetime,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> BillingResult:
+        """
+        Renova uma assinatura (chamado pelo SubscriptionEngine).
+        
+        Args:
+            subscription_id: ID da subscription
+            renewal_date: Data da renovação
+            metadata: Metadados adicionais
+            
+        Returns:
+            BillingResult com resultado do processamento
+        """
+        metadata = metadata or {}
+        
+        try:
+            subscription = await Subscription.get_by_id(subscription_id)
+            if not subscription:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.RENEW_SUBSCRIPTION,
+                    resource_id=subscription_id,
+                    resource_type="subscription",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Subscription não encontrada: {subscription_id}"]
+                )
+            
+            # Verificar se está ativa e não cancelada
+            if subscription.status != SubscriptionState.ACTIVE.value:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.RENEW_SUBSCRIPTION,
+                    resource_id=subscription_id,
+                    resource_type="subscription",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Subscription não está ativa (status: {subscription.status})"]
+                )
+            
+            if subscription.cancel_at_period_end:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.RENEW_SUBSCRIPTION,
+                    resource_id=subscription_id,
+                    resource_type="subscription",
+                    timestamp=datetime.utcnow(),
+                    errors=["Subscription marcada para cancelamento no fim do período"]
+                )
+            
+            # Buscar oferta atual
+            offer = await Offer.get_by_id(subscription.offer_id)
+            if not offer:
+                return BillingResult(
+                    success=False,
+                    action=BillingAction.RENEW_SUBSCRIPTION,
+                    resource_id=subscription_id,
+                    resource_type="subscription",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Offer não encontrada: {subscription.offer_id}"]
+                )
+            
+            # Criar invoice de renovação
+            renewal_invoice = await Invoice.create_subscription_renewal(
+                subscription=subscription,
+                offer=offer,
+                renewal_date=renewal_date,
+                metadata=metadata
+            )
+            
+            # Atualizar subscription
+            await subscription.add_renewal_invoice(
+                invoice_id=renewal_invoice.id,
+                renewed_at=renewal_date
+            )
+            
+            # Enfileirar cobrança (em produção, integraria com provider de pagamento recorrente)
+            await enqueue_billing_task(
+                task_type="process_subscription_renewal",
+                subscription_id=subscription.id,
+                invoice_id=renewal_invoice.id,
+                user_id=subscription.user_id,
+                bot_id=subscription.bot_id,
+                amount=float(offer.price),
+                currency=offer.currency
+            )
+            
+            await audit_logger.log_async(
+                resource_type="subscription",
+                resource_id=subscription_id,
+                action="renewed",
+                actor="billing_engine",
+                description=f"Assinatura renovada, invoice {renewal_invoice.id} criada",
+                metadata={
+                    "renewal_date": renewal_date.isoformat(),
+                    "renewal_invoice_id": renewal_invoice.id,
+                    "offer_price": float(offer.price),
+                    "offer_currency": offer.currency,
+                    **metadata
+                }
+            )
+            
+            logger.info(
+                f"Subscription {subscription_id} renewed, "
+                f"invoice {renewal_invoice.id} created"
+            )
+            
+            return BillingResult(
+                success=True,
+                action=BillingAction.RENEW_SUBSCRIPTION,
+                resource_id=subscription_id,
+                resource_type="subscription",
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "renewal_invoice_id": renewal_invoice.id,
+                    "renewal_date": renewal_date.isoformat(),
+                    "amount": float(offer.price),
+                    "currency": offer.currency
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error renewing subscription {subscription_id}: {e}",
+                exc_info=True
+            )
+            
+            return BillingResult(
+                success=False,
+                action=BillingAction.RENEW_SUBSCRIPTION,
+                resource_id=subscription_id,
+                resource_type="subscription",
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def get_invoice_summary(
+        self,
+        user_id: Optional[int] = None,
+        bot_id: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """
+        Retorna resumo financeiro.
+        
+        Args:
+            user_id: Filtrar por usuário (opcional)
+            bot_id: Filtrar por bot (opcional)
+            start_date: Data inicial (opcional)
+            end_date: Data final (opcional)
+            
+        Returns:
+            Dict com resumo financeiro
+        """
+        try:
+            # Em produção, isso usaria aggregation no banco
+            # Por enquanto, implementação simplificada
+            
+            filters = {}
+            if user_id:
+                filters["user_id"] = user_id
+            if bot_id:
+                filters["bot_id"] = bot_id
+            if start_date:
+                filters["created_at__gte"] = start_date
+            if end_date:
+                filters["created_at__lte"] = end_date
+            
+            invoices = await Invoice.filter(**filters)
+            
+            total_invoices = len(invoices)
+            total_revenue = Decimal("0")
+            total_refunds = Decimal("0")
+            total_chargebacks = Decimal("0")
+            total_fees = Decimal("0")
+            
+            status_counts = {}
+            currency_totals = {}
+            
+            for invoice in invoices:
+                # Revenue
+                if invoice.status == InvoiceStatus.PAID.value:
+                    total_revenue += invoice.amount_decimal
+                    total_fees += invoice.provider_fee_decimal or Decimal("0")
+                
+                # Refunds
+                total_refunds += invoice.total_refunded_decimal
+                
+                # Chargebacks
+                total_chargebacks += invoice.total_chargeback_decimal
+                
+                # Status counts
+                status_counts[invoice.status] = status_counts.get(invoice.status, 0) + 1
+                
+                # Currency totals
+                if invoice.status == InvoiceStatus.PAID.value:
+                    currency_totals[invoice.currency] = currency_totals.get(invoice.currency, Decimal("0")) + invoice.amount_decimal
+            
+            net_revenue = total_revenue - total_refunds - total_chargebacks - total_fees
+            
+            return {
+                "summary": {
+                    "total_invoices": total_invoices,
+                    "total_revenue": float(total_revenue),
+                    "total_refunds": float(total_refunds),
+                    "total_chargebacks": float(total_chargebacks),
+                    "total_fees": float(total_fees),
+                    "net_revenue": float(net_revenue),
+                },
+                "status_distribution": status_counts,
+                "currency_distribution": {
+                    currency: float(amount) for currency, amount in currency_totals.items()
+                },
+                "time_period": {
+                    "start_date": start_date.isoformat() if start_date else None,
+                    "end_date": end_date.isoformat() if end_date else None,
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting invoice summary: {e}")
+            return {}
+    
+    async def _log_billing_error(
+        self,
+        action: str,
+        resource_id: str,
+        error: str,
+        metadata: Dict[str, Any]
+    ) -> None:
+        """Registra erro de faturamento para auditoria."""
+        try:
+            await audit_logger.log_async(
+                resource_type="billing_error",
+                resource_id=f"{action}_{resource_id}_{int(datetime.utcnow().timestamp())}",
+                action="error",
+                actor="system",
+                description=f"Erro no billing: {action} - {error}",
+                metadata={
+                    "action": action,
+                    "resource_id": resource_id,
+                    "error": error,
+                    **metadata
+                },
+                severity="error"
+            )
+        except Exception as e:
+            logger.error(f"Error logging billing error: {e}")
+
+
+# Factory para criação do BillingEngine
+def create_billing_engine() -> BillingEngine:
+    """Cria uma instância configurada do BillingEngine."""
+    return BillingEngine()
+
+
+# Singleton para uso global (opcional)
+_billing_engine_instance: Optional[BillingEngine] = None
+
+def get_billing_engine() -> BillingEngine:
+    """Retorna instância singleton do BillingEngine."""
+    global _billing_engine_instance
+    if _billing_engine_instance is None:
+        _billing_engine_instance = create_billing_engine()
+    return _billing_engine_instance

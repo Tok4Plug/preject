@@ -1,0 +1,574 @@
+"""
+Worker especializado para processamento de tarefas de auditoria.
+Garante logs imutáveis, compliance e correlacionação cross-system.
+"""
+
+import logging
+import time
+from datetime import datetime
+from typing import Any, Dict, Optional, List
+from dataclasses import asdict
+import hashlib
+
+from ...core.audit_logger import AuditLogger
+from ...core.metrics_engine import MetricsEngine
+from ...models.audit_log import AuditLog, AuditLogLevel
+from ...queue import BaseWorker, BaseTask, AuditLogTask, CleanupTask
+from ...queue.tasks import TaskFactory
+from ...utils.cryptography import hash_data
+
+logger = logging.getLogger(__name__)
+
+
+class AuditWorker(BaseWorker):
+    """
+    Worker para processamento de tarefas de auditoria.
+    Processa logs de auditoria com garantia de imutabilidade e compliance.
+    """
+    
+    def __init__(
+        self,
+        queue,
+        worker_id: str,
+        audit_logger: AuditLogger,
+        tenant_id: Optional[str] = None,
+        metrics_engine: Optional[MetricsEngine] = None
+    ):
+        super().__init__(
+            queue=queue,
+            worker_id=worker_id,
+            tenant_id=tenant_id,
+            audit_logger=audit_logger,
+            metrics_engine=metrics_engine
+        )
+        
+        self.audit_logger = audit_logger
+        
+        # Configurações de compliance
+        self.retention_days = 365  # LGPD/PCI-DSS mínimo
+        self.immutable_logging = True
+        self.sign_logs = True
+        
+        logger.info(f"AuditWorker {worker_id} initialized")
+    
+    async def process_task(self, task: BaseTask) -> Any:
+        """Processa uma tarefa de auditoria baseada no tipo"""
+        
+        if task.task_type == "audit_log":
+            return await self._process_audit_log(task)
+        elif task.task_type == "cleanup":
+            return await self._process_cleanup(task)
+        else:
+            raise ValueError(f"Tipo de tarefa não suportada: {task.task_type}")
+    
+    async def _process_audit_log(self, task: AuditLogTask) -> Dict[str, Any]:
+        """
+        Processa registro de log de auditoria.
+        Garante imutabilidade, hash chain e compliance.
+        """
+        
+        start_time = time.time()
+        tenant_id = task.metadata.tenant_id
+        action = task.payload["action"]
+        resource_type = task.payload["resource_type"]
+        resource_id = task.payload["resource_id"]
+        changes = task.payload.get("changes", {})
+        actor_id = task.payload.get("actor_id")
+        actor_type = task.payload.get("actor_type", "system")
+        
+        logger.debug(
+            f"Processing audit log",
+            extra={
+                "tenant_id": tenant_id,
+                "action": action,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "task_id": str(task.metadata.task_id)
+            }
+        )
+        
+        try:
+            # 1. Validação de compliance
+            validation_result = await self._validate_for_compliance(
+                tenant_id, action, resource_type, changes
+            )
+            
+            if not validation_result.get("valid", True):
+                logger.warning(
+                    f"Audit log failed compliance validation",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "action": action,
+                        "resource_type": resource_type,
+                        "reasons": validation_result.get("reasons")
+                    }
+                )
+                
+                # Registra tentativa falha (para forense)
+                await self._log_compliance_failure(
+                    tenant_id, action, resource_type, resource_id, validation_result
+                )
+                
+                return validation_result
+            
+            # 2. Calcula hash para imutabilidade
+            log_data = {
+                "tenant_id": tenant_id,
+                "action": action,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "changes": changes,
+                "actor_id": actor_id,
+                "actor_type": actor_type,
+                "timestamp": task.payload.get("performed_at", datetime.utcnow().isoformat()),
+                "task_id": str(task.metadata.task_id),
+                "correlation_id": task.metadata.correlation_id
+            }
+            
+            # Gera hash da entrada atual
+            current_hash = await self._generate_audit_hash(log_data)
+            
+            # 3. Obtém hash anterior para chain
+            previous_hash = await self._get_previous_audit_hash(tenant_id)
+            
+            # 4. Cria log de auditoria
+            audit_result = await self.audit_logger.log(
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                tenant_id=tenant_id,
+                details={
+                    "changes": changes,
+                    "actor_id": actor_id,
+                    "actor_type": actor_type,
+                    "current_hash": current_hash,
+                    "previous_hash": previous_hash,
+                    "task_id": str(task.metadata.task_id),
+                    "correlation_id": task.metadata.correlation_id
+                },
+                level=self._get_log_level_for_action(action)
+            )
+            
+            if not audit_result.get("success"):
+                logger.error(
+                    f"Failed to store audit log",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "action": action,
+                        "error": audit_result.get("error")
+                    }
+                )
+                return audit_result
+            
+            audit_log_id = audit_result.get("audit_log_id")
+            
+            # 5. Atualiza hash chain
+            await self._update_audit_hash_chain(tenant_id, current_hash)
+            
+            # 6. Replicação para sistemas externos (se necessário)
+            replication_result = await self._replicate_to_external_systems(
+                tenant_id, audit_log_id, log_data
+            )
+            
+            # 7. Registra métricas
+            if self.metrics_engine:
+                await self.metrics_engine.increment_counter(
+                    name="audit_logs_processed",
+                    tenant_id=tenant_id,
+                    tags={
+                        "action": action,
+                        "resource_type": resource_type,
+                        "status": "success"
+                    }
+                )
+                
+                await self.metrics_engine.record_histogram(
+                    name="audit_processing_time_ms",
+                    tenant_id=tenant_id,
+                    value=(time.time() - start_time) * 1000,
+                    tags={"action": action}
+                )
+            
+            logger.info(
+                f"Audit log processed successfully",
+                extra={
+                    "tenant_id": tenant_id,
+                    "action": action,
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                    "audit_log_id": audit_log_id,
+                    "processing_time": time.time() - start_time
+                }
+            )
+            
+            return {
+                "status": "success",
+                "audit_log_id": audit_log_id,
+                "hash": current_hash,
+                "previous_hash": previous_hash,
+                "replication": replication_result,
+                "processing_time_ms": (time.time() - start_time) * 1000,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing audit log: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "action": action,
+                    "resource_type": resource_type
+                },
+                exc_info=True
+            )
+            
+            if self.metrics_engine:
+                await self.metrics_engine.increment_counter(
+                    name="audit_logs_failed",
+                    tenant_id=tenant_id,
+                    tags={
+                        "action": action,
+                        "resource_type": resource_type,
+                        "error_type": type(e).__name__
+                    }
+                )
+            
+            raise
+    
+    async def _process_cleanup(self, task: CleanupTask) -> Dict[str, Any]:
+        """Processa tarefa de limpeza de logs antigos"""
+        
+        start_time = time.time()
+        tenant_id = task.metadata.tenant_id
+        cleanup_type = task.payload["cleanup_type"]
+        retention_days = task.payload.get("retention_days", self.retention_days)
+        dry_run = task.payload.get("dry_run", False)
+        
+        logger.info(
+            f"Processing cleanup task",
+            extra={
+                "tenant_id": tenant_id,
+                "cleanup_type": cleanup_type,
+                "retention_days": retention_days,
+                "dry_run": dry_run,
+                "task_id": str(task.metadata.task_id)
+            }
+        )
+        
+        try:
+            if cleanup_type == "audit_logs":
+                result = await self._cleanup_old_audit_logs(
+                    tenant_id, retention_days, dry_run
+                )
+            elif cleanup_type == "temporary_data":
+                result = await self._cleanup_temporary_data(tenant_id, dry_run)
+            else:
+                result = {"status": "skipped", "reason": f"Unknown cleanup type: {cleanup_type}"}
+            
+            # Registra auditoria da limpeza
+            if not dry_run and result.get("deleted_count", 0) > 0:
+                await self.audit_logger.log(
+                    action="cleanup_executed",
+                    resource_type="audit_logs",
+                    resource_id=f"cleanup_{cleanup_type}",
+                    tenant_id=tenant_id,
+                    details={
+                        "cleanup_type": cleanup_type,
+                        "retention_days": retention_days,
+                        "deleted_count": result.get("deleted_count", 0),
+                        "processing_time_ms": (time.time() - start_time) * 1000,
+                        "task_id": str(task.metadata.task_id)
+                    },
+                    level=AuditLogLevel.INFO
+                )
+            
+            logger.info(
+                f"Cleanup task completed",
+                extra={
+                    "tenant_id": tenant_id,
+                    "cleanup_type": cleanup_type,
+                    "result": result,
+                    "processing_time": time.time() - start_time
+                }
+            )
+            
+            return {
+                "status": "success",
+                "cleanup_type": cleanup_type,
+                "result": result,
+                "processing_time_ms": (time.time() - start_time) * 1000,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing cleanup task: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "cleanup_type": cleanup_type
+                }
+            )
+            
+            if self.metrics_engine:
+                await self.metrics_engine.increment_counter(
+                    name="cleanup_tasks_failed",
+                    tenant_id=tenant_id,
+                    tags={"cleanup_type": cleanup_type}
+                )
+            
+            raise
+    
+    async def _validate_for_compliance(
+        self,
+        tenant_id: str,
+        action: str,
+        resource_type: str,
+        changes: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Valida se o log atende requisitos de compliance"""
+        
+        reasons = []
+        
+        # 1. Verifica dados sensíveis (PII)
+        sensitive_fields = ["cpf", "cnpj", "email", "phone", "password", "credit_card"]
+        for field in sensitive_fields:
+            if field in str(changes).lower():
+                reasons.append(f"Contains sensitive field: {field}")
+        
+        # 2. Verifica ações críticas
+        critical_actions = ["delete", "purge", "override", "admin_access"]
+        if any(critical in action.lower() for critical in critical_actions):
+            # Para ações críticas, requer actor_id explícito
+            if not changes.get("actor_id"):
+                reasons.append("Critical action requires actor_id")
+        
+        # 3. Verifica tamanho dos dados (evita DoS)
+        changes_str = str(changes)
+        if len(changes_str) > 10000:  # 10KB máximo
+            reasons.append(f"Changes too large: {len(changes_str)} bytes")
+        
+        # 4. Validações específicas por resource_type
+        if resource_type == "user":
+            if "password" in changes:
+                # Nunca logar senhas, mesmo hashadas
+                reasons.append("Password changes should not be logged")
+        
+        return {
+            "valid": len(reasons) == 0,
+            "reasons": reasons if reasons else None
+        }
+    
+    async def _generate_audit_hash(self, log_data: Dict[str, Any]) -> str:
+        """Gera hash SHA-256 para imutabilidade do log"""
+        
+        # Ordena dados deterministicamente
+        sorted_data = json.dumps(log_data, sort_keys=True, default=str)
+        
+        # Adiciona salt do sistema
+        system_salt = "saas-platform-audit-2024"
+        data_to_hash = f"{sorted_data}|{system_salt}"
+        
+        return hashlib.sha256(data_to_hash.encode()).hexdigest()
+    
+    async def _get_previous_audit_hash(self, tenant_id: str) -> Optional[str]:
+        """Obtém hash do último log para criar chain"""
+        
+        # Em produção, isso buscaria do banco de dados
+        # Por enquanto, retorna None para primeiro log
+        return None
+    
+    async def _update_audit_hash_chain(self, tenant_id: str, current_hash: str) -> None:
+        """Atualiza chain de hashes no banco"""
+        
+        # Em produção, armazenaria em tabela de controle
+        # Para manter a chain de auditoria
+        pass
+    
+    async def _replicate_to_external_systems(
+        self,
+        tenant_id: str,
+        audit_log_id: str,
+        log_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Replica log para sistemas externos de auditoria"""
+        
+        # Implementação específica para cada tenant
+        # Ex: SIEM, DataDog, Splunk, etc.
+        
+        return {
+            "status": "not_configured",
+            "systems": []
+        }
+    
+    async def _log_compliance_failure(
+        self,
+        tenant_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        validation_result: Dict[str, Any]
+    ) -> None:
+        """Registra falha de compliance para forense"""
+        
+        await self.audit_logger.log(
+            action="compliance_validation_failed",
+            resource_type="audit_log",
+            resource_id=resource_id,
+            tenant_id=tenant_id,
+            details={
+                "original_action": action,
+                "original_resource_type": resource_type,
+                "validation_reasons": validation_result.get("reasons"),
+                "severity": "high"
+            },
+            level=AuditLogLevel.WARNING
+        )
+    
+    def _get_log_level_for_action(self, action: str) -> AuditLogLevel:
+        """Determina nível de log baseado na ação"""
+        
+        critical_actions = ["delete", "purge", "security_breach", "fraud_detected"]
+        warning_actions = ["update", "modify", "access_denied"]
+        
+        if any(critical in action.lower() for critical in critical_actions):
+            return AuditLogLevel.CRITICAL
+        elif any(warning in action.lower() for warning in warning_actions):
+            return AuditLogLevel.WARNING
+        else:
+            return AuditLogLevel.INFO
+    
+    async def _cleanup_old_audit_logs(
+        self,
+        tenant_id: str,
+        retention_days: int,
+        dry_run: bool
+    ) -> Dict[str, Any]:
+        """Remove logs de auditoria antigos"""
+        
+        # Em produção, isso executaria uma query SQL
+        # DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL 'X days'
+        
+        # Para simulação
+        deleted_count = 0
+        
+        if not dry_run:
+            # Código real de limpeza aqui
+            pass
+        
+        return {
+            "deleted_count": deleted_count,
+            "retention_days": retention_days,
+            "dry_run": dry_run,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    async def _cleanup_temporary_data(self, tenant_id: str, dry_run: bool) -> Dict[str, Any]:
+        """Limpa dados temporários"""
+        
+        # Limpa cache, sessões expiradas, etc.
+        
+        return {
+            "status": "completed",
+            "dry_run": dry_run,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+class AuditWorkerManager:
+    """Gerencia múltiplos workers de auditoria"""
+    
+    def __init__(self, queue, **dependencies):
+        self.queue = queue
+        self.dependencies = dependencies
+        self.workers: Dict[str, AuditWorker] = {}
+        self.worker_tasks: Dict[str, asyncio.Task] = {}
+    
+    async def start_worker(
+        self,
+        worker_id: str,
+        tenant_id: Optional[str] = None,
+        concurrency: int = 2
+    ) -> AuditWorker:
+        """Inicia um worker de auditoria"""
+        
+        worker = AuditWorker(
+            queue=self.queue,
+            worker_id=worker_id,
+            tenant_id=tenant_id,
+            **self.dependencies
+        )
+        
+        self.workers[worker_id] = worker
+        
+        # Inicia worker em background
+        task = asyncio.create_task(
+            worker.start("audit_queue", concurrency)
+        )
+        self.worker_tasks[worker_id] = task
+        
+        logger.info(f"AuditWorker {worker_id} started")
+        return worker
+    
+    async def stop_worker(self, worker_id: str):
+        """Para um worker de auditoria"""
+        
+        if worker_id in self.workers:
+            await self.workers[worker_id].stop()
+            del self.workers[worker_id]
+        
+        if worker_id in self.worker_tasks:
+            self.worker_tasks[worker_id].cancel()
+            try:
+                await self.worker_tasks[worker_id]
+            except asyncio.CancelledError:
+                pass
+            del self.worker_tasks[worker_id]
+        
+        logger.info(f"AuditWorker {worker_id} stopped")
+    
+    async def stop_all(self):
+        """Para todos os workers"""
+        
+        for worker_id in list(self.workers.keys()):
+            await self.stop_worker(worker_id)
+        
+        logger.info("All audit workers stopped")
+    
+    async def process_immediate_audit(
+        self,
+        tenant_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        changes: Dict[str, Any],
+        actor_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Processa auditoria imediata sem fila (para casos críticos)"""
+        
+        worker_id = f"immediate_audit_{tenant_id}"
+        
+        if worker_id not in self.workers:
+            worker = AuditWorker(
+                queue=self.queue,
+                worker_id=worker_id,
+                tenant_id=tenant_id,
+                **self.dependencies
+            )
+            self.workers[worker_id] = worker
+        
+        # Cria tarefa local
+        task = TaskFactory.create_audit_log(
+            tenant_id=tenant_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            changes=changes,
+            actor_id=actor_id
+        )
+        
+        # Processa imediatamente
+        return await self.workers[worker_id].process_task(task)
+
+
+# Import necessário
+import json

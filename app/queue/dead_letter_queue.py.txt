@@ -1,0 +1,249 @@
+"""
+Implementação de Dead Letter Queue usando banco de dados.
+Armazena mensagens falhas persistentemente para análise posterior.
+"""
+
+import json
+import logging
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+
+from .base import DeadLetterQueue, QueueMessage
+from ..models.dead_letter_message import DeadLetterMessage
+
+logger = logging.getLogger(__name__)
+
+
+class DatabaseDeadLetterQueue(DeadLetterQueue):
+    """Dead Letter Queue persistida em banco de dados"""
+    
+    def __init__(self, db_session_factory):
+        """
+        Args:
+            db_session_factory: Função que retorna uma sessão do banco de dados
+        """
+        self.db_session_factory = db_session_factory
+        self.max_retention_days = 30  # Retém mensagens por 30 dias
+    
+    async def store_failed_message(
+        self, 
+        message: QueueMessage,
+        error: str,
+        last_error: str,
+        stack_trace: Optional[str] = None
+    ) -> None:
+        """Armazena mensagem falha no banco de dados"""
+        db_session = self.db_session_factory()
+        
+        try:
+            dlq_message = DeadLetterMessage(
+                message_id=message.metadata.message_id,
+                tenant_id=message.metadata.tenant_id,
+                queue_name=message.queue_name,
+                
+                # Serializa payload e metadata
+                payload=json.dumps(message.payload) if not isinstance(message.payload, str) else message.payload,
+                metadata=json.dumps(message.metadata.to_dict()),
+                
+                # Informações de erro
+                error=error[:1000],  # Limita tamanho
+                last_error=last_error[:1000] if last_error else None,
+                stack_trace=stack_trace[:5000] if stack_trace else None,
+                
+                # Controle de retentativas
+                retry_count=message.metadata.retry_count,
+                
+                # Timestamps
+                original_created_at=message.metadata.created_at,
+                failed_at=datetime.utcnow(),
+                
+                # Informações de correlação
+                correlation_id=message.metadata.correlation_id,
+                source=message.metadata.source
+            )
+            
+            db_session.add(dlq_message)
+            db_session.commit()
+            
+            logger.warning(
+                f"Message {message.metadata.message_id} stored in DLQ",
+                extra={
+                    "tenant_id": message.metadata.tenant_id,
+                    "queue_name": message.queue_name,
+                    "retry_count": message.metadata.retry_count,
+                    "error": error[:200]
+                }
+            )
+            
+        except SQLAlchemyError as e:
+            db_session.rollback()
+            logger.error(
+                f"Failed to store message in DLQ: {str(e)}",
+                extra={
+                    "message_id": message.metadata.message_id,
+                    "tenant_id": message.metadata.tenant_id
+                }
+            )
+            # Não relança a exceção - não queremos que falhas na DLQ
+            # interrompam o fluxo principal
+        finally:
+            db_session.close()
+    
+    async def get_failed_messages(
+        self, 
+        tenant_id: Optional[str] = None,
+        queue_name: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Recupera mensagens falhas do banco de dados"""
+        db_session = self.db_session_factory()
+        
+        try:
+            query = db_session.query(DeadLetterMessage)
+            
+            # Filtros opcionais
+            if tenant_id:
+                query = query.filter(DeadLetterMessage.tenant_id == tenant_id)
+            
+            if queue_name:
+                query = query.filter(DeadLetterMessage.queue_name == queue_name)
+            
+            # Ordena por data de falha (mais recentes primeiro)
+            query = query.order_by(DeadLetterMessage.failed_at.desc())
+            
+            # Limita resultados
+            messages = query.limit(limit).all()
+            
+            result = []
+            for msg in messages:
+                try:
+                    payload = json.loads(msg.payload) if msg.payload else None
+                except json.JSONDecodeError:
+                    payload = msg.payload
+                
+                try:
+                    metadata = json.loads(msg.metadata) if msg.metadata else None
+                except json.JSONDecodeError:
+                    metadata = msg.metadata
+                
+                result.append({
+                    "id": msg.id,
+                    "message_id": msg.message_id,
+                    "tenant_id": msg.tenant_id,
+                    "queue_name": msg.queue_name,
+                    "payload": payload,
+                    "metadata": metadata,
+                    "error": msg.error,
+                    "last_error": msg.last_error,
+                    "stack_trace": msg.stack_trace,
+                    "retry_count": msg.retry_count,
+                    "original_created_at": msg.original_created_at.isoformat() if msg.original_created_at else None,
+                    "failed_at": msg.failed_at.isoformat() if msg.failed_at else None,
+                    "correlation_id": msg.correlation_id,
+                    "source": msg.source
+                })
+            
+            return result
+            
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to retrieve DLQ messages: {str(e)}")
+            return []
+        finally:
+            db_session.close()
+    
+    async def retry_message(self, message_id: str, queue_name: str) -> bool:
+        """Reenvia uma mensagem da DLQ para processamento"""
+        db_session = self.db_session_factory()
+        
+        try:
+            # Busca a mensagem
+            message = db_session.query(DeadLetterMessage).filter(
+                DeadLetterMessage.message_id == message_id,
+                DeadLetterMessage.queue_name == queue_name
+            ).first()
+            
+            if not message:
+                logger.warning(f"Message {message_id} not found in DLQ")
+                return False
+            
+            # Aqui você implementaria a lógica para reenviar a mensagem
+            # para a fila original. Isso depende da implementação específica
+            # do seu sistema de filas.
+            
+            # Por exemplo:
+            # 1. Desserializar payload e metadata
+            # 2. Criar nova QueueMessage
+            # 3. Publicar na fila original
+            
+            logger.info(
+                f"Message {message_id} retried from DLQ",
+                extra={
+                    "tenant_id": message.tenant_id,
+                    "queue_name": message.queue_name
+                }
+            )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to retry message from DLQ: {str(e)}")
+            return False
+        finally:
+            db_session.close()
+    
+    async def delete_message(self, message_id: str, queue_name: str) -> bool:
+        """Remove uma mensagem da DLQ"""
+        db_session = self.db_session_factory()
+        
+        try:
+            result = db_session.query(DeadLetterMessage).filter(
+                DeadLetterMessage.message_id == message_id,
+                DeadLetterMessage.queue_name == queue_name
+            ).delete()
+            
+            db_session.commit()
+            
+            if result > 0:
+                logger.info(f"Message {message_id} deleted from DLQ")
+                return True
+            else:
+                logger.warning(f"Message {message_id} not found in DLQ")
+                return False
+                
+        except SQLAlchemyError as e:
+            db_session.rollback()
+            logger.error(f"Failed to delete message from DLQ: {str(e)}")
+            return False
+        finally:
+            db_session.close()
+    
+    async def cleanup_old_messages(self, retention_days: Optional[int] = None) -> int:
+        """Remove mensagens antigas da DLQ"""
+        if retention_days is None:
+            retention_days = self.max_retention_days
+        
+        cutoff_date = datetime.utcnow().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) - timedelta(days=retention_days)
+        
+        db_session = self.db_session_factory()
+        
+        try:
+            result = db_session.query(DeadLetterMessage).filter(
+                DeadLetterMessage.failed_at < cutoff_date
+            ).delete()
+            
+            db_session.commit()
+            
+            logger.info(f"Cleaned up {result} old messages from DLQ")
+            return result
+            
+        except SQLAlchemyError as e:
+            db_session.rollback()
+            logger.error(f"Failed to cleanup DLQ: {str(e)}")
+            return 0
+        finally:
+            db_session.close()

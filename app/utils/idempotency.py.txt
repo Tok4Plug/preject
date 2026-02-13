@@ -1,0 +1,602 @@
+"""
+Utilitários de idempotência para garantia de processamento único.
+Implementa chaves idempotentes, locks lógicos e registro de eventos processados.
+"""
+
+import hashlib
+import json
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Tuple, Generator
+from functools import wraps
+import redis
+import threading
+import logging
+
+from ..exceptions import (
+    IdempotencyError,
+    ConcurrentProcessingError,
+    ProcessedEventError,
+    LockAcquisitionError,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class IdempotencyManager:
+    """Gerenciador central de idempotência para eventos e operações."""
+    
+    def __init__(self, redis_client: Optional[redis.Redis] = None):
+        """
+        Inicializa o gerenciador de idempotência.
+        
+        Args:
+            redis_client: Cliente Redis para locks distribuídos (opcional)
+        """
+        self.redis_client = redis_client
+        self._local_locks = {}  # Locks locais para fallback
+        self._lock_timeout = 30  # Segundos
+        self._idempotency_window = 86400  # 24 horas para idempotência
+        
+    def generate_idempotency_key(
+        self,
+        tenant_id: str,
+        provider: str,
+        external_event_id: str,
+        operation: Optional[str] = None
+    ) -> str:
+        """
+        Gera chave idempotente única para um evento.
+        
+        Formato: idem_{hash(tenant:provider:external_id:operation)}
+        
+        Args:
+            tenant_id: ID do tenant
+            provider: Provider (stripe, mercado_pago, etc.)
+            external_event_id: ID do evento no sistema externo
+            operation: Operação específica (opcional)
+            
+        Returns:
+            Chave idempotente
+        """
+        components = [
+            tenant_id,
+            provider,
+            external_event_id,
+            operation or "default"
+        ]
+        
+        # Concatena com separador seguro
+        key_string = ":".join(str(c) for c in components)
+        
+        # Gera hash SHA256
+        hash_digest = hashlib.sha256(key_string.encode('utf-8')).hexdigest()
+        
+        return f"idem_{hash_digest}"
+    
+    def generate_lock_key(self, idempotency_key: str) -> str:
+        """Gera chave de lock a partir da chave idempotente."""
+        return f"lock_{idempotency_key}"
+    
+    def generate_processing_key(self, idempotency_key: str) -> str:
+        """Gera chave de processamento a partir da chave idempotente."""
+        return f"proc_{idempotency_key}"
+    
+    def acquire_lock(self, lock_key: str, timeout: Optional[int] = None) -> bool:
+        """
+        Adquire lock distribuído ou local.
+        
+        Args:
+            lock_key: Chave do lock
+            timeout: Timeout em segundos (opcional)
+            
+        Returns:
+            True se adquiriu o lock
+            
+        Raises:
+            LockAcquisitionError: Se não conseguir adquirir o lock
+        """
+        timeout = timeout or self._lock_timeout
+        lock_expiration = int(time.time()) + timeout + 1
+        
+        if self.redis_client:
+            # Tenta lock distribuído via Redis
+            try:
+                acquired = self.redis_client.set(
+                    lock_key,
+                    lock_expiration,
+                    ex=timeout,
+                    nx=True  # Seta apenas se não existir
+                )
+                
+                if acquired:
+                    logger.debug(f"Lock distribuído adquirido: {lock_key}")
+                    return True
+                    
+                # Verifica se o lock expirou (stale lock)
+                current_value = self.redis_client.get(lock_key)
+                if current_value and int(current_value) < int(time.time()):
+                    # Lock expirou, tenta tomar
+                    new_value = str(lock_expiration)
+                    old_value = self.redis_client.getset(lock_key, new_value)
+                    if old_value == current_value:
+                        logger.warning(f"Tomou lock expirado: {lock_key}")
+                        return True
+                        
+            except redis.RedisError as e:
+                logger.error(f"Erro Redis no lock {lock_key}: {str(e)}")
+                # Fallback para lock local
+                
+        # Lock local para fallback ou sem Redis
+        if lock_key not in self._local_locks:
+            self._local_locks[lock_key] = {
+                'expires_at': lock_expiration,
+                'owner': threading.current_thread().ident
+            }
+            logger.debug(f"Lock local adquirido: {lock_key}")
+            return True
+            
+        # Verifica se lock local expirou
+        local_lock = self._local_locks.get(lock_key)
+        if local_lock and local_lock['expires_at'] < time.time():
+            # Lock expirado, libera e tenta novamente
+            del self._local_locks[lock_key]
+            self._local_locks[lock_key] = {
+                'expires_at': lock_expiration,
+                'owner': threading.current_thread().ident
+            }
+            logger.warning(f"Tomou lock local expirado: {lock_key}")
+            return True
+            
+        raise LockAcquisitionError(f"Lock já adquirido: {lock_key}")
+    
+    def release_lock(self, lock_key: str) -> None:
+        """Libera lock adquirido."""
+        if self.redis_client:
+            try:
+                self.redis_client.delete(lock_key)
+                logger.debug(f"Lock distribuído liberado: {lock_key}")
+            except redis.RedisError as e:
+                logger.error(f"Erro ao liberar lock Redis {lock_key}: {str(e)}")
+        
+        # Libera lock local se existir
+        if lock_key in self._local_locks:
+            del self._local_locks[lock_key]
+            logger.debug(f"Lock local liberado: {lock_key}")
+    
+    @contextmanager
+    def distributed_lock(self, lock_key: str, timeout: Optional[int] = None) -> Generator:
+        """
+        Context manager para lock distribuído.
+        
+        Args:
+            lock_key: Chave do lock
+            timeout: Timeout em segundos
+            
+        Yields:
+            None
+            
+        Raises:
+            ConcurrentProcessingError: Se não conseguir adquirir o lock
+        """
+        acquired = False
+        try:
+            acquired = self.acquire_lock(lock_key, timeout)
+            if not acquired:
+                raise ConcurrentProcessingError(
+                    f"Não foi possível adquirir lock para {lock_key}"
+                )
+            yield
+        finally:
+            if acquired:
+                self.release_lock(lock_key)
+    
+    def mark_event_processing(self, idempotency_key: str, metadata: Dict[str, Any]) -> bool:
+        """
+        Marca evento como em processamento.
+        
+        Args:
+            idempotency_key: Chave idempotente
+            metadata: Metadados do processamento
+            
+        Returns:
+            True se marcou como processando
+        """
+        processing_key = self.generate_processing_key(idempotency_key)
+        
+        processing_data = {
+            'status': 'processing',
+            'started_at': datetime.now(timezone.utc).isoformat(),
+            'metadata': metadata,
+            'attempt': self._get_attempt_count(idempotency_key) + 1
+        }
+        
+        if self.redis_client:
+            try:
+                # Define com expiração para evitar stuck
+                self.redis_client.setex(
+                    processing_key,
+                    self._lock_timeout * 2,  # Dobro do timeout do lock
+                    json.dumps(processing_data)
+                )
+                logger.info(f"Evento marcado como processando: {idempotency_key}")
+                return True
+            except redis.RedisError as e:
+                logger.error(f"Erro ao marcar evento processando: {str(e)}")
+                
+        # Fallback: apenas log
+        logger.info(f"Evento em processamento (fallback): {idempotency_key}")
+        return True
+    
+    def mark_event_completed(
+        self,
+        idempotency_key: str,
+        result: Any,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Marca evento como concluído com sucesso.
+        
+        Args:
+            idempotency_key: Chave idempotente
+            result: Resultado do processamento
+            metadata: Metadados adicionais
+        """
+        completed_data = {
+            'status': 'completed',
+            'completed_at': datetime.now(timezone.utc).isoformat(),
+            'result': result,
+            'metadata': metadata or {}
+        }
+        
+        if self.redis_client:
+            try:
+                # Armazena resultado por 24 horas
+                self.redis_client.setex(
+                    idempotency_key,
+                    self._idempotency_window,
+                    json.dumps(completed_data)
+                )
+                
+                # Limpa chave de processamento
+                processing_key = self.generate_processing_key(idempotency_key)
+                self.redis_client.delete(processing_key)
+                
+                logger.info(f"Evento marcado como concluído: {idempotency_key}")
+            except redis.RedisError as e:
+                logger.error(f"Erro ao marcar evento concluído: {str(e)}")
+        else:
+            logger.info(f"Evento concluído (fallback): {idempotency_key}")
+    
+    def mark_event_failed(
+        self,
+        idempotency_key: str,
+        error: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Marca evento como falhou.
+        
+        Args:
+            idempotency_key: Chave idempotente
+            error: Mensagem de erro
+            metadata: Metadados adicionais
+        """
+        failed_data = {
+            'status': 'failed',
+            'failed_at': datetime.now(timezone.utc).isoformat(),
+            'error': error,
+            'metadata': metadata or {}
+        }
+        
+        if self.redis_client:
+            try:
+                # Armazena falha por 1 hora para análise
+                self.redis_client.setex(
+                    idempotency_key,
+                    3600,
+                    json.dumps(failed_data)
+                )
+                
+                # Limpa chave de processamento
+                processing_key = self.generate_processing_key(idempotency_key)
+                self.redis_client.delete(processing_key)
+                
+                logger.warning(f"Evento marcado como falhou: {idempotency_key}")
+            except redis.RedisError as e:
+                logger.error(f"Erro ao marcar evento falhou: {str(e)}")
+        else:
+            logger.warning(f"Evento falhou (fallback): {idempotency_key}")
+    
+    def check_event_processed(self, idempotency_key: str) -> Tuple[bool, Optional[Dict]]:
+        """
+        Verifica se evento já foi processado.
+        
+        Args:
+            idempotency_key: Chave idempotente
+            
+        Returns:
+            Tupla (já_processado, resultado_se_existir)
+        """
+        if self.redis_client:
+            try:
+                result = self.redis_client.get(idempotency_key)
+                if result:
+                    data = json.loads(result)
+                    
+                    # Verifica se está em processamento
+                    processing_key = self.generate_processing_key(idempotency_key)
+                    processing_result = self.redis_client.get(processing_key)
+                    
+                    if processing_result:
+                        processing_data = json.loads(processing_result)
+                        # Se está processando há muito tempo, assume falha
+                        started_at = datetime.fromisoformat(
+                            processing_data['started_at'].replace('Z', '+00:00')
+                        )
+                        processing_time = (datetime.now(timezone.utc) - started_at).total_seconds()
+                        
+                        if processing_time > self._lock_timeout * 2:
+                            logger.warning(
+                                f"Processamento travado: {idempotency_key}, "
+                                f"tempo: {processing_time}s"
+                            )
+                            # Limpa processamento travado
+                            self.redis_client.delete(processing_key)
+                            return False, None
+                        else:
+                            raise ConcurrentProcessingError(
+                                f"Evento ainda em processamento: {idempotency_key}"
+                            )
+                    
+                    if data.get('status') == 'completed':
+                        logger.debug(f"Evento já processado: {idempotency_key}")
+                        return True, data
+                    elif data.get('status') == 'failed':
+                        # Para falhas recentes, levanta erro
+                        failed_at = datetime.fromisoformat(
+                            data['failed_at'].replace('Z', '+00:00')
+                        )
+                        failed_age = (datetime.now(timezone.utc) - failed_at).total_seconds()
+                        
+                        if failed_age < 300:  # 5 minutos
+                            raise ProcessedEventError(
+                                f"Evento falhou recentemente: {data.get('error')}"
+                            )
+                        else:
+                            # Falha antiga, permite reprocessamento
+                            return False, None
+            except redis.RedisError as e:
+                logger.error(f"Erro ao verificar evento processado: {str(e)}")
+        
+        return False, None
+    
+    def _get_attempt_count(self, idempotency_key: str) -> int:
+        """Obtém contagem de tentativas para um evento."""
+        if self.redis_client:
+            try:
+                processing_key = self.generate_processing_key(idempotency_key)
+                result = self.redis_client.get(processing_key)
+                if result:
+                    data = json.loads(result)
+                    return data.get('attempt', 0)
+            except redis.RedisError:
+                pass
+        return 0
+    
+    def generate_request_id(self) -> str:
+        """Gera ID único para rastreamento de requisição."""
+        return f"req_{uuid.uuid4().hex}"
+    
+    def store_request_context(
+        self,
+        request_id: str,
+        context: Dict[str, Any],
+        ttl: int = 86400
+    ) -> None:
+        """Armazena contexto da requisição para debug."""
+        if self.redis_client:
+            try:
+                key = f"req_ctx_{request_id}"
+                self.redis_client.setex(key, ttl, json.dumps(context))
+            except redis.RedisError as e:
+                logger.error(f"Erro ao armazenar contexto: {str(e)}")
+
+
+def idempotent_operation(
+    tenant_field: str = "tenant_id",
+    provider_field: str = "provider",
+    event_id_field: str = "external_event_id",
+    operation_field: Optional[str] = None,
+    lock_timeout: int = 30
+):
+    """
+    Decorator para tornar operações idempotentes.
+    
+    Args:
+        tenant_field: Nome do campo do tenant
+        provider_field: Nome do campo do provider
+        event_id_field: Nome do campo do event ID
+        operation_field: Nome do campo da operação (opcional)
+        lock_timeout: Timeout do lock em segundos
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Encontra o idempotency manager
+            # Assume que a instância está disponível no primeiro argumento (self)
+            # ou podemos buscar de um service locator
+            self_obj = args[0] if args else None
+            
+            # Tenta obter manager do objeto ou cria padrão
+            if hasattr(self_obj, 'idempotency_manager'):
+                manager = self_obj.idempotency_manager
+            else:
+                manager = IdempotencyManager()
+            
+            # Extrai parâmetros para chave idempotente
+            func_kwargs = kwargs.copy()
+            if args:
+                # Para métodos, o primeiro arg é self
+                func_params = func.__code__.co_varnames[1:func.__code__.co_argcount]
+                for i, param in enumerate(func_params):
+                    if i < len(args) - 1:  # -1 porque o primeiro é self
+                        func_kwargs[param] = args[i + 1]
+            
+            tenant_id = func_kwargs.get(tenant_field)
+            provider = func_kwargs.get(provider_field)
+            event_id = func_kwargs.get(event_id_field)
+            operation = func_kwargs.get(operation_field) if operation_field else None
+            
+            if not all([tenant_id, provider, event_id]):
+                raise IdempotencyError(
+                    f"Campos obrigatórios para idempotência faltando: "
+                    f"tenant={tenant_id}, provider={provider}, event_id={event_id}"
+                )
+            
+            # Gera chave idempotente
+            idempotency_key = manager.generate_idempotency_key(
+                tenant_id, provider, event_id, operation
+            )
+            
+            # Verifica se já foi processado
+            processed, result = manager.check_event_processed(idempotency_key)
+            if processed:
+                logger.info(f"Operação idempotente já processada: {idempotency_key}")
+                return result.get('result') if result else None
+            
+            # Adquire lock
+            lock_key = manager.generate_lock_key(idempotency_key)
+            
+            with manager.distributed_lock(lock_key, lock_timeout):
+                # Verifica novamente dentro do lock (double-check)
+                processed, result = manager.check_event_processed(idempotency_key)
+                if processed:
+                    logger.info(f"Operação idempotente já processada (double-check): {idempotency_key}")
+                    return result.get('result') if result else None
+                
+                # Marca como processando
+                metadata = {
+                    'function': func.__name__,
+                    'module': func.__module__,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+                manager.mark_event_processing(idempotency_key, metadata)
+                
+                try:
+                    # Executa função
+                    func_result = func(*args, **kwargs)
+                    
+                    # Marca como concluído
+                    manager.mark_event_completed(
+                        idempotency_key,
+                        func_result,
+                        {'success': True}
+                    )
+                    
+                    return func_result
+                    
+                except Exception as e:
+                    # Marca como falhou
+                    manager.mark_event_failed(
+                        idempotency_key,
+                        str(e),
+                        {'error_type': type(e).__name__, 'success': False}
+                    )
+                    raise
+        
+        return wrapper
+    return decorator
+
+
+class IdempotentProcessor:
+    """Processador dedicado para operações idempotentes."""
+    
+    def __init__(self, redis_client: Optional[redis.Redis] = None):
+        self.manager = IdempotencyManager(redis_client)
+    
+    def process_webhook(
+        self,
+        tenant_id: str,
+        provider: str,
+        external_event_id: str,
+        event_data: Dict[str, Any],
+        processor_func
+    ) -> Any:
+        """
+        Processa webhook de forma idempotente.
+        
+        Args:
+            tenant_id: ID do tenant
+            provider: Provider do webhook
+            external_event_id: ID do evento externo
+            event_data: Dados do evento
+            processor_func: Função para processar o evento
+            
+        Returns:
+            Resultado do processamento
+            
+        Raises:
+            ProcessedEventError: Se evento já foi processado
+            ConcurrentProcessingError: Se está sendo processado concorrentemente
+        """
+        idempotency_key = self.manager.generate_idempotency_key(
+            tenant_id, provider, external_event_id
+        )
+        
+        # Verifica se já processado
+        processed, existing_result = self.manager.check_event_processed(idempotency_key)
+        if processed:
+            raise ProcessedEventError(
+                f"Webhook já processado: {external_event_id}",
+                existing_result
+            )
+        
+        # Adquire lock
+        lock_key = self.manager.generate_lock_key(idempotency_key)
+        
+        with self.manager.distributed_lock(lock_key):
+            # Double-check dentro do lock
+            processed, existing_result = self.manager.check_event_processed(idempotency_key)
+            if processed:
+                raise ProcessedEventError(
+                    f"Webhook já processado (double-check): {external_event_id}",
+                    existing_result
+                )
+            
+            # Marca como processando
+            metadata = {
+                'webhook_provider': provider,
+                'event_type': event_data.get('type'),
+                'received_at': datetime.now(timezone.utc).isoformat()
+            }
+            self.manager.mark_event_processing(idempotency_key, metadata)
+            
+            try:
+                # Processa evento
+                result = processor_func(event_data)
+                
+                # Marca como concluído
+                self.manager.mark_event_completed(idempotency_key, result)
+                
+                return result
+                
+            except Exception as e:
+                # Marca como falhou
+                self.manager.mark_event_failed(idempotency_key, str(e))
+                raise
+
+
+# Instância global para uso direto
+try:
+    import redis
+    redis_client = redis.Redis.from_url(
+        os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
+        decode_responses=False  # Mantém bytes para segurança
+    )
+    idempotency_manager = IdempotencyManager(redis_client)
+except Exception as e:
+    logger.warning(f"Redis não disponível para idempotência: {str(e)}")
+    idempotency_manager = IdempotencyManager()  # Modo local apenas

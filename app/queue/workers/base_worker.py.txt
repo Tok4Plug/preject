@@ -1,0 +1,259 @@
+"""
+Worker base para processamento de tarefas.
+Todos os workers especializados herdam desta classe.
+"""
+
+import asyncio
+import logging
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+
+from ...queue import BaseQueue, QueueMessage, BaseTask, TaskFactory
+from ...core.audit_logger import AuditLogger
+from ...core.metrics_engine import MetricsEngine
+
+logger = logging.getLogger(__name__)
+
+
+class BaseWorker(ABC):
+    """Classe base para todos os workers"""
+    
+    def __init__(
+        self,
+        queue: BaseQueue,
+        worker_id: str,
+        tenant_id: Optional[str] = None,
+        audit_logger: Optional[AuditLogger] = None,
+        metrics_engine: Optional[MetricsEngine] = None
+    ):
+        self.queue = queue
+        self.worker_id = worker_id
+        self.tenant_id = tenant_id
+        self.audit_logger = audit_logger
+        self.metrics_engine = metrics_engine
+        
+        self.is_running = False
+        self.processed_count = 0
+        self.failed_count = 0
+        
+        logger.info(f"Worker {worker_id} initialized")
+    
+    @abstractmethod
+    async def process_task(self, task: BaseTask) -> Any:
+        """Processa uma tarefa específica"""
+        pass
+    
+    async def start(self, queue_name: str, concurrency: int = 1):
+        """Inicia o worker"""
+        self.is_running = True
+        
+        logger.info(f"Worker {self.worker_id} starting on queue {queue_name}")
+        
+        # Cria múltiplas tasks para concorrência
+        tasks = []
+        for i in range(concurrency):
+            task_name = f"{self.worker_id}_{i}"
+            task = asyncio.create_task(
+                self._run_consumer(queue_name, task_name)
+            )
+            tasks.append(task)
+        
+        # Aguarda todas as tasks
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            logger.info(f"Worker {self.worker_id} cancelled")
+        except Exception as e:
+            logger.error(f"Worker {self.worker_id} error: {str(e)}")
+        finally:
+            self.is_running = False
+    
+    async def _run_consumer(self, queue_name: str, consumer_name: str):
+        """Executa consumer específico"""
+        logger.debug(f"Consumer {consumer_name} starting")
+        
+        while self.is_running:
+            try:
+                # Recebe mensagem da fila
+                message = await self.queue.receive_message(
+                    queue_name,
+                    self.tenant_id
+                )
+                
+                if not message:
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Processa mensagem
+                await self._process_message(message, consumer_name)
+                
+            except Exception as e:
+                logger.error(f"Consumer {consumer_name} error: {str(e)}")
+                await asyncio.sleep(1)
+        
+        logger.debug(f"Consumer {consumer_name} stopped")
+    
+    async def _process_message(self, message: QueueMessage, consumer_name: str):
+        """Processa uma mensagem recebida"""
+        try:
+            # Converte para tarefa
+            task_data = message.payload
+            task = BaseTask.from_dict(task_data)
+            
+            # Valida tarefa
+            from ...queue.tasks import TaskValidator
+            errors = TaskValidator.validate_task(task)
+            
+            if errors:
+                logger.error(f"Invalid task: {errors}")
+                await self.queue.nack(message, f"Invalid task: {errors}")
+                return
+            
+            # Processa tarefa
+            start_time = datetime.utcnow()
+            
+            try:
+                result = await self.process_task(task)
+                processing_time = (datetime.utcnow() - start_time).total_seconds()
+                
+                # Registra sucesso
+                self.processed_count += 1
+                
+                if self.audit_logger:
+                    await self.audit_logger.log(
+                        action="task_processed",
+                        resource_type="queue_task",
+                        resource_id=task.metadata.task_id,
+                        tenant_id=task.metadata.tenant_id,
+                        details={
+                            "task_type": task.task_type,
+                            "processing_time": processing_time,
+                            "consumer": consumer_name,
+                            "result": str(result)[:500]  # Limita tamanho
+                        }
+                    )
+                
+                # Confirma mensagem
+                await self.queue.acknowledge(message)
+                
+                logger.debug(
+                    f"Task {task.metadata.task_id} processed successfully "
+                    f"by {consumer_name}"
+                )
+                
+            except Exception as e:
+                # Registra falha
+                self.failed_count += 1
+                
+                if self.audit_logger:
+                    await self.audit_logger.log(
+                        action="task_failed",
+                        resource_type="queue_task",
+                        resource_id=task.metadata.task_id,
+                        tenant_id=task.metadata.tenant_id,
+                        details={
+                            "task_type": task.task_type,
+                            "error": str(e),
+                            "consumer": consumer_name
+                        }
+                    )
+                
+                # Nega confirmação com retry
+                await self.queue.nack(message, str(e))
+                
+                logger.error(
+                    f"Task {task.metadata.task_id} failed: {str(e)}",
+                    exc_info=True
+                )
+            
+            # Atualiza métricas
+            if self.metrics_engine:
+                await self.metrics_engine.record_worker_metrics(
+                    worker_id=self.worker_id,
+                    processed_count=self.processed_count,
+                    failed_count=self.failed_count,
+                    tenant_id=self.tenant_id
+                )
+            
+        except Exception as e:
+            # Erro no processamento geral
+            logger.error(f"Error processing message: {str(e)}", exc_info=True)
+            await self.queue.nack(message, f"Processing error: {str(e)}")
+    
+    async def stop(self):
+        """Para o worker"""
+        self.is_running = False
+        logger.info(f"Worker {self.worker_id} stopping")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Retorna estatísticas do worker"""
+        return {
+            "worker_id": self.worker_id,
+            "tenant_id": self.tenant_id,
+            "is_running": self.is_running,
+            "processed_count": self.processed_count,
+            "failed_count": self.failed_count,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+class WorkerManager:
+    """Gerencia múltiplos workers"""
+    
+    def __init__(self):
+        self.workers: Dict[str, BaseWorker] = {}
+        self.worker_tasks: Dict[str, asyncio.Task] = {}
+    
+    def register_worker(self, worker: BaseWorker, queue_name: str):
+        """Registra um worker"""
+        self.workers[worker.worker_id] = worker
+        
+        # Inicia worker em background
+        task = asyncio.create_task(
+            worker.start(queue_name, concurrency=3)
+        )
+        self.worker_tasks[worker.worker_id] = task
+        
+        logger.info(f"Worker {worker.worker_id} registered for queue {queue_name}")
+    
+    async def stop_all(self):
+        """Para todos os workers"""
+        logger.info("Stopping all workers")
+        
+        # Para workers
+        for worker in self.workers.values():
+            await worker.stop()
+        
+        # Aguarda tasks
+        for task in self.worker_tasks.values():
+            task.cancel()
+        
+        if self.worker_tasks:
+            await asyncio.gather(*self.worker_tasks.values(), return_exceptions=True)
+        
+        logger.info("All workers stopped")
+    
+    def get_worker_stats(self) -> Dict[str, Any]:
+        """Retorna estatísticas de todos os workers"""
+        stats = {}
+        
+        for worker_id, worker in self.workers.items():
+            stats[worker_id] = worker.get_stats()
+        
+        return {
+            "total_workers": len(self.workers),
+            "workers": stats,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+# Singleton global do WorkerManager
+_worker_manager: Optional[WorkerManager] = None
+
+def get_worker_manager() -> WorkerManager:
+    """Retorna instância global do WorkerManager"""
+    global _worker_manager
+    if _worker_manager is None:
+        _worker_manager = WorkerManager()
+    return _worker_manager

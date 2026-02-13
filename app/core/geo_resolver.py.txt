@@ -1,0 +1,667 @@
+# app/core/geo_resolver.py
+"""
+Resolvedor de região operacional.
+Determina a região do usuário com base em múltiplos sinais ponderados.
+Stateless, thread-safe, com fallback inteligente.
+"""
+
+import enum
+import ipaddress
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from enum import Enum
+import asyncio
+from functools import lru_cache
+
+import httpx
+from geoip2.database import Reader
+from geoip2.errors import AddressNotFoundError
+
+from app.core.audit_logger import audit_logger
+from app.utils.cryptography import hash_data
+
+logger = logging.getLogger(__name__)
+
+
+class GeoRegion(Enum):
+    """Regiões operacionais do sistema."""
+    BR = "BR"          # Brasil
+    LATAM = "LATAM"    # América Latina (exceto Brasil)
+    EU = "EU"          # Europa
+    US = "US"          # Estados Unidos
+    GLOBAL = "GLOBAL"  # Fallback global
+    
+    @classmethod
+    def from_country_code(cls, country_code: str) -> 'GeoRegion':
+        """Mapeia código de país para região."""
+        country_to_region = {
+            # Brasil
+            'BR': cls.BR,
+            
+            # América Latina
+            'AR': cls.LATAM, 'CL': cls.LATAM, 'CO': cls.LATAM, 'PE': cls.LATAM,
+            'MX': cls.LATAM, 'UY': cls.LATAM, 'PY': cls.LATAM, 'BO': cls.LATAM,
+            'EC': cls.LATAM, 'VE': cls.LATAM, 'CR': cls.LATAM, 'PA': cls.LATAM,
+            'DO': cls.LATAM, 'GT': cls.LATAM, 'SV': cls.LATAM, 'HN': cls.LATAM,
+            'NI': cls.LATAM, 'CU': cls.LATAM,
+            
+            # Europa
+            'PT': cls.EU, 'ES': cls.EU, 'FR': cls.EU, 'DE': cls.EU, 'IT': cls.EU,
+            'GB': cls.EU, 'NL': cls.EU, 'BE': cls.EU, 'CH': cls.EU, 'AT': cls.EU,
+            'IE': cls.EU, 'SE': cls.EU, 'NO': cls.EU, 'DK': cls.EU, 'FI': cls.EU,
+            'PL': cls.EU, 'CZ': cls.EU, 'HU': cls.EU, 'RO': cls.EU, 'BG': cls.EU,
+            'GR': cls.EU, 'RS': cls.EU, 'HR': cls.EU, 'SI': cls.EU, 'SK': cls.EU,
+            'LT': cls.EU, 'LV': cls.EU, 'EE': cls.EU, 'CY': cls.EU, 'LU': cls.EU,
+            'MT': cls.EU,
+            
+            # Estados Unidos
+            'US': cls.US,
+        }
+        
+        return country_to_region.get(country_code.upper(), cls.GLOBAL)
+
+
+@dataclass
+class GeoSignal:
+    """Sinal de geolocalização com peso e confiança."""
+    source: str
+    region: GeoRegion
+    confidence: float  # 0.0 a 1.0
+    timestamp: datetime
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class GeoResolution:
+    """Resultado da resolução de região."""
+    region: GeoRegion
+    confidence: float
+    signals_used: List[str]
+    primary_signal: Optional[str] = None
+    fallback_used: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "region": self.region.value,
+            "confidence": self.confidence,
+            "signals_used": self.signals_used,
+            "primary_signal": self.primary_signal,
+            "fallback_used": self.fallback_used,
+            "metadata": self.metadata
+        }
+
+
+class GeoSignalSource(Enum):
+    """Fontes de sinal de geolocalização."""
+    IP_GEOLITE = "ip_geolite"
+    TELEGRAM_LANGUAGE = "telegram_language"
+    TELEGRAM_PHONE = "telegram_phone"
+    TIMEZONE = "timezone"
+    HISTORICAL = "historical"
+    USER_PROVIDED = "user_provided"
+    FALLBACK = "fallback"
+
+
+class GeoResolver:
+    """
+    Resolvedor de região operacional com múltiplos sinais ponderados.
+    """
+    
+    def __init__(
+        self,
+        geolite_db_path: Optional[str] = None,
+        maxmind_license_key: Optional[str] = None,
+        cache_ttl: int = 3600  # 1 hora
+    ):
+        self.geolite_db_path = geolite_db_path
+        self.maxmind_license_key = maxmind_license_key
+        self.cache_ttl = cache_ttl
+        
+        # Peso de cada fonte de sinal (soma = 1.0)
+        self.signal_weights = {
+            GeoSignalSource.HISTORICAL.value: 0.35,
+            GeoSignalSource.IP_GEOLITE.value: 0.25,
+            GeoSignalSource.TELEGRAM_PHONE.value: 0.20,
+            GeoSignalSource.TIMEZONE.value: 0.10,
+            GeoSignalSource.TELEGRAM_LANGUAGE.value: 0.07,
+            GeoSignalSource.USER_PROVIDED.value: 0.03,
+        }
+        
+        # Cache in-memory para resoluções frequentes
+        self._resolution_cache: Dict[str, Tuple[GeoResolution, datetime]] = {}
+        
+        # Cliente HTTP para APIs externas
+        self._http_client = httpx.AsyncClient(timeout=5.0)
+        
+        # Inicializar leitor GeoLite2 se disponível
+        self._geolite_reader = None
+        if geolite_db_path:
+            try:
+                self._geolite_reader = Reader(geolite_db_path)
+                logger.info(f"GeoLite2 database loaded from {geolite_db_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load GeoLite2 database: {e}")
+    
+    async def resolve_region(
+        self,
+        user_id: int,
+        user_data: Dict[str, Any],
+        bot_id: str,
+        ip_address: Optional[str] = None
+    ) -> GeoResolution:
+        """
+        Resolve a região operacional do usuário.
+        
+        Args:
+            user_id: ID do usuário
+            user_data: Dados do usuário do Telegram
+            bot_id: ID do bot
+            ip_address: Endereço IP do usuário (opcional)
+            
+        Returns:
+            GeoResolution com região e confiança
+        """
+        cache_key = self._generate_cache_key(user_id, bot_id, ip_address)
+        
+        # Verificar cache
+        if cache_key in self._resolution_cache:
+            resolution, cached_at = self._resolution_cache[cache_key]
+            if (datetime.utcnow() - cached_at).seconds < self.cache_ttl:
+                logger.debug(f"Cache hit for geo resolution: {cache_key}")
+                return resolution
+        
+        # Coletar sinais
+        signals = await self._collect_signals(user_id, user_data, bot_id, ip_address)
+        
+        # Combinar sinais ponderados
+        resolution = self._combine_signals(signals)
+        
+        # Aplicar regras de fallback se necessário
+        if resolution.confidence < 0.6:  # Limiar de confiança baixa
+            resolution = self._apply_fallback(resolution, signals)
+        
+        # Cache do resultado
+        self._resolution_cache[cache_key] = (resolution, datetime.utcnow())
+        
+        # Registrar auditoria para resoluções de alta importância
+        if resolution.region != GeoRegion.GLOBAL or resolution.confidence > 0.8:
+            await self._log_geo_resolution(user_id, bot_id, resolution)
+        
+        return resolution
+    
+    async def _collect_signals(
+        self,
+        user_id: int,
+        user_data: Dict[str, Any],
+        bot_id: str,
+        ip_address: Optional[str]
+    ) -> List[GeoSignal]:
+        """
+        Coleta todos os sinais disponíveis para o usuário.
+        """
+        signals = []
+        
+        # 1. Sinal IP (GeoLite2)
+        if ip_address:
+            try:
+                ip_signal = await self._get_ip_signal(ip_address)
+                if ip_signal:
+                    signals.append(ip_signal)
+            except Exception as e:
+                logger.error(f"Error getting IP signal: {e}")
+        
+        # 2. Sinal Telegram Language Code
+        language_signal = self._get_language_signal(user_data)
+        if language_signal:
+            signals.append(language_signal)
+        
+        # 3. Sinal Telegram Phone (se disponível)
+        phone_signal = self._get_phone_signal(user_data)
+        if phone_signal:
+            signals.append(phone_signal)
+        
+        # 4. Sinal Timezone
+        timezone_signal = self._get_timezone_signal(user_data)
+        if timezone_signal:
+            signals.append(timezone_signal)
+        
+        # 5. Sinal Histórico (de compras anteriores)
+        historical_signal = await self._get_historical_signal(user_id, bot_id)
+        if historical_signal:
+            signals.append(historical_signal)
+        
+        # 6. Sinal User Provided (se disponível)
+        user_provided_signal = self._get_user_provided_signal(user_data)
+        if user_provided_signal:
+            signals.append(user_provided_signal)
+        
+        logger.debug(
+            f"Collected {len(signals)} geo signals for user {user_id}: "
+            f"{[s.source for s in signals]}"
+        )
+        
+        return signals
+    
+    async def _get_ip_signal(self, ip_address: str) -> Optional[GeoSignal]:
+        """
+        Obtém região a partir do endereço IP usando GeoLite2.
+        """
+        if not self._geolite_reader:
+            return None
+        
+        try:
+            # Validar e limpar IP
+            ip_obj = ipaddress.ip_address(ip_address)
+            
+            # Consultar GeoLite2
+            response = self._geolite_reader.country(str(ip_obj))
+            
+            if response.country.iso_code:
+                region = GeoRegion.from_country_code(response.country.iso_code)
+                
+                # Calcular confiança baseada na precisão do IP
+                confidence = self._calculate_ip_confidence(ip_obj, response)
+                
+                return GeoSignal(
+                    source=GeoSignalSource.IP_GEOLITE.value,
+                    region=region,
+                    confidence=confidence,
+                    timestamp=datetime.utcnow(),
+                    metadata={
+                        "country_code": response.country.iso_code,
+                        "country_name": response.country.name,
+                        "ip_address": str(ip_obj),
+                        "ip_type": "public" if ip_obj.is_global else "private"
+                    }
+                )
+        
+        except AddressNotFoundError:
+            logger.debug(f"IP address not found in GeoLite2: {ip_address}")
+        except Exception as e:
+            logger.error(f"Error querying GeoLite2: {e}")
+        
+        return None
+    
+    def _calculate_ip_confidence(
+        self,
+        ip_address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+        response: Any
+    ) -> float:
+        """
+        Calcula confiança do sinal IP baseado em vários fatores.
+        """
+        confidence = 0.7  # Base
+        
+        # Ajustar por tipo de IP
+        if ip_address.is_private:
+            confidence *= 0.3  # IPs privados são menos confiáveis
+        
+        if ip_address.is_multicast or ip_address.is_reserved:
+            confidence *= 0.1
+        
+        # Ajustar por país (alguns são mais específicos)
+        country_code = response.country.iso_code
+        if country_code in ['US', 'BR', 'DE', 'GB', 'FR']:
+            confidence *= 1.1  # Países com boa cobertura
+        
+        return min(confidence, 0.95)
+    
+    def _get_language_signal(self, user_data: Dict[str, Any]) -> Optional[GeoSignal]:
+        """
+        Obtém região a partir do language_code do Telegram.
+        """
+        language_code = user_data.get("language_code")
+        if not language_code:
+            return None
+        
+        # Mapear language_code para região
+        language_to_region = {
+            # Português
+            'pt': GeoRegion.BR,
+            'pt-br': GeoRegion.BR,
+            'pt-pt': GeoRegion.EU,
+            
+            # Espanhol
+            'es': GeoRegion.LATAM,
+            'es-ar': GeoRegion.LATAM,
+            'es-mx': GeoRegion.LATAM,
+            'es-es': GeoRegion.EU,
+            
+            # Inglês
+            'en': GeoRegion.US,
+            'en-us': GeoRegion.US,
+            'en-gb': GeoRegion.EU,
+            'en-au': GeoRegion.GLOBAL,
+            
+            # Outros Europeus
+            'de': GeoRegion.EU,
+            'fr': GeoRegion.EU,
+            'it': GeoRegion.EU,
+            'nl': GeoRegion.EU,
+            'pl': GeoRegion.EU,
+            'ru': GeoRegion.GLOBAL,  # Rússia pode ser qualquer lugar
+        }
+        
+        region = language_to_region.get(language_code.lower())
+        if not region:
+            # Tentar extrair do prefixo
+            lang_prefix = language_code.split('-')[0]
+            region = language_to_region.get(lang_prefix)
+        
+        if region:
+            return GeoSignal(
+                source=GeoSignalSource.TELEGRAM_LANGUAGE.value,
+                region=region,
+                confidence=0.6,
+                timestamp=datetime.utcnow(),
+                metadata={"language_code": language_code}
+            )
+        
+        return None
+    
+    def _get_phone_signal(self, user_data: Dict[str, Any]) -> Optional[GeoSignal]:
+        """
+        Obtém região a partir do código do país do telefone do Telegram.
+        """
+        phone_number = user_data.get("phone_number")
+        if not phone_number:
+            return None
+        
+        # Extrair código do país (simplificado)
+        # Em produção, usar uma biblioteca como phonenumbers
+        try:
+            # Remove espaços e caracteres especiais
+            clean_phone = ''.join(c for c in phone_number if c.isdigit() or c == '+')
+            
+            # Mapear códigos de país para regiões
+            country_code_to_region = {
+                '55': GeoRegion.BR,  # Brasil
+                '1': GeoRegion.US,   # EUA/Canadá
+                '44': GeoRegion.EU,  # UK
+                '33': GeoRegion.EU,  # França
+                '49': GeoRegion.EU,  # Alemanha
+                '34': GeoRegion.EU,  # Espanha
+                '351': GeoRegion.EU, # Portugal
+                '54': GeoRegion.LATAM, # Argentina
+                '56': GeoRegion.LATAM, # Chile
+                '52': GeoRegion.LATAM, # México
+            }
+            
+            # Verificar diferentes prefixos
+            for code, region in country_code_to_region.items():
+                if clean_phone.startswith(f'+{code}') or clean_phone.startswith(code):
+                    return GeoSignal(
+                        source=GeoSignalSource.TELEGRAM_PHONE.value,
+                        region=region,
+                        confidence=0.85,  # Alto confiança para telefone
+                        timestamp=datetime.utcnow(),
+                        metadata={
+                            "phone_number": phone_number,
+                            "country_code": code
+                        }
+                    )
+        
+        except Exception as e:
+            logger.debug(f"Error parsing phone number {phone_number}: {e}")
+        
+        return None
+    
+    def _get_timezone_signal(self, user_data: Dict[str, Any]) -> Optional[GeoSignal]:
+        """
+        Obtém região a partir do fuso horário.
+        """
+        # Telegram não fornece timezone diretamente
+        # Podemos inferir do horário de atividade ou usar hora atual
+        # Por enquanto, retornar None - pode ser implementado posteriormente
+        return None
+    
+    async def _get_historical_signal(
+        self,
+        user_id: int,
+        bot_id: str
+    ) -> Optional[GeoSignal]:
+        """
+        Obtém região a partir do histórico de compras do usuário.
+        """
+        try:
+            # Importação condicional para evitar circular imports
+            from app.models.payment_intent import PaymentIntent
+            
+            # Buscar último pagamento confirmado do usuário
+            last_payment = await PaymentIntent.get_last_confirmed_payment(
+                user_id=user_id,
+                bot_id=bot_id
+            )
+            
+            if last_payment and last_payment.region:
+                try:
+                    region = GeoRegion(last_payment.region)
+                    
+                    # Calcular confiança baseada na idade do pagamento
+                    payment_age = (datetime.utcnow() - last_payment.created_at).days
+                    age_confidence = max(0.7, 1.0 - (payment_age / 90))  # Decai em 90 dias
+                    
+                    return GeoSignal(
+                        source=GeoSignalSource.HISTORICAL.value,
+                        region=region,
+                        confidence=age_confidence * 0.9,  # Histórico tem alta confiança
+                        timestamp=datetime.utcnow(),
+                        metadata={
+                            "payment_intent_id": last_payment.id,
+                            "payment_age_days": payment_age,
+                            "amount": last_payment.amount,
+                            "currency": last_payment.currency
+                        }
+                    )
+                
+                except ValueError:
+                    logger.debug(f"Invalid region in historical payment: {last_payment.region}")
+        
+        except Exception as e:
+            logger.error(f"Error getting historical signal: {e}")
+        
+        return None
+    
+    def _get_user_provided_signal(self, user_data: Dict[str, Any]) -> Optional[GeoSignal]:
+        """
+        Obtém região fornecida diretamente pelo usuário.
+        """
+        # Pode ser implementado se o usuário selecionar país manualmente
+        # Por enquanto, retornar None
+        return None
+    
+    def _combine_signals(self, signals: List[GeoSignal]) -> GeoResolution:
+        """
+        Combina múltiplos sinais ponderados para determinar região final.
+        """
+        if not signals:
+            return self._create_fallback_resolution()
+        
+        # Agrupar sinais por região
+        region_scores: Dict[GeoRegion, float] = {}
+        region_metadata: Dict[GeoRegion, List[Dict]] = {}
+        used_sources = []
+        
+        for signal in signals:
+            weight = self.signal_weights.get(signal.source, 0.05)
+            score = signal.confidence * weight
+            
+            if signal.region not in region_scores:
+                region_scores[signal.region] = 0
+                region_metadata[signal.region] = []
+            
+            region_scores[signal.region] += score
+            region_metadata[signal.region].append({
+                "source": signal.source,
+                "confidence": signal.confidence,
+                "metadata": signal.metadata
+            })
+            used_sources.append(signal.source)
+        
+        # Determinar região com maior score
+        best_region = max(region_scores.items(), key=lambda x: x[1])
+        
+        # Calcular confiança total (normalizada)
+        total_score = best_region[1]
+        confidence = min(total_score * 1.5, 1.0)  # Escalar para 0-1
+        
+        # Determinar sinal primário (maior contribuição)
+        primary_signal = None
+        if signals:
+            primary_signal = max(
+                signals,
+                key=lambda s: s.confidence * self.signal_weights.get(s.source, 0.05)
+            ).source
+        
+        return GeoResolution(
+            region=best_region[0],
+            confidence=confidence,
+            signals_used=used_sources,
+            primary_signal=primary_signal,
+            metadata={
+                "region_scores": {
+                    region.value: score for region, score in region_scores.items()
+                },
+                "signal_details": region_metadata.get(best_region[0], [])
+            }
+        )
+    
+    def _apply_fallback(
+        self,
+        resolution: GeoResolution,
+        signals: List[GeoSignal]
+    ) -> GeoResolution:
+        """
+        Aplica regras de fallback para resoluções de baixa confiança.
+        """
+        # Se temos algum sinal, mesmo com baixa confiança, usar
+        if signals and resolution.confidence > 0.3:
+            return resolution
+        
+        # Fallback baseado em distribuição de usuários por bot
+        # Por enquanto, fallback genérico
+        return GeoResolution(
+            region=GeoRegion.GLOBAL,
+            confidence=0.5,
+            signals_used=resolution.signals_used + [GeoSignalSource.FALLBACK.value],
+            primary_signal=GeoSignalSource.FALLBACK.value,
+            fallback_used=True,
+            metadata={
+                **resolution.metadata,
+                "fallback_reason": "low_confidence",
+                "fallback_confidence": resolution.confidence
+            }
+        )
+    
+    def _create_fallback_resolution(self) -> GeoResolution:
+        """Cria resolução de fallback quando não há sinais."""
+        return GeoResolution(
+            region=GeoRegion.GLOBAL,
+            confidence=0.5,
+            signals_used=[GeoSignalSource.FALLBACK.value],
+            primary_signal=GeoSignalSource.FALLBACK.value,
+            fallback_used=True,
+            metadata={"fallback_reason": "no_signals"}
+        )
+    
+    def _generate_cache_key(
+        self,
+        user_id: int,
+        bot_id: str,
+        ip_address: Optional[str]
+    ) -> str:
+        """Gera chave de cache para resolução."""
+        components = [str(user_id), bot_id]
+        if ip_address:
+            components.append(hash_data(ip_address))
+        return ":".join(components)
+    
+    async def _log_geo_resolution(
+        self,
+        user_id: int,
+        bot_id: str,
+        resolution: GeoResolution
+    ) -> None:
+        """Registra auditoria da resolução geográfica."""
+        try:
+            await audit_logger.log_async(
+                resource_type="geo_resolution",
+                resource_id=f"{bot_id}:{user_id}",
+                action="resolve",
+                actor="system",
+                description=f"Região resolvida: {resolution.region.value}",
+                metadata=resolution.to_dict()
+            )
+        except Exception as e:
+            logger.error(f"Error logging geo resolution: {e}")
+    
+    async def get_region_statistics(
+        self,
+        bot_id: Optional[str] = None,
+        hours: int = 24
+    ) -> Dict[str, Any]:
+        """
+        Retorna estatísticas de resolução de região.
+        """
+        # Em produção, buscar do banco de dados
+        # Por enquanto, retornar estrutura vazia
+        return {
+            "total_resolutions": 0,
+            "region_distribution": {},
+            "average_confidence": 0.0,
+            "fallback_rate": 0.0
+        }
+    
+    def clear_cache(self) -> int:
+        """
+        Limpa o cache de resoluções.
+        
+        Returns:
+            Número de itens removidos
+        """
+        count = len(self._resolution_cache)
+        self._resolution_cache.clear()
+        logger.info(f"Cleared geo resolution cache ({count} items)")
+        return count
+    
+    async def close(self):
+        """Libera recursos."""
+        if self._geolite_reader:
+            self._geolite_reader.close()
+        
+        await self._http_client.aclose()
+
+
+# Factory para criação do GeoResolver
+def create_geo_resolver(
+    geolite_db_path: Optional[str] = None,
+    maxmind_license_key: Optional[str] = None
+) -> GeoResolver:
+    """
+    Cria uma instância configurada do GeoResolver.
+    
+    Args:
+        geolite_db_path: Caminho para o arquivo GeoLite2-Country.mmdb
+        maxmind_license_key: Chave de licença MaxMind para atualizações
+        
+    Returns:
+        GeoResolver configurado
+    """
+    return GeoResolver(
+        geolite_db_path=geolite_db_path,
+        maxmind_license_key=maxmind_license_key
+    )
+
+
+# Singleton para uso global (opcional)
+_geo_resolver_instance: Optional[GeoResolver] = None
+
+def get_geo_resolver() -> GeoResolver:
+    """Retorna instância singleton do GeoResolver."""
+    global _geo_resolver_instance
+    if _geo_resolver_instance is None:
+        _geo_resolver_instance = create_geo_resolver()
+    return _geo_resolver_instance

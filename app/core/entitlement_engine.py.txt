@@ -1,0 +1,1255 @@
+# app/core/entitlement_engine.py
+"""
+Engine de concessão e revogação de acessos (entitlements).
+Fonte única da verdade para permissões - nunca contém lógica de negócio, apenas gerencia entitlements.
+Baseado em pagamentos confirmados, reembolsos, chargebacks, etc.
+"""
+
+import enum
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Set, Any, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+import uuid
+
+from app.core.audit_logger import audit_logger
+from app.models.entitlement import (
+    Entitlement, 
+    EntitlementStatus,
+    EntitlementScope,
+    EntitlementType
+)
+from app.models.user import User
+from app.models.payment_intent import PaymentIntent
+from app.models.invoice import Invoice
+from app.models.offer import Offer
+from app.utils.idempotency import with_idempotency
+from app.queue.tasks import enqueue_entitlement_task
+
+logger = logging.getLogger(__name__)
+
+
+class EntitlementAction(Enum):
+    """Ações que podem ser executadas no EntitlementEngine."""
+    GRANT = "grant"
+    REVOKE = "revoke"
+    SUSPEND = "suspend"
+    REACTIVATE = "reactivate"
+    EXTEND = "extend"
+    UPGRADE = "upgrade"
+    DOWNGRADE = "downgrade"
+
+
+class EntitlementError(Exception):
+    """Exceção para erros no EntitlementEngine."""
+    pass
+
+
+class EntitlementValidationError(EntitlementError):
+    """Exceção para erros de validação de entitlement."""
+    pass
+
+
+@dataclass
+class EntitlementGrant:
+    """Dados para concessão de acesso."""
+    user_id: int
+    bot_id: str
+    offer_id: str
+    payment_intent_id: str
+    fingerprint: str
+    granted_by: str = "system"  # "system", "admin_id", "user_id"
+    grant_reason: str = "payment_confirmed"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    expires_at: Optional[datetime] = None
+    custom_duration_days: Optional[int] = None
+
+
+@dataclass
+class EntitlementRevoke:
+    """Dados para revogação de acesso."""
+    entitlement_id: str
+    revoked_by: str = "system"
+    revoke_reason: str = "payment_refunded"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EntitlementResult:
+    """Resultado de uma operação de entitlement."""
+    success: bool
+    action: EntitlementAction
+    entitlement_id: Optional[str] = None
+    user_id: Optional[int] = None
+    bot_id: Optional[str] = None
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    errors: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "action": self.action.value,
+            "entitlement_id": self.entitlement_id,
+            "user_id": self.user_id,
+            "bot_id": self.bot_id,
+            "timestamp": self.timestamp.isoformat(),
+            "metadata": self.metadata,
+            "errors": self.errors
+        }
+
+
+class EntitlementEngine:
+    """
+    Engine de entitlements - fonte única da verdade para permissões.
+    Stateless, idempotente, com auditoria completa.
+    """
+    
+    def __init__(self):
+        # Cache de entitlements ativos por user+bot (opcional, para performance)
+        self._active_entitlements_cache: Dict[str, Set[str]] = {}
+        
+        # Configuração de expiração padrão baseada em tipo de oferta
+        self._default_expirations = {
+            "one_time": timedelta(days=365 * 10),  # 10 anos para acesso vitalício
+            "subscription": None,  # Segue ciclo da assinatura
+            "trial": timedelta(days=7),
+            "bonus": timedelta(days=30),
+        }
+    
+    @with_idempotency(key_fields=["user_id", "bot_id", "offer_id", "payment_intent_id", "action"])
+    async def grant_access(
+        self,
+        user_id: int,
+        bot_id: str,
+        offer_id: str,
+        payment_intent_id: str,
+        fingerprint: str,
+        granted_by: str = "system",
+        grant_reason: str = "payment_confirmed",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> EntitlementResult:
+        """
+        Concede acesso baseado em pagamento confirmado.
+        
+        Args:
+            user_id: ID do usuário
+            bot_id: ID do bot
+            offer_id: ID da oferta
+            payment_intent_id: ID do payment intent confirmado
+            fingerprint: Fingerprint do usuário
+            granted_by: Quem concedeu o acesso
+            grant_reason: Motivo da concessão
+            metadata: Metadados adicionais
+            
+        Returns:
+            EntitlementResult com resultado da operação
+        """
+        start_time = datetime.utcnow()
+        metadata = metadata or {}
+        
+        try:
+            # 1. Validar dados de entrada
+            validation_result = await self._validate_grant_request(
+                user_id=user_id,
+                bot_id=bot_id,
+                offer_id=offer_id,
+                payment_intent_id=payment_intent_id,
+                fingerprint=fingerprint
+            )
+            
+            if not validation_result["is_valid"]:
+                return EntitlementResult(
+                    success=False,
+                    action=EntitlementAction.GRANT,
+                    user_id=user_id,
+                    bot_id=bot_id,
+                    timestamp=datetime.utcnow(),
+                    errors=validation_result["errors"],
+                    metadata=validation_result["metadata"]
+                )
+            
+            # 2. Preparar dados do grant
+            grant = EntitlementGrant(
+                user_id=user_id,
+                bot_id=bot_id,
+                offer_id=offer_id,
+                payment_intent_id=payment_intent_id,
+                fingerprint=fingerprint,
+                granted_by=granted_by,
+                grant_reason=grant_reason,
+                metadata=metadata
+            )
+            
+            # 3. Calcular expiração (se aplicável)
+            grant = await self._calculate_expiration(grant)
+            
+            # 4. Verificar se já existe entitlement ativo para mesma oferta
+            existing_entitlement = await self._get_existing_active_entitlement(grant)
+            
+            if existing_entitlement:
+                # Se já existe, podemos estender ou atualizar
+                return await self._handle_existing_entitlement(
+                    existing_entitlement=existing_entitlement,
+                    grant=grant
+                )
+            
+            # 5. Criar novo entitlement
+            entitlement = await self._create_entitlement(grant)
+            
+            # 6. Registrar auditoria
+            await self._audit_grant(
+                entitlement=entitlement,
+                grant=grant,
+                start_time=start_time
+            )
+            
+            # 7. Atualizar cache (se usando)
+            self._update_cache(
+                user_id=user_id,
+                bot_id=bot_id,
+                entitlement_id=entitlement.id,
+                action="add"
+            )
+            
+            # 8. Enfileirar tarefas pós-grant
+            await self._enqueue_post_grant_tasks(entitlement)
+            
+            logger.info(
+                f"Access granted - User: {user_id}, Bot: {bot_id}, "
+                f"Offer: {offer_id}, Entitlement: {entitlement.id}"
+            )
+            
+            return EntitlementResult(
+                success=True,
+                action=EntitlementAction.GRANT,
+                entitlement_id=entitlement.id,
+                user_id=user_id,
+                bot_id=bot_id,
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "entitlement_id": entitlement.id,
+                    "expires_at": entitlement.expires_at.isoformat() if entitlement.expires_at else None,
+                    "scope": entitlement.scope.value,
+                    "type": entitlement.type.value,
+                    "processing_time": (datetime.utcnow() - start_time).total_seconds()
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error granting access - User: {user_id}, Bot: {bot_id}, "
+                f"Offer: {offer_id}, Error: {e}",
+                exc_info=True
+            )
+            
+            await self._log_entitlement_error(
+                action=EntitlementAction.GRANT.value,
+                user_id=user_id,
+                bot_id=bot_id,
+                error=str(e),
+                metadata=metadata
+            )
+            
+            return EntitlementResult(
+                success=False,
+                action=EntitlementAction.GRANT,
+                user_id=user_id,
+                bot_id=bot_id,
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def _validate_grant_request(
+        self,
+        user_id: int,
+        bot_id: str,
+        offer_id: str,
+        payment_intent_id: str,
+        fingerprint: str
+    ) -> Dict[str, Any]:
+        """
+        Valida requisição de grant.
+        """
+        errors = []
+        metadata = {}
+        
+        # 1. Verificar se usuário existe
+        user = await User.get_by_id(user_id)
+        if not user:
+            errors.append(f"Usuário não encontrado: {user_id}")
+        
+        # 2. Verificar se payment intent existe e está pago
+        payment_intent = await PaymentIntent.get_by_id(payment_intent_id)
+        if not payment_intent:
+            errors.append(f"PaymentIntent não encontrado: {payment_intent_id}")
+        else:
+            if payment_intent.status != "paid":
+                errors.append(f"PaymentIntent não está pago (status: {payment_intent.status})")
+                metadata["payment_intent_status"] = payment_intent.status
+            
+            # Verificar se fingerprint corresponde
+            if payment_intent.fingerprint != fingerprint:
+                errors.append("Fingerprint não corresponde ao PaymentIntent")
+                metadata["fingerprint_mismatch"] = True
+        
+        # 3. Verificar se oferta existe
+        offer = await Offer.get_by_id(offer_id)
+        if not offer:
+            errors.append(f"Oferta não encontrada: {offer_id}")
+        else:
+            metadata["offer_type"] = offer.type
+            metadata["is_recurring"] = offer.is_recurring
+        
+        # 4. Verificar se o payment intent está associado à oferta correta
+        if payment_intent and offer and payment_intent.offer_id != offer_id:
+            errors.append(
+                f"PaymentIntent associado à oferta diferente: "
+                f"{payment_intent.offer_id} != {offer_id}"
+            )
+        
+        # 5. Verificar se usuário não está bloqueado (antifraude)
+        # (Em produção, integrar com antifraud engine)
+        
+        return {
+            "is_valid": len(errors) == 0,
+            "errors": errors,
+            "metadata": metadata
+        }
+    
+    async def _calculate_expiration(self, grant: EntitlementGrant) -> EntitlementGrant:
+        """
+        Calcula data de expiração baseada no tipo de oferta.
+        """
+        try:
+            offer = await Offer.get_by_id(grant.offer_id)
+            if not offer:
+                return grant
+            
+            # Se já tem expiração customizada, usar
+            if grant.custom_duration_days:
+                grant.expires_at = datetime.utcnow() + timedelta(days=grant.custom_duration_days)
+                return grant
+            
+            # Se a oferta tem expiração definida, usar
+            if offer.access_duration_days:
+                grant.expires_at = datetime.utcnow() + timedelta(days=offer.access_duration_days)
+                return grant
+            
+            # Usar expiração padrão baseada no tipo
+            default_expiration = self._default_expirations.get(
+                offer.type if offer.type else "one_time"
+            )
+            
+            if default_expiration:
+                grant.expires_at = datetime.utcnow() + default_expiration
+            
+            return grant
+            
+        except Exception as e:
+            logger.error(f"Error calculating expiration: {e}")
+            return grant
+    
+    async def _get_existing_active_entitlement(
+        self,
+        grant: EntitlementGrant
+    ) -> Optional[Entitlement]:
+        """
+        Busca entitlement ativo existente para mesma oferta.
+        """
+        try:
+            return await Entitlement.get_active_entitlement(
+                user_id=grant.user_id,
+                bot_id=grant.bot_id,
+                offer_id=grant.offer_id
+            )
+        except Exception as e:
+            logger.error(f"Error getting existing entitlement: {e}")
+            return None
+    
+    async def _handle_existing_entitlement(
+        self,
+        existing_entitlement: Entitlement,
+        grant: EntitlementGrant
+    ) -> EntitlementResult:
+        """
+        Lida com entitlement existente (extensão, upgrade, etc).
+        """
+        # Se já existe um entitlement ativo para mesma oferta, podemos:
+        # 1. Estender expiração
+        # 2. Fazer upgrade/downgrade
+        # 3. Ignorar (idempotência)
+        
+        # Por enquanto, vamos apenas estender se a nova expiração for maior
+        if grant.expires_at and existing_entitlement.expires_at:
+            if grant.expires_at > existing_entitlement.expires_at:
+                # Estender entitlement existente
+                await existing_entitlement.extend(
+                    new_expires_at=grant.expires_at,
+                    extended_by=grant.granted_by,
+                    extension_reason=f"renewal_{grant.grant_reason}",
+                    metadata={
+                        "original_entitlement_id": existing_entitlement.id,
+                        "new_payment_intent_id": grant.payment_intent_id,
+                        **grant.metadata
+                    }
+                )
+                
+                await audit_logger.log_async(
+                    resource_type="entitlement",
+                    resource_id=existing_entitlement.id,
+                    action="extended",
+                    actor=grant.granted_by,
+                    description=f"Entitlement estendido via {grant.grant_reason}",
+                    metadata={
+                        "old_expires_at": existing_entitlement.expires_at.isoformat(),
+                        "new_expires_at": grant.expires_at.isoformat(),
+                        "payment_intent_id": grant.payment_intent_id,
+                        "fingerprint": grant.fingerprint
+                    }
+                )
+                
+                logger.info(
+                    f"Existing entitlement extended - "
+                    f"Entitlement: {existing_entitlement.id}, "
+                    f"New expiry: {grant.expires_at}"
+                )
+                
+                return EntitlementResult(
+                    success=True,
+                    action=EntitlementAction.EXTEND,
+                    entitlement_id=existing_entitlement.id,
+                    user_id=grant.user_id,
+                    bot_id=grant.bot_id,
+                    timestamp=datetime.utcnow(),
+                    metadata={
+                        "entitlement_id": existing_entitlement.id,
+                        "old_expires_at": existing_entitlement.expires_at.isoformat(),
+                        "new_expires_at": grant.expires_at.isoformat(),
+                        "extended_by": grant.granted_by
+                    }
+                )
+        
+        # Se não precisou estender, retornar sucesso (idempotência)
+        return EntitlementResult(
+            success=True,
+            action=EntitlementAction.GRANT,
+            entitlement_id=existing_entitlement.id,
+            user_id=grant.user_id,
+            bot_id=grant.bot_id,
+            timestamp=datetime.utcnow(),
+            metadata={
+                "entitlement_id": existing_entitlement.id,
+                "already_active": True,
+                "expires_at": existing_entitlement.expires_at.isoformat() if existing_entitlement.expires_at else None
+            }
+        )
+    
+    async def _create_entitlement(self, grant: EntitlementGrant) -> Entitlement:
+        """
+        Cria novo entitlement no banco de dados.
+        """
+        # Buscar dados da oferta para determinar scope e type
+        offer = await Offer.get_by_id(grant.offer_id)
+        if not offer:
+            raise EntitlementError(f"Oferta não encontrada: {grant.offer_id}")
+        
+        # Determinar scope baseado na oferta
+        scope = self._determine_scope(offer)
+        
+        # Determinar type baseado na oferta
+        entitlement_type = self._determine_type(offer)
+        
+        # Criar entitlement
+        entitlement_data = {
+            "user_id": grant.user_id,
+            "bot_id": grant.bot_id,
+            "offer_id": grant.offer_id,
+            "payment_intent_id": grant.payment_intent_id,
+            "fingerprint": grant.fingerprint,
+            "status": EntitlementStatus.ACTIVE.value,
+            "scope": scope.value,
+            "type": entitlement_type.value,
+            "granted_at": datetime.utcnow(),
+            "granted_by": grant.granted_by,
+            "grant_reason": grant.grant_reason,
+            "expires_at": grant.expires_at,
+            "metadata": {
+                "offer_name": offer.name,
+                "offer_description": offer.description,
+                "offer_type": offer.type,
+                "is_recurring": offer.is_recurring,
+                "fingerprint": grant.fingerprint,
+                **grant.metadata
+            }
+        }
+        
+        entitlement = await Entitlement.create(**entitlement_data)
+        
+        return entitlement
+    
+    def _determine_scope(self, offer: Offer) -> EntitlementScope:
+        """Determina o scope baseado na oferta."""
+        # Em produção, isso viria da configuração da oferta
+        # Por enquanto, lógica simples
+        
+        if offer.type == "global":
+            return EntitlementScope.GLOBAL
+        elif offer.type == "feature":
+            return EntitlementScope.FEATURE
+        else:
+            return EntitlementScope.BOT
+    
+    def _determine_type(self, offer: Offer) -> EntitlementType:
+        """Determina o tipo baseado na oferta."""
+        if offer.is_recurring:
+            return EntitlementType.SUBSCRIPTION
+        elif offer.type == "trial":
+            return EntitlementType.TRIAL
+        elif offer.type == "bonus":
+            return EntitlementType.BONUS
+        else:
+            return EntitlementType.ONE_TIME
+    
+    async def _audit_grant(
+        self,
+        entitlement: Entitlement,
+        grant: EntitlementGrant,
+        start_time: datetime
+    ) -> None:
+        """Registra auditoria da concessão de acesso."""
+        try:
+            processing_time = (datetime.utcnow() - start_time).total_seconds()
+            
+            await audit_logger.log_async(
+                resource_type="entitlement",
+                resource_id=entitlement.id,
+                action="granted",
+                actor=grant.granted_by,
+                description=f"Acesso concedido via {grant.grant_reason}",
+                metadata={
+                    "user_id": grant.user_id,
+                    "bot_id": grant.bot_id,
+                    "offer_id": grant.offer_id,
+                    "payment_intent_id": grant.payment_intent_id,
+                    "scope": entitlement.scope.value,
+                    "type": entitlement.type.value,
+                    "expires_at": entitlement.expires_at.isoformat() if entitlement.expires_at else None,
+                    "processing_time": processing_time,
+                    "fingerprint": grant.fingerprint
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error auditing grant: {e}")
+    
+    def _update_cache(
+        self,
+        user_id: int,
+        bot_id: str,
+        entitlement_id: str,
+        action: str  # "add" ou "remove"
+    ) -> None:
+        """Atualiza cache de entitlements ativos."""
+        cache_key = f"{user_id}:{bot_id}"
+        
+        if action == "add":
+            if cache_key not in self._active_entitlements_cache:
+                self._active_entitlements_cache[cache_key] = set()
+            self._active_entitlements_cache[cache_key].add(entitlement_id)
+        
+        elif action == "remove":
+            if cache_key in self._active_entitlements_cache:
+                self._active_entitlements_cache[cache_key].discard(entitlement_id)
+                if not self._active_entitlements_cache[cache_key]:
+                    del self._active_entitlements_cache[cache_key]
+    
+    async def _enqueue_post_grant_tasks(self, entitlement: Entitlement) -> None:
+        """Enfileira tarefas pós-concessão."""
+        # 1. Enviar notificação de acesso concedido
+        await enqueue_entitlement_task(
+            task_type="send_access_granted_notification",
+            entitlement_id=entitlement.id,
+            user_id=entitlement.user_id,
+            bot_id=entitlement.bot_id,
+            offer_id=entitlement.offer_id
+        )
+        
+        # 2. Enfileirar verificação de expiração futura
+        if entitlement.expires_at:
+            expires_in = (entitlement.expires_at - datetime.utcnow()).total_seconds()
+            if expires_in > 0:
+                await enqueue_entitlement_task(
+                    task_type="schedule_expiration_check",
+                    entitlement_id=entitlement.id,
+                    check_at=entitlement.expires_at.isoformat(),
+                    delay_seconds=int(expires_in)
+                )
+        
+        # 3. Atualizar métricas
+        await enqueue_entitlement_task(
+            task_type="update_access_metrics",
+            user_id=entitlement.user_id,
+            bot_id=entitlement.bot_id,
+            entitlement_type=entitlement.type.value
+        )
+    
+    @with_idempotency(key_fields=["entitlement_id", "action"])
+    async def revoke_access(
+        self,
+        entitlement_id: str,
+        revoked_by: str = "system",
+        revoke_reason: str = "payment_refunded",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> EntitlementResult:
+        """
+        Revoga acesso (por refund, chargeback, admin action, etc).
+        
+        Args:
+            entitlement_id: ID do entitlement
+            revoked_by: Quem revogou o acesso
+            revoke_reason: Motivo da revogação
+            metadata: Metadados adicionais
+            
+        Returns:
+            EntitlementResult com resultado da operação
+        """
+        metadata = metadata or {}
+        
+        try:
+            # 1. Buscar entitlement
+            entitlement = await Entitlement.get_by_id(entitlement_id)
+            if not entitlement:
+                return EntitlementResult(
+                    success=False,
+                    action=EntitlementAction.REVOKE,
+                    entitlement_id=entitlement_id,
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Entitlement não encontrado: {entitlement_id}"]
+                )
+            
+            # 2. Validar se pode ser revogado
+            if entitlement.status != EntitlementStatus.ACTIVE.value:
+                return EntitlementResult(
+                    success=True,  # Já está revogado/suspenso
+                    action=EntitlementAction.REVOKE,
+                    entitlement_id=entitlement_id,
+                    user_id=entitlement.user_id,
+                    bot_id=entitlement.bot_id,
+                    timestamp=datetime.utcnow(),
+                    metadata={
+                        "already_revoked": True,
+                        "current_status": entitlement.status
+                    }
+                )
+            
+            # 3. Criar revogação
+            revoke = EntitlementRevoke(
+                entitlement_id=entitlement_id,
+                revoked_by=revoked_by,
+                revoke_reason=revoke_reason,
+                metadata=metadata
+            )
+            
+            # 4. Revogar entitlement
+            await entitlement.revoke(
+                revoked_by=revoked_by,
+                revoke_reason=revoke_reason,
+                metadata={
+                    "revoked_at": datetime.utcnow().isoformat(),
+                    **metadata
+                }
+            )
+            
+            # 5. Registrar auditoria
+            await self._audit_revoke(entitlement, revoke)
+            
+            # 6. Atualizar cache
+            self._update_cache(
+                user_id=entitlement.user_id,
+                bot_id=entitlement.bot_id,
+                entitlement_id=entitlement_id,
+                action="remove"
+            )
+            
+            # 7. Enfileirar tarefas pós-revogação
+            await self._enqueue_post_revoke_tasks(entitlement, revoke)
+            
+            logger.info(
+                f"Access revoked - Entitlement: {entitlement_id}, "
+                f"Reason: {revoke_reason}, By: {revoked_by}"
+            )
+            
+            return EntitlementResult(
+                success=True,
+                action=EntitlementAction.REVOKE,
+                entitlement_id=entitlement_id,
+                user_id=entitlement.user_id,
+                bot_id=entitlement.bot_id,
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "entitlement_id": entitlement_id,
+                    "revoked_by": revoked_by,
+                    "revoke_reason": revoke_reason,
+                    "previous_status": EntitlementStatus.ACTIVE.value
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error revoking access for entitlement {entitlement_id}: {e}",
+                exc_info=True
+            )
+            
+            await self._log_entitlement_error(
+                action=EntitlementAction.REVOKE.value,
+                entitlement_id=entitlement_id,
+                error=str(e),
+                metadata=metadata
+            )
+            
+            return EntitlementResult(
+                success=False,
+                action=EntitlementAction.REVOKE,
+                entitlement_id=entitlement_id,
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def _audit_revoke(
+        self,
+        entitlement: Entitlement,
+        revoke: EntitlementRevoke
+    ) -> None:
+        """Registra auditoria da revogação de acesso."""
+        try:
+            await audit_logger.log_async(
+                resource_type="entitlement",
+                resource_id=entitlement.id,
+                action="revoked",
+                actor=revoke.revoked_by,
+                description=f"Acesso revogado: {revoke.revoke_reason}",
+                metadata={
+                    "user_id": entitlement.user_id,
+                    "bot_id": entitlement.bot_id,
+                    "offer_id": entitlement.offer_id,
+                    "payment_intent_id": entitlement.payment_intent_id,
+                    "scope": entitlement.scope.value,
+                    "type": entitlement.type.value,
+                    "granted_at": entitlement.granted_at.isoformat() if entitlement.granted_at else None,
+                    "expires_at": entitlement.expires_at.isoformat() if entitlement.expires_at else None,
+                    "revoke_reason": revoke.revoke_reason,
+                    "fingerprint": entitlement.fingerprint,
+                    **revoke.metadata
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error auditing revoke: {e}")
+    
+    async def _enqueue_post_revoke_tasks(
+        self,
+        entitlement: Entitlement,
+        revoke: EntitlementRevoke
+    ) -> None:
+        """Enfileira tarefas pós-revogação."""
+        # 1. Enviar notificação de acesso revogado
+        await enqueue_entitlement_task(
+            task_type="send_access_revoked_notification",
+            entitlement_id=entitlement.id,
+            user_id=entitlement.user_id,
+            bot_id=entitlement.bot_id,
+            revoke_reason=revoke.revoke_reason
+        )
+        
+        # 2. Cancelar verificação de expiração agendada
+        await enqueue_entitlement_task(
+            task_type="cancel_scheduled_expiration_check",
+            entitlement_id=entitlement.id
+        )
+        
+        # 3. Atualizar métricas
+        await enqueue_entitlement_task(
+            task_type="update_revocation_metrics",
+            user_id=entitlement.user_id,
+            bot_id=entitlement.bot_id,
+            revoke_reason=revoke.revoke_reason
+        )
+    
+    async def suspend_access(
+        self,
+        entitlement_id: str,
+        suspended_by: str = "system",
+        suspend_reason: str = "dispute_opened",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> EntitlementResult:
+        """
+        Suspende acesso temporariamente (ex: durante disputas).
+        
+        Args:
+            entitlement_id: ID do entitlement
+            suspended_by: Quem suspendeu
+            suspend_reason: Motivo da suspensão
+            metadata: Metadados adicionais
+            
+        Returns:
+            EntitlementResult com resultado da operação
+        """
+        metadata = metadata or {}
+        
+        try:
+            entitlement = await Entitlement.get_by_id(entitlement_id)
+            if not entitlement:
+                return EntitlementResult(
+                    success=False,
+                    action=EntitlementAction.SUSPEND,
+                    entitlement_id=entitlement_id,
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Entitlement não encontrado: {entitlement_id}"]
+                )
+            
+            # Verificar se já está suspenso
+            if entitlement.status == EntitlementStatus.SUSPENDED.value:
+                return EntitlementResult(
+                    success=True,
+                    action=EntitlementAction.SUSPEND,
+                    entitlement_id=entitlement_id,
+                    user_id=entitlement.user_id,
+                    bot_id=entitlement.bot_id,
+                    timestamp=datetime.utcnow(),
+                    metadata={
+                        "already_suspended": True,
+                        "suspended_since": entitlement.updated_at.isoformat() if entitlement.updated_at else None
+                    }
+                )
+            
+            # Suspender
+            await entitlement.suspend(
+                suspended_by=suspended_by,
+                suspend_reason=suspend_reason,
+                metadata=metadata
+            )
+            
+            # Atualizar cache
+            self._update_cache(
+                user_id=entitlement.user_id,
+                bot_id=entitlement.bot_id,
+                entitlement_id=entitlement_id,
+                action="remove"
+            )
+            
+            await audit_logger.log_async(
+                resource_type="entitlement",
+                resource_id=entitlement_id,
+                action="suspended",
+                actor=suspended_by,
+                description=f"Acesso suspenso: {suspend_reason}",
+                metadata={
+                    "user_id": entitlement.user_id,
+                    "bot_id": entitlement.bot_id,
+                    "suspend_reason": suspend_reason,
+                    **metadata
+                }
+            )
+            
+            # Enfileirar notificação
+            await enqueue_entitlement_task(
+                task_type="send_access_suspended_notification",
+                entitlement_id=entitlement_id,
+                user_id=entitlement.user_id,
+                bot_id=entitlement.bot_id,
+                suspend_reason=suspend_reason
+            )
+            
+            logger.info(
+                f"Access suspended - Entitlement: {entitlement_id}, "
+                f"Reason: {suspend_reason}"
+            )
+            
+            return EntitlementResult(
+                success=True,
+                action=EntitlementAction.SUSPEND,
+                entitlement_id=entitlement_id,
+                user_id=entitlement.user_id,
+                bot_id=entitlement.bot_id,
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "entitlement_id": entitlement_id,
+                    "suspended_by": suspended_by,
+                    "suspend_reason": suspend_reason,
+                    "previous_status": entitlement.status
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error suspending access for entitlement {entitlement_id}: {e}",
+                exc_info=True
+            )
+            
+            return EntitlementResult(
+                success=False,
+                action=EntitlementAction.SUSPEND,
+                entitlement_id=entitlement_id,
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def reactivate_access(
+        self,
+        entitlement_id: str,
+        reactivated_by: str = "system",
+        reactivate_reason: str = "dispute_closed",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> EntitlementResult:
+        """
+        Reativa acesso previamente suspenso.
+        
+        Args:
+            entitlement_id: ID do entitlement
+            reactivated_by: Quem reativou
+            reactivate_reason: Motivo da reativação
+            metadata: Metadados adicionais
+            
+        Returns:
+            EntitlementResult com resultado da operação
+        """
+        metadata = metadata or {}
+        
+        try:
+            entitlement = await Entitlement.get_by_id(entitlement_id)
+            if not entitlement:
+                return EntitlementResult(
+                    success=False,
+                    action=EntitlementAction.REACTIVATE,
+                    entitlement_id=entitlement_id,
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Entitlement não encontrado: {entitlement_id}"]
+                )
+            
+            # Verificar se está suspenso
+            if entitlement.status != EntitlementStatus.SUSPENDED.value:
+                return EntitlementResult(
+                    success=False,
+                    action=EntitlementAction.REACTIVATE,
+                    entitlement_id=entitlement_id,
+                    user_id=entitlement.user_id,
+                    bot_id=entitlement.bot_id,
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Entitlement não está suspenso (status: {entitlement.status})"]
+                )
+            
+            # Reativar
+            await entitlement.reactivate(
+                reactivated_by=reactivated_by,
+                reactivate_reason=reactivate_reason,
+                metadata=metadata
+            )
+            
+            # Atualizar cache
+            self._update_cache(
+                user_id=entitlement.user_id,
+                bot_id=entitlement.bot_id,
+                entitlement_id=entitlement_id,
+                action="add"
+            )
+            
+            await audit_logger.log_async(
+                resource_type="entitlement",
+                resource_id=entitlement_id,
+                action="reactivated",
+                actor=reactivated_by,
+                description=f"Acesso reativado: {reactivate_reason}",
+                metadata={
+                    "user_id": entitlement.user_id,
+                    "bot_id": entitlement.bot_id,
+                    "reactivate_reason": reactivate_reason,
+                    **metadata
+                }
+            )
+            
+            # Enfileirar notificação
+            await enqueue_entitlement_task(
+                task_type="send_access_reactivated_notification",
+                entitlement_id=entitlement_id,
+                user_id=entitlement.user_id,
+                bot_id=entitlement.bot_id,
+                reactivate_reason=reactivate_reason
+            )
+            
+            logger.info(
+                f"Access reactivated - Entitlement: {entitlement_id}, "
+                f"Reason: {reactivate_reason}"
+            )
+            
+            return EntitlementResult(
+                success=True,
+                action=EntitlementAction.REACTIVATE,
+                entitlement_id=entitlement_id,
+                user_id=entitlement.user_id,
+                bot_id=entitlement.bot_id,
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "entitlement_id": entitlement_id,
+                    "reactivated_by": reactivated_by,
+                    "reactivate_reason": reactivate_reason
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error reactivating access for entitlement {entitlement_id}: {e}",
+                exc_info=True
+            )
+            
+            return EntitlementResult(
+                success=False,
+                action=EntitlementAction.REACTIVATE,
+                entitlement_id=entitlement_id,
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def generate_access_link(
+        self,
+        user_id: int,
+        bot_id: str,
+        offer_id: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Gera link de acesso único e expirável.
+        
+        Args:
+            user_id: ID do usuário
+            bot_id: ID do bot
+            offer_id: ID específico da oferta (opcional)
+            
+        Returns:
+            Link de acesso ou None se não tiver acesso
+        """
+        try:
+            # Verificar se usuário tem acesso
+            has_access = await self.check_access(
+                user_id=user_id,
+                bot_id=bot_id,
+                offer_id=offer_id
+            )
+            
+            if not has_access:
+                return None
+            
+            # Gerar token único
+            import secrets
+            token = secrets.token_urlsafe(32)
+            
+            # Calcular expiração (24 horas)
+            expires_at = datetime.utcnow() + timedelta(hours=24)
+            
+            # Em produção, salvaríamos no banco
+            # Por enquanto, retornar link mockado
+            base_url = "https://access.platform.com"
+            link = f"{base_url}/access/{token}?user={user_id}&bot={bot_id}"
+            
+            if offer_id:
+                link += f"&offer={offer_id}"
+            
+            # Registrar geração de link
+            await audit_logger.log_async(
+                resource_type="access_link",
+                resource_id=token[:16],
+                action="generated",
+                actor="system",
+                description=f"Link de acesso gerado para user {user_id}",
+                metadata={
+                    "user_id": user_id,
+                    "bot_id": bot_id,
+                    "offer_id": offer_id,
+                    "expires_at": expires_at.isoformat(),
+                    "link_hash": hashlib.sha256(link.encode()).hexdigest()[:16]
+                }
+            )
+            
+            return link
+            
+        except Exception as e:
+            logger.error(f"Error generating access link: {e}")
+            return None
+    
+    async def check_access(
+        self,
+        user_id: int,
+        bot_id: str,
+        offer_id: Optional[str] = None
+    ) -> bool:
+        """
+        Verifica se usuário tem acesso ativo.
+        Uso pelo EntitlementResolver (READ-SIDE).
+        
+        Args:
+            user_id: ID do usuário
+            bot_id: ID do bot
+            offer_id: ID específico da oferta (opcional)
+            
+        Returns:
+            True se tem acesso ativo, False caso contrário
+        """
+        try:
+            # Verificar cache primeiro
+            cache_key = f"{user_id}:{bot_id}"
+            if cache_key in self._active_entitlements_cache and not offer_id:
+                # Tem algum entitlement ativo para este user+bot
+                return True
+            
+            # Buscar no banco
+            if offer_id:
+                # Verificar acesso específico à oferta
+                entitlement = await Entitlement.get_active_entitlement(
+                    user_id=user_id,
+                    bot_id=bot_id,
+                    offer_id=offer_id
+                )
+                return entitlement is not None
+            else:
+                # Verificar se tem qualquer acesso ativo para este bot
+                entitlements = await Entitlement.get_active_entitlements(
+                    user_id=user_id,
+                    bot_id=bot_id
+                )
+                return len(entitlements) > 0
+            
+        except Exception as e:
+            logger.error(f"Error checking access: {e}")
+            return False
+    
+    async def get_user_entitlements(
+        self,
+        user_id: int,
+        bot_id: Optional[str] = None,
+        include_inactive: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Retorna todos os entitlements do usuário.
+        
+        Args:
+            user_id: ID do usuário
+            bot_id: Filtrar por bot (opcional)
+            include_inactive: Incluir entitlements inativos
+            
+        Returns:
+            Lista de entitlements
+        """
+        try:
+            filters = {"user_id": user_id}
+            if bot_id:
+                filters["bot_id"] = bot_id
+            
+            if not include_inactive:
+                filters["status"] = EntitlementStatus.ACTIVE.value
+            
+            entitlements = await Entitlement.filter(**filters)
+            
+            return [
+                {
+                    "id": e.id,
+                    "bot_id": e.bot_id,
+                    "offer_id": e.offer_id,
+                    "status": e.status,
+                    "scope": e.scope.value,
+                    "type": e.type.value,
+                    "granted_at": e.granted_at.isoformat() if e.granted_at else None,
+                    "expires_at": e.expires_at.isoformat() if e.expires_at else None,
+                    "revoked_at": e.revoked_at.isoformat() if e.revoked_at else None,
+                    "grant_reason": e.grant_reason,
+                    "revoke_reason": e.revoke_reason,
+                    "metadata": e.metadata
+                }
+                for e in entitlements
+            ]
+            
+        except Exception as e:
+            logger.error(f"Error getting user entitlements: {e}")
+            return []
+    
+    async def cleanup_expired_entitlements(self) -> int:
+        """
+        Revoga automaticamente entitlements expirados.
+        
+        Returns:
+            Número de entitlements expirados revogados
+        """
+        try:
+            expired_entitlements = await Entitlement.get_expired_entitlements()
+            
+            revoked_count = 0
+            for entitlement in expired_entitlements:
+                result = await self.revoke_access(
+                    entitlement_id=entitlement.id,
+                    revoked_by="system",
+                    revoke_reason="auto_expired"
+                )
+                
+                if result.success:
+                    revoked_count += 1
+            
+            if revoked_count > 0:
+                logger.info(f"Auto-revoked {revoked_count} expired entitlements")
+            
+            return revoked_count
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up expired entitlements: {e}")
+            return 0
+    
+    async def _log_entitlement_error(
+        self,
+        action: str,
+        error: str,
+        metadata: Dict[str, Any],
+        user_id: Optional[int] = None,
+        bot_id: Optional[str] = None,
+        entitlement_id: Optional[str] = None
+    ) -> None:
+        """Registra erro de entitlement para auditoria."""
+        try:
+            resource_id = entitlement_id or f"{user_id}_{bot_id}_{action}"
+            
+            await audit_logger.log_async(
+                resource_type="entitlement_error",
+                resource_id=resource_id,
+                action="error",
+                actor="system",
+                description=f"Erro no entitlement: {action} - {error}",
+                metadata={
+                    "action": action,
+                    "error": error,
+                    "user_id": user_id,
+                    "bot_id": bot_id,
+                    "entitlement_id": entitlement_id,
+                    **metadata
+                },
+                severity="error"
+            )
+        except Exception as e:
+            logger.error(f"Error logging entitlement error: {e}")
+
+
+# Factory para criação do EntitlementEngine
+def create_entitlement_engine() -> EntitlementEngine:
+    """Cria uma instância configurada do EntitlementEngine."""
+    return EntitlementEngine()
+
+
+# Singleton para uso global (opcional)
+_entitlement_engine_instance: Optional[EntitlementEngine] = None
+
+def get_entitlement_engine() -> EntitlementEngine:
+    """Retorna instância singleton do EntitlementEngine."""
+    global _entitlement_engine_instance
+    if _entitlement_engine_instance is None:
+        _entitlement_engine_instance = create_entitlement_engine()
+    return _entitlement_engine_instance

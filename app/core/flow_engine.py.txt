@@ -1,0 +1,984 @@
+# app/core/flow_engine.py
+"""
+Motor central de fluxos multi-bot.
+Orquestra a interação do usuário com o sistema, independente do bot de entrada.
+Stateless, multi-tenancy, preparado para alta concorrência.
+"""
+
+import enum
+import json
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+import asyncio
+from functools import lru_cache
+
+from app.core.state_machine import StateMachineEngine, StateTransitionError
+from app.core.geo_resolver import GeoResolver, GeoRegion
+from app.core.antifraud import AntifraudEngine, FraudScore
+from app.models.flow_state import FlowState, FlowStep
+from app.models.user import User
+from app.models.bot import Bot
+from app.models.offer import Offer
+from app.models.payment_intent import PaymentIntent, PaymentIntentState
+from app.core.audit_logger import audit_logger
+from app.core.entitlement_engine import EntitlementEngine
+from app.core.notification_engine import NotificationEngine
+from app.utils.fingerprint import generate_user_fingerprint
+from app.utils.idempotency import with_idempotency
+from app.queue.tasks import enqueue_flow_task
+
+logger = logging.getLogger(__name__)
+
+
+class FlowStepType(Enum):
+    """Tipos de passo no fluxo."""
+    MESSAGE = "message"
+    VIDEO = "video"
+    BUTTONS = "buttons"
+    PAYMENT_CHOICE = "payment_choice"
+    PAYMENT_INSTRUCTIONS = "payment_instructions"
+    ACCESS_GRANT = "access_grant"
+    TRACKING = "tracking"
+    ANTIFRAUD_CHECK = "antifraud_check"
+    WAIT = "wait"
+
+
+class FlowAction(Enum):
+    """Ações que podem ser disparadas pelo fluxo."""
+    SHOW_OFFER = "show_offer"
+    REQUEST_PAYMENT = "request_payment"
+    GRANT_ACCESS = "grant_access"
+    SEND_NOTIFICATION = "send_notification"
+    TRACK_EVENT = "track_event"
+    CHECK_ANTIFRAUD = "check_antifraud"
+    UPDATE_USER = "update_user"
+
+
+@dataclass
+class FlowContext:
+    """Contexto completo do fluxo em execução."""
+    flow_id: str
+    bot_id: str
+    user_id: int
+    user_fingerprint: str
+    current_step: str
+    next_step: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    region: Optional[GeoRegion] = None
+    fraud_score: Optional[FraudScore] = None
+    payment_intent_id: Optional[str] = None
+    offer_id: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte contexto para dicionário serializável."""
+        return {
+            "flow_id": self.flow_id,
+            "bot_id": self.bot_id,
+            "user_id": self.user_id,
+            "user_fingerprint": self.user_fingerprint,
+            "current_step": self.current_step,
+            "next_step": self.next_step,
+            "metadata": self.metadata,
+            "region": self.region.value if self.region else None,
+            "fraud_score": self.fraud_score.value if self.fraud_score else None,
+            "payment_intent_id": self.payment_intent_id,
+            "offer_id": self.offer_id,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat()
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FlowContext":
+        """Cria contexto a partir de dicionário."""
+        context = cls(
+            flow_id=data["flow_id"],
+            bot_id=data["bot_id"],
+            user_id=data["user_id"],
+            user_fingerprint=data["user_fingerprint"],
+            current_step=data["current_step"],
+            next_step=data.get("next_step"),
+            metadata=data.get("metadata", {}),
+            payment_intent_id=data.get("payment_intent_id"),
+            offer_id=data.get("offer_id"),
+            created_at=datetime.fromisoformat(data["created_at"]),
+            updated_at=datetime.fromisoformat(data["updated_at"])
+        )
+        
+        if data.get("region"):
+            context.region = GeoRegion(data["region"])
+        if data.get("fraud_score"):
+            context.fraud_score = FraudScore(data["fraud_score"])
+        
+        return context
+
+
+class FlowEngine:
+    """
+    Motor de fluxos multi-bot.
+    Responsável por orquestrar a jornada do usuário através do sistema.
+    """
+    
+    def __init__(
+        self,
+        geo_resolver: Optional[GeoResolver] = None,
+        antifraud_engine: Optional[AntifraudEngine] = None,
+        entitlement_engine: Optional[EntitlementEngine] = None,
+        notification_engine: Optional[NotificationEngine] = None
+    ):
+        self.geo_resolver = geo_resolver or GeoResolver()
+        self.antifraud_engine = antifraud_engine or AntifraudEngine()
+        self.entitlement_engine = entitlement_engine or EntitlementEngine()
+        self.notification_engine = notification_engine or NotificationEngine()
+        
+        # Registro de handlers por tipo de passo
+        self._step_handlers: Dict[str, Callable] = {}
+        self._action_handlers: Dict[str, Callable] = {}
+        
+        self._register_default_handlers()
+    
+    def _register_default_handlers(self) -> None:
+        """Registra handlers padrão para passos e ações."""
+        # Handlers de passo
+        self.register_step_handler(FlowStepType.MESSAGE.value, self._handle_message)
+        self.register_step_handler(FlowStepType.VIDEO.value, self._handle_video)
+        self.register_step_handler(FlowStepType.BUTTONS.value, self._handle_buttons)
+        self.register_step_handler(FlowStepType.PAYMENT_CHOICE.value, self._handle_payment_choice)
+        self.register_step_handler(FlowStepType.PAYMENT_INSTRUCTIONS.value, self._handle_payment_instructions)
+        self.register_step_handler(FlowStepType.ACCESS_GRANT.value, self._handle_access_grant)
+        self.register_step_handler(FlowStepType.TRACKING.value, self._handle_tracking)
+        self.register_step_handler(FlowStepType.ANTIFRAUD_CHECK.value, self._handle_antifraud_check)
+        self.register_step_handler(FlowStepType.WAIT.value, self._handle_wait)
+        
+        # Handlers de ação
+        self.register_action_handler(FlowAction.SHOW_OFFER.value, self._handle_show_offer)
+        self.register_action_handler(FlowAction.REQUEST_PAYMENT.value, self._handle_request_payment)
+        self.register_action_handler(FlowAction.GRANT_ACCESS.value, self._handle_grant_access)
+        self.register_action_handler(FlowAction.SEND_NOTIFICATION.value, self._handle_send_notification)
+        self.register_action_handler(FlowAction.TRACK_EVENT.value, self._handle_track_event)
+        self.register_action_handler(FlowAction.CHECK_ANTIFRAUD.value, self._handle_check_antifraud)
+        self.register_action_handler(FlowAction.UPDATE_USER.value, self._handle_update_user)
+    
+    def register_step_handler(self, step_type: str, handler: Callable) -> None:
+        """Registra um handler para um tipo de passo."""
+        self._step_handlers[step_type] = handler
+    
+    def register_action_handler(self, action: str, handler: Callable) -> None:
+        """Registra um handler para uma ação."""
+        self._action_handlers[action] = handler
+    
+    @with_idempotency(key_fields=["bot_id", "user_id", "flow_id"])
+    async def process_user_interaction(
+        self,
+        bot_id: str,
+        user_id: int,
+        user_data: Dict[str, Any],
+        message_text: Optional[str] = None,
+        callback_data: Optional[str] = None,
+        flow_id: str = "main_flow"
+    ) -> Dict[str, Any]:
+        """
+        Processa uma interação do usuário.
+        Ponto de entrada principal do Flow Engine.
+        
+        Args:
+            bot_id: ID do bot que recebeu a interação
+            user_id: ID do usuário no Telegram
+            user_data: Dados do usuário (username, language_code, etc.)
+            message_text: Texto da mensagem (se houver)
+            callback_data: Dados do callback (se de botão)
+            flow_id: ID do fluxo a ser executado
+            
+        Returns:
+            Dict com resposta para o bot
+        """
+        start_time = time.time()
+        
+        try:
+            # 1. Criar ou recuperar contexto do fluxo
+            context = await self._get_or_create_context(
+                bot_id=bot_id,
+                user_id=user_id,
+                user_data=user_data,
+                flow_id=flow_id
+            )
+            
+            # 2. Atualizar contexto baseado na interação
+            context = await self._update_context(
+                context=context,
+                message_text=message_text,
+                callback_data=callback_data
+            )
+            
+            # 3. Executar passo atual do fluxo
+            result = await self._execute_current_step(context)
+            
+            # 4. Salvar estado do fluxo
+            await self._persist_flow_state(context, result)
+            
+            # 5. Registrar métricas
+            processing_time = time.time() - start_time
+            logger.info(
+                f"Flow processed - Bot: {bot_id}, User: {user_id}, "
+                f"Flow: {flow_id}, Step: {context.current_step}, "
+                f"Time: {processing_time:.2f}s"
+            )
+            
+            # 6. Retornar resposta para o bot
+            return {
+                "success": True,
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "flow_id": flow_id,
+                "response": result.get("response", {}),
+                "next_step": context.next_step,
+                "metadata": context.metadata,
+                "processing_time": processing_time
+            }
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing flow interaction - "
+                f"Bot: {bot_id}, User: {user_id}, Error: {str(e)}",
+                exc_info=True
+            )
+            
+            # Fallback para erro
+            return {
+                "success": False,
+                "bot_id": bot_id,
+                "user_id": user_id,
+                "error": str(e),
+                "response": {
+                    "type": "message",
+                    "text": "⚠️ Ocorreu um erro inesperado. Por favor, tente novamente."
+                }
+            }
+    
+    async def _get_or_create_context(
+        self,
+        bot_id: str,
+        user_id: int,
+        user_data: Dict[str, Any],
+        flow_id: str
+    ) -> FlowContext:
+        """
+        Cria ou recupera o contexto do fluxo para o usuário.
+        """
+        # Gerar fingerprint do usuário
+        user_fingerprint = generate_user_fingerprint(
+            user_id=user_id,
+            bot_id=bot_id,
+            user_data=user_data
+        )
+        
+        # Tentar recuperar estado existente
+        flow_state = await FlowState.get_active(
+            bot_id=bot_id,
+            user_id=user_id,
+            flow_id=flow_id
+        )
+        
+        if flow_state:
+            # Contexto existe, restaurar
+            context = FlowContext.from_dict(flow_state.context_data)
+            context.updated_at = datetime.utcnow()
+            
+            # Atualizar fingerprint se necessário
+            if context.user_fingerprint != user_fingerprint:
+                logger.warning(
+                    f"Fingerprint mismatch for user {user_id}. "
+                    f"Old: {context.user_fingerprint}, New: {user_fingerprint}"
+                )
+                # Manter o original para consistência
+        else:
+            # Criar novo contexto
+            context = FlowContext(
+                flow_id=flow_id,
+                bot_id=bot_id,
+                user_id=user_id,
+                user_fingerprint=user_fingerprint,
+                current_step="start",
+                metadata={
+                    "user_data": user_data,
+                    "started_at": datetime.utcnow().isoformat()
+                }
+            )
+            
+            # Resolver região geográfica
+            context.region = await self.geo_resolver.resolve_region(
+                user_id=user_id,
+                user_data=user_data,
+                bot_id=bot_id
+            )
+            
+            # Verificar antifraude inicial
+            context.fraud_score = await self.antifraud_engine.assess_risk(
+                fingerprint=user_fingerprint,
+                user_id=user_id,
+                bot_id=bot_id,
+                region=context.region
+            )
+            
+            # Registrar criação de contexto
+            await audit_logger.log_async(
+                resource_type="flow_context",
+                resource_id=f"{bot_id}:{user_id}:{flow_id}",
+                action="create",
+                actor="system",
+                description=f"Novo contexto de fluxo criado",
+                metadata={
+                    "bot_id": bot_id,
+                    "user_id": user_id,
+                    "flow_id": flow_id,
+                    "region": context.region.value if context.region else None,
+                    "fraud_score": context.fraud_score.value if context.fraud_score else None
+                }
+            )
+        
+        return context
+    
+    async def _update_context(
+        self,
+        context: FlowContext,
+        message_text: Optional[str],
+        callback_data: Optional[str]
+    ) -> FlowContext:
+        """
+        Atualiza contexto baseado na interação do usuário.
+        """
+        context.updated_at = datetime.utcnow()
+        
+        if callback_data:
+            # Processar callback de botão
+            parts = callback_data.split("|")
+            
+            if len(parts) >= 2:
+                action = parts[0]
+                data = parts[1:]
+                
+                context.metadata["last_callback"] = {
+                    "action": action,
+                    "data": data,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                
+                # Ações específicas
+                if action == "buy":
+                    # Clique em botão de compra
+                    if len(data) >= 2:
+                        offer_id = data[0]
+                        price_id = data[1]
+                        
+                        context.offer_id = offer_id
+                        context.metadata["selected_offer"] = {
+                            "offer_id": offer_id,
+                            "price_id": price_id
+                        }
+                        
+                        # Próximo passo: escolha de pagamento
+                        context.next_step = "payment_choice"
+                
+                elif action == "payment_method":
+                    # Escolha de método de pagamento
+                    if len(data) >= 1:
+                        payment_method = data[0]
+                        
+                        context.metadata["selected_payment_method"] = payment_method
+                        context.next_step = "payment_instructions"
+                
+                elif action == "cancel":
+                    # Cancelamento pelo usuário
+                    context.next_step = "cancelled"
+                    context.metadata["cancelled_by_user"] = True
+        
+        elif message_text:
+            # Processar mensagem de texto
+            context.metadata["last_message"] = {
+                "text": message_text,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            # Comandos especiais
+            if message_text.startswith("/"):
+                command = message_text.split()[0].lower()
+                
+                if command == "/start":
+                    context.current_step = "start"
+                    context.next_step = "welcome"
+                
+                elif command == "/help":
+                    context.next_step = "help"
+        
+        return context
+    
+    async def _execute_current_step(self, context: FlowContext) -> Dict[str, Any]:
+        """
+        Executa o passo atual do fluxo.
+        """
+        step_type = self._determine_step_type(context.current_step)
+        
+        if step_type not in self._step_handlers:
+            raise ValueError(f"No handler registered for step type: {step_type}")
+        
+        handler = self._step_handlers[step_type]
+        result = await handler(context)
+        
+        # Atualizar próximo passo se não definido pelo handler
+        if context.next_step is None and result.get("next_step"):
+            context.next_step = result["next_step"]
+        
+        return result
+    
+    def _determine_step_type(self, step_name: str) -> str:
+        """
+        Determina o tipo de passo baseado no nome.
+        """
+        step_type_map = {
+            "start": FlowStepType.MESSAGE.value,
+            "welcome": FlowStepType.MESSAGE.value,
+            "help": FlowStepType.MESSAGE.value,
+            "show_offer": FlowStepType.BUTTONS.value,
+            "payment_choice": FlowStepType.PAYMENT_CHOICE.value,
+            "payment_instructions": FlowStepType.PAYMENT_INSTRUCTIONS.value,
+            "wait_payment": FlowStepType.WAIT.value,
+            "access_grant": FlowStepType.ACCESS_GRANT.value,
+            "tracking": FlowStepType.TRACKING.value,
+            "antifraud_check": FlowStepType.ANTIFRAUD_CHECK.value,
+            "cancelled": FlowStepType.MESSAGE.value
+        }
+        
+        return step_type_map.get(step_name, FlowStepType.MESSAGE.value)
+    
+    async def _handle_message(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para passos de mensagem."""
+        messages = {
+            "start": "👋 Bem-vindo! Vou te mostrar nossas ofertas exclusivas...",
+            "welcome": "🎉 Olá! Pronto para descobrir conteúdo exclusivo?",
+            "help": "ℹ️ Preciso de ajuda? Entre em contato com nosso suporte.",
+            "cancelled": "❌ Operação cancelada. Você pode reiniciar quando quiser."
+        }
+        
+        message = messages.get(context.current_step, "Continuando...")
+        
+        # Determinar próximo passo baseado no passo atual
+        next_step_map = {
+            "start": "show_offer",
+            "welcome": "show_offer",
+            "help": "start",
+            "cancelled": "start"
+        }
+        
+        return {
+            "response": {
+                "type": "message",
+                "text": message,
+                "parse_mode": "HTML"
+            },
+            "next_step": next_step_map.get(context.current_step)
+        }
+    
+    async def _handle_video(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para envio de vídeo."""
+        # Aqui você implementaria a lógica de vídeo com proteção
+        # Por enquanto, retorna mensagem informativa
+        return {
+            "response": {
+                "type": "message",
+                "text": "🎬 Preparando conteúdo exclusivo para você...",
+                "parse_mode": "HTML"
+            },
+            "next_step": "show_offer"
+        }
+    
+    async def _handle_buttons(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para exibição de botões com ofertas."""
+        # Buscar ofertas disponíveis para este bot/região
+        offers = await Offer.get_available_offers(
+            bot_id=context.bot_id,
+            region=context.region
+        )
+        
+        if not offers:
+            # Fallback para mensagem sem ofertas
+            return await self._handle_message(context)
+        
+        # Preparar botões
+        buttons = []
+        for offer in offers[:5]:  # Limitar a 5 ofertas
+            price_info = offer.get_price_for_region(context.region)
+            
+            button_text = f"{offer.name} - {price_info['currency']} {price_info['amount']}"
+            callback_data = f"buy|{offer.id}|{price_info['price_id']}"
+            
+            buttons.append({
+                "text": button_text,
+                "callback_data": callback_data
+            })
+        
+        # Adicionar botão de ajuda
+        buttons.append({
+            "text": "❓ Ajuda",
+            "callback_data": "help"
+        })
+        
+        return {
+            "response": {
+                "type": "buttons",
+                "text": "🎯 Escolha seu plano exclusivo:",
+                "buttons": buttons,
+                "parse_mode": "HTML"
+            },
+            "next_step": "wait_selection"
+        }
+    
+    async def _handle_payment_choice(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para escolha de método de pagamento."""
+        if not context.offer_id:
+            return await self._handle_message(context)
+        
+        # Buscar oferta selecionada
+        offer = await Offer.get_by_id(context.offer_id)
+        if not offer:
+            return await self._handle_message(context)
+        
+        # Buscar métodos de pagamento disponíveis para região
+        payment_methods = await self._get_available_payment_methods(
+            region=context.region,
+            currency=offer.currency
+        )
+        
+        if not payment_methods:
+            return {
+                "response": {
+                    "type": "message",
+                    "text": "⚠️ Nenhum método de pagamento disponível para sua região.",
+                    "parse_mode": "HTML"
+                },
+                "next_step": "show_offer"
+            }
+        
+        # Preparar botões de métodos de pagamento
+        buttons = []
+        for method in payment_methods:
+            button_text = self._get_payment_method_display(method)
+            callback_data = f"payment_method|{method}"
+            
+            buttons.append({
+                "text": button_text,
+                "callback_data": callback_data
+            })
+        
+        # Botão de voltar
+        buttons.append({
+            "text": "↩️ Voltar",
+            "callback_data": "back"
+        })
+        
+        price_info = offer.get_price_for_region(context.region)
+        
+        return {
+            "response": {
+                "type": "buttons",
+                "text": f"💳 Como você quer pagar?\n\n"
+                       f"Plano: {offer.name}\n"
+                       f"Valor: {price_info['currency']} {price_info['amount']}",
+                "buttons": buttons,
+                "parse_mode": "HTML"
+            },
+            "next_step": "wait_payment_method"
+        }
+    
+    async def _handle_payment_instructions(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para instruções de pagamento."""
+        payment_method = context.metadata.get("selected_payment_method")
+        
+        if not payment_method or not context.offer_id:
+            return await self._handle_message(context)
+        
+        # Buscar oferta
+        offer = await Offer.get_by_id(context.offer_id)
+        if not offer:
+            return await self._handle_message(context)
+        
+        # Criar Payment Intent
+        payment_intent = await PaymentIntent.create(
+            user_id=context.user_id,
+            bot_id=context.bot_id,
+            offer_id=context.offer_id,
+            amount=offer.price,
+            currency=offer.currency,
+            region=context.region.value if context.region else None,
+            payment_method=payment_method,
+            fingerprint=context.user_fingerprint
+        )
+        
+        context.payment_intent_id = payment_intent.id
+        
+        # Gerar instruções baseadas no método
+        instructions = await self._generate_payment_instructions(
+            payment_method=payment_method,
+            payment_intent=payment_intent,
+            offer=offer
+        )
+        
+        return {
+            "response": {
+                "type": "payment_instructions",
+                "text": instructions["text"],
+                "instructions": instructions["details"],
+                "payment_intent_id": payment_intent.id
+            },
+            "next_step": "wait_payment"
+        }
+    
+    async def _handle_access_grant(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para concessão de acesso após pagamento."""
+        payment_intent_id = context.payment_intent_id
+        
+        if not payment_intent_id:
+            return {
+                "response": {
+                    "type": "message",
+                    "text": "⚠️ Não encontramos informações de pagamento.",
+                    "parse_mode": "HTML"
+                },
+                "next_step": "show_offer"
+            }
+        
+        # Buscar Payment Intent
+        payment_intent = await PaymentIntent.get_by_id(payment_intent_id)
+        
+        if not payment_intent or payment_intent.status != PaymentIntentState.PAID.value:
+            return {
+                "response": {
+                    "type": "message",
+                    "text": "⏳ Aguardando confirmação do pagamento...",
+                    "parse_mode": "HTML"
+                },
+                "next_step": "wait_payment"
+            }
+        
+        # Conceder acesso via Entitlement Engine
+        success = await self.entitlement_engine.grant_access(
+            user_id=context.user_id,
+            bot_id=context.bot_id,
+            offer_id=payment_intent.offer_id,
+            payment_intent_id=payment_intent.id,
+            fingerprint=context.user_fingerprint
+        )
+        
+        if success:
+            # Buscar link de acesso
+            access_link = await self.entitlement_engine.generate_access_link(
+                user_id=context.user_id,
+                bot_id=context.bot_id
+            )
+            
+            return {
+                "response": {
+                    "type": "access_granted",
+                    "text": "✅ Pagamento confirmado! Aqui está seu acesso exclusivo:",
+                    "access_link": access_link,
+                    "parse_mode": "HTML"
+                },
+                "next_step": "tracking"
+            }
+        else:
+            return {
+                "response": {
+                    "type": "message",
+                    "text": "⚠️ Erro ao conceder acesso. Entre em contato com o suporte.",
+                    "parse_mode": "HTML"
+                },
+                "next_step": "help"
+            }
+    
+    async def _handle_tracking(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para tracking de eventos."""
+        # Enfileirar evento de tracking
+        await enqueue_flow_task(
+            task_type="track_event",
+            bot_id=context.bot_id,
+            user_id=context.user_id,
+            flow_id=context.flow_id,
+            event_type="flow_completed",
+            metadata=context.metadata
+        )
+        
+        return {
+            "response": {
+                "type": "message",
+                "text": "🎉 Processo concluído! Aproveite seu acesso.",
+                "parse_mode": "HTML"
+            },
+            "next_step": None  # Fim do fluxo
+        }
+    
+    async def _handle_antifraud_check(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para verificação de antifraude."""
+        score = await self.antifraud_engine.assess_risk(
+            fingerprint=context.user_fingerprint,
+            user_id=context.user_id,
+            bot_id=context.bot_id,
+            region=context.region
+        )
+        
+        context.fraud_score = score
+        
+        if score == FraudScore.HIGH:
+            return {
+                "response": {
+                    "type": "message",
+                    "text": "⚠️ Sua solicitação está em análise. Entre em contato com o suporte.",
+                    "parse_mode": "HTML"
+                },
+                "next_step": "blocked"
+            }
+        
+        return {
+            "response": {},
+            "next_step": context.next_step or "continue"
+        }
+    
+    async def _handle_wait(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para passo de espera."""
+        return {
+            "response": {
+                "type": "message",
+                "text": "⏳ Processando sua solicitação...",
+                "parse_mode": "HTML"
+            },
+            "next_step": None  # Aguardar próxima interação
+        }
+    
+    async def _handle_show_offer(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para ação SHOW_OFFER."""
+        return await self._handle_buttons(context)
+    
+    async def _handle_request_payment(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para ação REQUEST_PAYMENT."""
+        return await self._handle_payment_choice(context)
+    
+    async def _handle_grant_access(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para ação GRANT_ACCESS."""
+        return await self._handle_access_grant(context)
+    
+    async def _handle_send_notification(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para ação SEND_NOTIFICATION."""
+        # Esta ação seria processada assincronamente
+        return {
+            "response": {},
+            "next_step": context.next_step
+        }
+    
+    async def _handle_track_event(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para ação TRACK_EVENT."""
+        return await self._handle_tracking(context)
+    
+    async def _handle_check_antifraud(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para ação CHECK_ANTIFRAUD."""
+        return await self._handle_antifraud_check(context)
+    
+    async def _handle_update_user(self, context: FlowContext) -> Dict[str, Any]:
+        """Handler para ação UPDATE_USER."""
+        # Atualizar informações do usuário
+        return {
+            "response": {},
+            "next_step": context.next_step
+        }
+    
+    async def _get_available_payment_methods(
+        self,
+        region: Optional[GeoRegion],
+        currency: str
+    ) -> List[str]:
+        """
+        Retorna métodos de pagamento disponíveis para região e moeda.
+        """
+        # Mapeamento região -> métodos
+        region_methods = {
+            GeoRegion.BR: ["pix_static", "pix_dynamic", "card_brl"],
+            GeoRegion.EU: ["sepa_instant", "mbway", "card_eur"],
+            GeoRegion.US: ["cash_app", "paypal", "p2p_us", "card_usd"],
+            GeoRegion.LATAM: ["card_usd", "p2p_latam"],
+            GeoRegion.GLOBAL: ["wallet_global", "card_usd"]
+        }
+        
+        if not region:
+            return ["wallet_global"]
+        
+        methods = region_methods.get(region, ["wallet_global"])
+        
+        # Filtrar por suporte a moeda
+        currency_support = {
+            "BRL": ["pix_static", "pix_dynamic", "card_brl"],
+            "EUR": ["sepa_instant", "mbway", "card_eur", "wallet_global"],
+            "USD": ["cash_app", "paypal", "p2p_us", "card_usd", "wallet_global"]
+        }
+        
+        supported = currency_support.get(currency, ["wallet_global"])
+        return [m for m in methods if m in supported]
+    
+    def _get_payment_method_display(self, method: str) -> str:
+        """Retorna display name para método de pagamento."""
+        display_names = {
+            "pix_static": "🧾 Pix (Copia e Cola)",
+            "pix_dynamic": "🧾 Pix QR Code",
+            "sepa_instant": "🇪🇺 SEPA Instant",
+            "mbway": "📱 MB Way",
+            "cash_app": "💸 Cash App",
+            "paypal": "🔵 PayPal",
+            "p2p_us": "🤝 P2P EUA",
+            "card_brl": "💳 Cartão (BRL)",
+            "card_eur": "💳 Cartão (EUR)",
+            "card_usd": "💳 Cartão (USD)",
+            "wallet_global": "🌐 Wallet Global"
+        }
+        
+        return display_names.get(method, method)
+    
+    async def _generate_payment_instructions(
+        self,
+        payment_method: str,
+        payment_intent: PaymentIntent,
+        offer: Offer
+    ) -> Dict[str, Any]:
+        """Gera instruções de pagamento baseadas no método."""
+        # Na implementação real, isso chamaria o Payment Engine
+        # Por enquanto, retorna instruções mockadas
+        
+        base_text = f"💳 Para completar sua compra:\n\n"
+        base_text += f"Plano: {offer.name}\n"
+        base_text += f"Valor: {offer.currency} {offer.price}\n"
+        base_text += f"ID: {payment_intent.id[:8]}...\n\n"
+        
+        details = {}
+        
+        if payment_method.startswith("pix"):
+            details = {
+                "type": "pix",
+                "instructions": "1. Abra seu app de banco\n"
+                               "2. Escaneie o QR Code ou cole o código\n"
+                               "3. Confirme o pagamento\n"
+                               "4. Aguarde confirmação automática",
+                "expires_in": "15 minutos"
+            }
+            base_text += "Escaneie o QR Code abaixo ou use o código Pix Copia e Cola."
+        
+        elif payment_method == "sepa_instant":
+            details = {
+                "type": "bank_transfer",
+                "instructions": "1. Use referência única abaixo\n"
+                               "2. Faça transferência SEPA Instant\n"
+                               "3. Aguarde confirmação automática",
+                "reference": f"SEPA-{payment_intent.id[:12]}"
+            }
+            base_text += "Faça uma transferência SEPA Instant usando a referência única."
+        
+        elif payment_method == "mbway":
+            details = {
+                "type": "mbway",
+                "instructions": "1. Abra app MB Way\n"
+                               "2. Use número abaixo\n"
+                               "3. Confirme pagamento",
+                "phone_number": "+351 900 000 000"
+            }
+            base_text += "Use o número MB Way abaixo para pagamento."
+        
+        else:
+            details = {
+                "type": "generic",
+                "instructions": "Siga as instruções na próxima tela."
+            }
+            base_text += "Clique no botão abaixo para prosseguir."
+        
+        return {
+            "text": base_text,
+            "details": details
+        }
+    
+    async def _persist_flow_state(
+        self,
+        context: FlowContext,
+        result: Dict[str, Any]
+    ) -> None:
+        """Persiste o estado do fluxo no banco de dados."""
+        try:
+            flow_state = await FlowState.create_or_update(
+                bot_id=context.bot_id,
+                user_id=context.user_id,
+                flow_id=context.flow_id,
+                context_data=context.to_dict(),
+                current_step=context.current_step,
+                next_step=context.next_step,
+                metadata={
+                    **context.metadata,
+                    "last_result": result.get("response", {}),
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+            )
+            
+            # Registrar auditoria se houve mudança significativa
+            if flow_state.created_at == flow_state.updated_at:
+                await audit_logger.log_async(
+                    resource_type="flow_state",
+                    resource_id=flow_state.id,
+                    action="update",
+                    actor="system",
+                    description=f"Estado do fluxo atualizado: {context.current_step}",
+                    metadata={
+                        "bot_id": context.bot_id,
+                        "user_id": context.user_id,
+                        "flow_id": context.flow_id,
+                        "current_step": context.current_step,
+                        "next_step": context.next_step
+                    }
+                )
+                
+        except Exception as e:
+            logger.error(f"Error persisting flow state: {e}", exc_info=True)
+            # Não falhar o fluxo por erro de persistência
+    
+    async def cleanup_expired_flows(self, hours: int = 24) -> int:
+        """
+        Remove fluxos expirados do banco de dados.
+        
+        Args:
+            hours: Quantidade de horas para considerar expirado
+            
+        Returns:
+            Número de fluxos removidos
+        """
+        try:
+            expired_before = datetime.utcnow() - timedelta(hours=hours)
+            count = await FlowState.delete_expired(expired_before)
+            
+            logger.info(f"Cleaned up {count} expired flows")
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up expired flows: {e}", exc_info=True)
+            return 0
+
+
+# Factory para criação do Flow Engine
+def create_flow_engine() -> FlowEngine:
+    """Cria uma instância configurada do Flow Engine."""
+    return FlowEngine()
+
+
+# Singleton para uso global (opcional)
+_flow_engine_instance: Optional[FlowEngine] = None
+
+def get_flow_engine() -> FlowEngine:
+    """Retorna instância singleton do Flow Engine."""
+    global _flow_engine_instance
+    if _flow_engine_instance is None:
+        _flow_engine_instance = create_flow_engine()
+    return _flow_engine_instance

@@ -1,0 +1,814 @@
+"""
+Template Engine - Sistema de templates multi-tenant com versionamento e renderização segura
+
+Princípios:
+1. Templates versionados e imutáveis após publicação
+2. Isolamento absoluto por tenant
+3. Renderização segura (SAFE/STRICT/DEBUG)
+4. Fallback automático para templates padrão
+5. Nenhum envio direto - apenas renderização
+"""
+
+import json
+import hashlib
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Dict, Any, Optional, List, Union, Callable
+from pathlib import Path
+import jinja2
+from jinja2.sandbox import SandboxedEnvironment
+
+from app.models.tenant import Tenant
+from app.utils.cryptography import encrypt_data, decrypt_data
+from app.core.audit_logger import AuditLogger
+
+
+class TemplateRenderMode(Enum):
+    """Modos de renderização de template"""
+    SAFE = "safe"        # Apenas variáveis, sem execução
+    STRICT = "strict"    # Com validação de segurança
+    DEBUG = "debug"      # Modo desenvolvimento (cuidado)
+
+
+class TemplateType(Enum):
+    """Tipos de template suportados"""
+    EMAIL = "email"
+    NOTIFICATION = "notification"
+    MESSAGE = "message"
+    WEBHOOK = "webhook"
+    INVOICE = "invoice"
+    RECEIPT = "receipt"
+    LEGAL = "legal"
+
+
+@dataclass
+class TemplateVersion:
+    """Versão específica de um template"""
+    version_id: str
+    template_id: str
+    tenant_id: str
+    content: str
+    variables: Dict[str, Any]
+    metadata: Dict[str, Any]
+    checksum: str
+    is_active: bool = True
+    is_immutable: bool = True
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_by: Optional[str] = None
+    
+    def validate(self) -> bool:
+        """Valida integridade do template"""
+        current_checksum = hashlib.sha256(
+            f"{self.content}{json.dumps(self.variables, sort_keys=True)}".encode()
+        ).hexdigest()
+        return current_checksum == self.checksum
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário seguro"""
+        return {
+            "version_id": self.version_id,
+            "template_id": self.template_id,
+            "tenant_id": self.tenant_id,
+            "metadata": self.metadata,
+            "checksum": self.checksum,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat(),
+            "created_by": self.created_by
+        }
+
+
+@dataclass
+class Template:
+    """Template com múltiplas versões"""
+    template_id: str
+    tenant_id: str
+    template_type: TemplateType
+    name: str
+    description: str
+    default_variables: Dict[str, Any]
+    current_version: Optional[str] = None
+    versions: Dict[str, TemplateVersion] = field(default_factory=dict)
+    fallback_template_id: Optional[str] = None
+    tags: List[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def get_version(self, version_id: Optional[str] = None) -> Optional[TemplateVersion]:
+        """Obtém versão específica ou a atual"""
+        if version_id:
+            return self.versions.get(version_id)
+        elif self.current_version:
+            return self.versions.get(self.current_version)
+        return None
+    
+    def add_version(self, version: TemplateVersion) -> bool:
+        """Adiciona nova versão do template"""
+        if version.template_id != self.template_id or version.tenant_id != self.tenant_id:
+            return False
+        
+        if version.version_id in self.versions:
+            return False
+        
+        self.versions[version.version_id] = version
+        self.current_version = version.version_id
+        self.updated_at = datetime.utcnow()
+        return True
+    
+    def deactivate_version(self, version_id: str) -> bool:
+        """Desativa versão específica"""
+        if version_id in self.versions:
+            self.versions[version_id].is_active = False
+            if self.current_version == version_id:
+                # Encontra última versão ativa
+                active_versions = [
+                    v for v in self.versions.values() 
+                    if v.is_active and v.version_id != version_id
+                ]
+                if active_versions:
+                    self.current_version = max(
+                        active_versions, 
+                        key=lambda v: v.created_at
+                    ).version_id
+                else:
+                    self.current_version = None
+            return True
+        return False
+
+
+class TemplateSecurityError(Exception):
+    """Exceção de segurança no template"""
+    pass
+
+
+class TemplateValidationError(Exception):
+    """Exceção de validação no template"""
+    pass
+
+
+class TemplateRenderer:
+    """Renderizador seguro de templates"""
+    
+    def __init__(self, mode: TemplateRenderMode = TemplateRenderMode.STRICT):
+        self.mode = mode
+        self._jinja_env = self._create_jinja_environment()
+        self._cache = {}
+        
+    def _create_jinja_environment(self) -> jinja2.Environment:
+        """Cria ambiente Jinja2 seguro baseado no modo"""
+        if self.mode == TemplateRenderMode.SAFE:
+            # Ambiente extremamente restrito
+            env = SandboxedEnvironment(
+                autoescape=True,
+                undefined=jinja2.StrictUndefined,
+                extensions=['jinja2.ext.autoescape']
+            )
+            # Remove funções perigosas
+            env.globals.update({})
+        elif self.mode == TemplateRenderMode.DEBUG:
+            # Ambiente mais permissivo para desenvolvimento
+            env = jinja2.Environment(
+                autoescape=True,
+                undefined=jinja2.DebugUndefined
+            )
+        else:  # STRICT
+            # Ambiente seguro com funções controladas
+            env = SandboxedEnvironment(
+                autoescape=True,
+                undefined=jinja2.StrictUndefined,
+                extensions=['jinja2.ext.i18n']
+            )
+            # Apenas funções seguras
+            safe_functions = {
+                'len': len,
+                'str': str,
+                'int': int,
+                'float': float,
+                'bool': bool,
+                'list': list,
+                'dict': dict,
+                'round': round,
+                'max': max,
+                'min': min,
+            }
+            env.globals.update(safe_functions)
+        
+        return env
+    
+    def render(self, template_content: str, variables: Dict[str, Any]) -> str:
+        """Renderiza template com segurança"""
+        try:
+            # Validação de segurança pré-renderização
+            self._validate_template_security(template_content, variables)
+            
+            # Compila template
+            template_key = hashlib.sha256(template_content.encode()).hexdigest()
+            if template_key not in self._cache:
+                self._cache[template_key] = self._jinja_env.from_string(template_content)
+            
+            template = self._cache[template_key]
+            
+            # Renderiza com sandbox
+            result = template.render(**variables)
+            
+            # Validação pós-renderização
+            self._validate_output_security(result)
+            
+            return result
+            
+        except jinja2.TemplateError as e:
+            raise TemplateSecurityError(f"Erro de template: {str(e)}")
+        except Exception as e:
+            raise TemplateSecurityError(f"Erro na renderização: {str(e)}")
+    
+    def _validate_template_security(self, content: str, variables: Dict[str, Any]) -> None:
+        """Valida segurança do template e variáveis"""
+        if self.mode == TemplateRenderMode.SAFE:
+            # Verifica por padrões perigosos
+            dangerous_patterns = [
+                r'\{\{.*__.*\}\}',      # Atributos privados
+                r'\{\{.*\.execute.*\}\}', # Execução
+                r'\{\{.*import.*\}\}',   # Importações
+                r'\{\{.*eval.*\}\}',     # Avaliação
+                r'\{\{.*exec.*\}\}',     # Execução
+                r'\{\{.*open.*\}\}',     # Abertura de arquivos
+            ]
+            
+            for pattern in dangerous_patterns:
+                if re.search(pattern, content, re.IGNORECASE):
+                    raise TemplateSecurityError(f"Template contém padrão perigoso: {pattern}")
+        
+        # Valida variáveis - apenas tipos primitivos em modo SAFE
+        if self.mode == TemplateRenderMode.SAFE:
+            for key, value in variables.items():
+                if not isinstance(value, (str, int, float, bool, type(None), list, dict)):
+                    raise TemplateSecurityError(
+                        f"Variável '{key}' tem tipo não permitido: {type(value)}"
+                    )
+    
+    def _validate_output_security(self, output: str) -> None:
+        """Valida segurança do output renderizado"""
+        # Verifica por scripts maliciosos
+        script_patterns = [
+            r'<script[^>]*>.*?</script>',
+            r'javascript:',
+            r'onload=',
+            r'onerror=',
+            r'onclick=',
+        ]
+        
+        for pattern in script_patterns:
+            if re.search(pattern, output, re.IGNORECASE):
+                raise TemplateSecurityError(f"Output contém possível script malicioso: {pattern}")
+
+
+class TemplateEngine:
+    """
+    Motor principal de templates com versionamento e isolamento por tenant
+    """
+    
+    def __init__(self, audit_logger: AuditLogger):
+        self.audit_logger = audit_logger
+        self._templates: Dict[str, Dict[str, Template]] = {}  # tenant_id -> {template_id -> Template}
+        self._renderers: Dict[TemplateRenderMode, TemplateRenderer] = {}
+        self._fallback_templates: Dict[TemplateType, str] = {}
+        
+        # Inicializa renderizadores
+        for mode in TemplateRenderMode:
+            self._renderers[mode] = TemplateRenderer(mode)
+    
+    async def initialize(self) -> None:
+        """Inicializa engine com templates padrão"""
+        # Carrega templates padrão do sistema
+        await self._load_default_templates()
+        
+        # Configura fallbacks
+        self._configure_fallbacks()
+    
+    async def _load_default_templates(self) -> None:
+        """Carrega templates padrão do sistema"""
+        default_templates_path = Path(__file__).parent.parent / "templates" / "default"
+        
+        if default_templates_path.exists():
+            for template_file in default_templates_path.glob("*.json"):
+                with open(template_file, 'r', encoding='utf-8') as f:
+                    template_data = json.load(f)
+                    
+                    template = Template(
+                        template_id=template_data['id'],
+                        tenant_id="system",
+                        template_type=TemplateType(template_data['type']),
+                        name=template_data['name'],
+                        description=template_data['description'],
+                        default_variables=template_data.get('variables', {}),
+                        tags=template_data.get('tags', [])
+                    )
+                    
+                    version = TemplateVersion(
+                        version_id="v1.0.0",
+                        template_id=template_data['id'],
+                        tenant_id="system",
+                        content=template_data['content'],
+                        variables=template_data.get('variables', {}),
+                        metadata=template_data.get('metadata', {}),
+                        checksum=self._calculate_checksum(
+                            template_data['content'],
+                            template_data.get('variables', {})
+                        ),
+                        created_by="system"
+                    )
+                    
+                    template.add_version(version)
+                    
+                    if "system" not in self._templates:
+                        self._templates["system"] = {}
+                    
+                    self._templates["system"][template_data['id']] = template
+    
+    def _configure_fallbacks(self) -> None:
+        """Configura fallbacks entre tipos de template"""
+        self._fallback_templates = {
+            TemplateType.INVOICE: "invoice_default",
+            TemplateType.RECEIPT: "receipt_default",
+            TemplateType.EMAIL: "email_default",
+            TemplateType.NOTIFICATION: "notification_default",
+            TemplateType.LEGAL: "legal_default"
+        }
+    
+    def _calculate_checksum(self, content: str, variables: Dict[str, Any]) -> str:
+        """Calcula checksum do template"""
+        content_str = content + json.dumps(variables, sort_keys=True)
+        return hashlib.sha256(content_str.encode()).hexdigest()
+    
+    async def create_template(
+        self,
+        tenant: Tenant,
+        template_type: TemplateType,
+        name: str,
+        description: str,
+        content: str,
+        variables: Dict[str, Any],
+        metadata: Dict[str, Any],
+        created_by: str,
+        version_tag: str = "v1.0.0",
+        tags: Optional[List[str]] = None,
+        fallback_template_id: Optional[str] = None
+    ) -> Template:
+        """
+        Cria novo template com versão inicial
+        """
+        # Gera ID único
+        template_id = f"tpl_{tenant.tenant_id}_{template_type.value}_{hashlib.md5(name.encode()).hexdigest()[:8]}"
+        
+        # Valida unicidade
+        if tenant.tenant_id in self._templates and template_id in self._templates[tenant.tenant_id]:
+            raise TemplateValidationError(f"Template '{template_id}' já existe")
+        
+        # Cria template
+        template = Template(
+            template_id=template_id,
+            tenant_id=tenant.tenant_id,
+            template_type=template_type,
+            name=name,
+            description=description,
+            default_variables=variables,
+            tags=tags or [],
+            fallback_template_id=fallback_template_id
+        )
+        
+        # Cria versão inicial
+        version = TemplateVersion(
+            version_id=version_tag,
+            template_id=template_id,
+            tenant_id=tenant.tenant_id,
+            content=content,
+            variables=variables,
+            metadata=metadata,
+            checksum=self._calculate_checksum(content, variables),
+            created_by=created_by
+        )
+        
+        # Adiciona versão
+        template.add_version(version)
+        
+        # Armazena
+        if tenant.tenant_id not in self._templates:
+            self._templates[tenant.tenant_id] = {}
+        
+        self._templates[tenant.tenant_id][template_id] = template
+        
+        # Audit log
+        await self.audit_logger.log(
+            tenant_id=tenant.tenant_id,
+            user_id=created_by,
+            action="template.create",
+            resource_type="template",
+            resource_id=template_id,
+            metadata={
+                "template_type": template_type.value,
+                "name": name,
+                "version": version_tag
+            }
+        )
+        
+        return template
+    
+    async def create_version(
+        self,
+        tenant: Tenant,
+        template_id: str,
+        content: str,
+        variables: Dict[str, Any],
+        metadata: Dict[str, Any],
+        created_by: str,
+        version_tag: Optional[str] = None
+    ) -> TemplateVersion:
+        """
+        Cria nova versão de template existente
+        """
+        # Obtém template
+        template = await self.get_template(tenant, template_id)
+        if not template:
+            raise TemplateValidationError(f"Template '{template_id}' não encontrado")
+        
+        # Gera tag de versão
+        if not version_tag:
+            current_version = template.get_version()
+            if current_version:
+                # Incrementa versão
+                base_version = current_version.version_id
+                if base_version.startswith('v'):
+                    try:
+                        parts = base_version[1:].split('.')
+                        major, minor = int(parts[0]), int(parts[1])
+                        patch = int(parts[2]) if len(parts) > 2 else 0
+                        version_tag = f"v{major}.{minor + 1}.0"
+                    except:
+                        version_tag = f"{base_version}.1"
+                else:
+                    version_tag = f"{base_version}_v2"
+            else:
+                version_tag = "v1.0.0"
+        
+        # Cria nova versão
+        version = TemplateVersion(
+            version_id=version_tag,
+            template_id=template_id,
+            tenant_id=tenant.tenant_id,
+            content=content,
+            variables=variables,
+            metadata=metadata,
+            checksum=self._calculate_checksum(content, variables),
+            created_by=created_by
+        )
+        
+        # Adiciona ao template
+        if not template.add_version(version):
+            raise TemplateValidationError(f"Falha ao adicionar versão '{version_tag}'")
+        
+        # Audit log
+        await self.audit_logger.log(
+            tenant_id=tenant.tenant_id,
+            user_id=created_by,
+            action="template.version.create",
+            resource_type="template",
+            resource_id=template_id,
+            metadata={
+                "version": version_tag,
+                "template_name": template.name
+            }
+        )
+        
+        return version
+    
+    async def get_template(
+        self,
+        tenant: Tenant,
+        template_id: str,
+        use_fallback: bool = True
+    ) -> Optional[Template]:
+        """
+        Obtém template específico, com fallback se necessário
+        """
+        # Tenta obter template do tenant
+        tenant_templates = self._templates.get(tenant.tenant_id, {})
+        template = tenant_templates.get(template_id)
+        
+        if template or not use_fallback:
+            return template
+        
+        # Fallback para template padrão do sistema
+        system_templates = self._templates.get("system", {})
+        return system_templates.get(template_id)
+    
+    async def render_template(
+        self,
+        tenant: Tenant,
+        template_id: str,
+        variables: Dict[str, Any],
+        version_id: Optional[str] = None,
+        render_mode: TemplateRenderMode = TemplateRenderMode.STRICT,
+        use_fallback: bool = True
+    ) -> str:
+        """
+        Renderiza template com variáveis específicas
+        """
+        # Obtém template
+        template = await self.get_template(tenant, template_id, use_fallback)
+        
+        if not template:
+            # Tenta usar fallback por tipo
+            template_type = await self._guess_template_type(template_id)
+            fallback_id = self._fallback_templates.get(template_type)
+            
+            if fallback_id:
+                template = await self.get_template(tenant, fallback_id, use_fallback)
+            
+            if not template:
+                raise TemplateValidationError(
+                    f"Template '{template_id}' não encontrado e sem fallback"
+                )
+        
+        # Obtém versão específica
+        version = template.get_version(version_id)
+        if not version:
+            raise TemplateValidationError(
+                f"Versão '{version_id or 'current'}' não encontrada no template '{template_id}'"
+            )
+        
+        if not version.is_active:
+            raise TemplateValidationError(f"Versão '{version.version_id}' está inativa")
+        
+        # Valida integridade da versão
+        if not version.validate():
+            raise TemplateSecurityError(f"Checksum inválido na versão '{version.version_id}'")
+        
+        # Mescla variáveis padrão com as fornecidas
+        merged_vars = {**version.variables, **variables}
+        
+        try:
+            # Renderiza
+            renderer = self._renderers[render_mode]
+            result = renderer.render(version.content, merged_vars)
+            
+            # Audit log
+            await self.audit_logger.log(
+                tenant_id=tenant.tenant_id,
+                user_id="system",
+                action="template.render",
+                resource_type="template",
+                resource_id=template_id,
+                metadata={
+                    "version": version.version_id,
+                    "render_mode": render_mode.value,
+                    "variables_used": list(variables.keys())
+                }
+            )
+            
+            return result
+            
+        except TemplateSecurityError as e:
+            # Log de segurança
+            await self.audit_logger.log(
+                tenant_id=tenant.tenant_id,
+                user_id="system",
+                action="template.security_error",
+                resource_type="template",
+                resource_id=template_id,
+                metadata={
+                    "version": version.version_id,
+                    "error": str(e),
+                    "render_mode": render_mode.value
+                },
+                severity="high"
+            )
+            raise
+    
+    async def _guess_template_type(self, template_id: str) -> TemplateType:
+        """Tenta adivinhar o tipo de template pelo ID"""
+        id_lower = template_id.lower()
+        
+        if any(word in id_lower for word in ['email', 'mail']):
+            return TemplateType.EMAIL
+        elif any(word in id_lower for word in ['invoice', 'fatura']):
+            return TemplateType.INVOICE
+        elif any(word in id_lower for word in ['receipt', 'recibo']):
+            return TemplateType.RECEIPT
+        elif any(word in id_lower for word in ['notification', 'notificacao']):
+            return TemplateType.NOTIFICATION
+        elif any(word in id_lower for word in ['legal', 'termo', 'contrato']):
+            return TemplateType.LEGAL
+        elif any(word in id_lower for word in ['webhook', 'hook']):
+            return TemplateType.WEBHOOK
+        else:
+            return TemplateType.MESSAGE
+    
+    async def list_templates(
+        self,
+        tenant: Tenant,
+        template_type: Optional[TemplateType] = None,
+        active_only: bool = True
+    ) -> List[Template]:
+        """
+        Lista templates do tenant
+        """
+        tenant_templates = self._templates.get(tenant.tenant_id, {})
+        
+        filtered = []
+        for template in tenant_templates.values():
+            if template_type and template.template_type != template_type:
+                continue
+            
+            if active_only and not template.current_version:
+                continue
+            
+            filtered.append(template)
+        
+        return filtered
+    
+    async def deactivate_template(
+        self,
+        tenant: Tenant,
+        template_id: str,
+        deactivated_by: str
+    ) -> bool:
+        """
+        Desativa template (soft delete)
+        """
+        template = await self.get_template(tenant, template_id, use_fallback=False)
+        if not template:
+            return False
+        
+        # Desativa todas as versões
+        for version in template.versions.values():
+            version.is_active = False
+        
+        # Audit log
+        await self.audit_logger.log(
+            tenant_id=tenant.tenant_id,
+            user_id=deactivated_by,
+            action="template.deactivate",
+            resource_type="template",
+            resource_id=template_id,
+            metadata={
+                "template_name": template.name,
+                "template_type": template.template_type.value
+            }
+        )
+        
+        return True
+    
+    async def export_template(
+        self,
+        tenant: Tenant,
+        template_id: str,
+        include_versions: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Exporta template para formato portável
+        """
+        template = await self.get_template(tenant, template_id, use_fallback=False)
+        if not template:
+            raise TemplateValidationError(f"Template '{template_id}' não encontrado")
+        
+        export_data = {
+            "template_id": template.template_id,
+            "tenant_id": template.tenant_id,
+            "type": template.template_type.value,
+            "name": template.name,
+            "description": template.description,
+            "default_variables": template.default_variables,
+            "current_version": template.current_version,
+            "fallback_template_id": template.fallback_template_id,
+            "tags": template.tags,
+            "created_at": template.created_at.isoformat(),
+            "updated_at": template.updated_at.isoformat()
+        }
+        
+        if include_versions:
+            export_data["versions"] = [
+                {
+                    "version_id": v.version_id,
+                    "content": v.content,
+                    "variables": v.variables,
+                    "metadata": v.metadata,
+                    "checksum": v.checksum,
+                    "is_active": v.is_active,
+                    "created_at": v.created_at.isoformat(),
+                    "created_by": v.created_by
+                }
+                for v in template.versions.values()
+            ]
+        
+        return export_data
+    
+    async def import_template(
+        self,
+        tenant: Tenant,
+        import_data: Dict[str, Any],
+        imported_by: str
+    ) -> Template:
+        """
+        Importa template de formato portável
+        """
+        # Valida dados de importação
+        required_fields = ["template_id", "type", "name", "description"]
+        for field in required_fields:
+            if field not in import_data:
+                raise TemplateValidationError(f"Campo obrigatório faltando: {field}")
+        
+        # Cria template base
+        template = Template(
+            template_id=import_data["template_id"],
+            tenant_id=tenant.tenant_id,
+            template_type=TemplateType(import_data["type"]),
+            name=import_data["name"],
+            description=import_data["description"],
+            default_variables=import_data.get("default_variables", {}),
+            fallback_template_id=import_data.get("fallback_template_id"),
+            tags=import_data.get("tags", [])
+        )
+        
+        # Importa versões
+        if "versions" in import_data:
+            for version_data in import_data["versions"]:
+                version = TemplateVersion(
+                    version_id=version_data["version_id"],
+                    template_id=import_data["template_id"],
+                    tenant_id=tenant.tenant_id,
+                    content=version_data["content"],
+                    variables=version_data["variables"],
+                    metadata=version_data["metadata"],
+                    checksum=version_data["checksum"],
+                    is_active=version_data.get("is_active", True),
+                    created_by=imported_by
+                )
+                
+                if not template.add_version(version):
+                    raise TemplateValidationError(
+                        f"Falha ao importar versão '{version.version_id}'"
+                    )
+        
+        # Armazena
+        if tenant.tenant_id not in self._templates:
+            self._templates[tenant.tenant_id] = {}
+        
+        self._templates[tenant.tenant_id][template.template_id] = template
+        
+        # Audit log
+        await self.audit_logger.log(
+            tenant_id=tenant.tenant_id,
+            user_id=imported_by,
+            action="template.import",
+            resource_type="template",
+            resource_id=template.template_id,
+            metadata={
+                "template_name": template.name,
+                "template_type": template.template_type.value,
+                "versions_imported": len(import_data.get("versions", []))
+            }
+        )
+        
+        return template
+    
+    async def validate_template_syntax(
+        self,
+        content: str,
+        variables: Dict[str, Any],
+        render_mode: TemplateRenderMode = TemplateRenderMode.STRICT
+    ) -> Dict[str, Any]:
+        """
+        Valida sintaxe e segurança do template
+        """
+        renderer = self._renderers[render_mode]
+        
+        try:
+            # Tenta renderizar com variáveis vazias
+            test_vars = {k: "" for k in variables}
+            renderer.render(content, test_vars)
+            
+            return {
+                "valid": True,
+                "message": "Template sintaticamente válido",
+                "variables_required": list(variables.keys())
+            }
+            
+        except TemplateSecurityError as e:
+            return {
+                "valid": False,
+                "message": f"Erro de segurança: {str(e)}",
+                "error_type": "security"
+            }
+        except jinja2.TemplateError as e:
+            return {
+                "valid": False,
+                "message": f"Erro de sintaxe: {str(e)}",
+                "error_type": "syntax"
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "message": f"Erro inesperado: {str(e)}",
+                "error_type": "unknown"
+            }

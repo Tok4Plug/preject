@@ -1,0 +1,501 @@
+# app/models/tenant.py (completo)
+"""
+Modelo de Tenant (Inquilino) - Isolamento absoluto por tenant.
+Cada tenant tem seus próprios dados, configurações e limites.
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
+import enum
+
+from app.database import Base
+
+
+class TenantTier(enum.Enum):
+    """Tier do tenant."""
+    FREE = "free"                     # Gratuito
+    STARTER = "starter"               # Inicial
+    GROWTH = "growth"                 # Crescimento
+    PROFESSIONAL = "professional"     # Profissional
+    BUSINESS = "business"             # Negócios
+    ENTERPRISE = "enterprise"         # Enterprise
+    CUSTOM = "custom"                 # Personalizado
+
+
+class TenantStatus(enum.Enum):
+    """Status do tenant."""
+    ACTIVE = "active"                 # Ativo
+    TRIAL = "trial"                   # Período de trial
+    SUSPENDED = "suspended"           # Suspenso
+    CANCELLED = "cancelled"           # Cancelado
+    DELETED = "deleted"               # Deletado
+
+
+class Tenant(Base):
+    """
+    Tenant representa uma organização/cliente do sistema SaaS.
+    
+    Princípios:
+    1. Isolamento absoluto: Todos os dados são filtrados por tenant_id
+    2. Configurações isoladas: Cada tenant tem suas próprias configurações
+    3. Limites individuais: Planos e limites são por tenant
+    4. Auditoria completa: Todas as alterações são registradas
+    5. Multi-plano: Suporte a diferentes tiers e customizações
+    """
+    
+    __tablename__ = "tenants"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    external_id: Mapped[Optional[str]] = mapped_column(String(255), unique=True, index=True)  # ID no sistema do cliente
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    
+    # Contato
+    email: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(50))
+    website: Mapped[Optional[str]] = mapped_column(String(255))
+    
+    # Status e plano
+    status: Mapped[TenantStatus] = mapped_column(Enum(TenantStatus), nullable=False, default=TenantStatus.ACTIVE)
+    tier: Mapped[TenantTier] = mapped_column(Enum(TenantTier), nullable=False, default=TenantTier.STARTER)
+    plan_id: Mapped[str] = mapped_column(String(100), nullable=False, default="starter")
+    
+    # Configurações
+    config: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    features: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    settings: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Limites do plano
+    max_users: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    max_bots: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    max_storage_gb: Mapped[float] = mapped_column(Float, nullable=False, default=10.0)
+    max_monthly_events: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
+    max_monthly_revenue: Mapped[float] = mapped_column(Float, nullable=False, default=1000.0)
+    
+    # Cobrança
+    monthly_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    billing_email: Mapped[Optional[str]] = mapped_column(String(255))
+    billing_address: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB)
+    tax_id: Mapped[Optional[str]] = mapped_column(String(100))
+    
+    # Trial
+    trial_start_date: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    trial_end_date: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    trial_days: Mapped[int] = mapped_column(Integer, nullable=False, default=14)
+    is_trial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    trial_converted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    
+    # Suporte
+    support_tier: Mapped[str] = mapped_column(String(50), nullable=False, default="basic")
+    account_manager_id: Mapped[Optional[str]] = mapped_column(String(100))
+    sales_rep_id: Mapped[Optional[str]] = mapped_column(String(100))
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    tags: Mapped[List[str]] = mapped_column(ARRAY(String(50)), nullable=False, default=[])
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    
+    # Localização
+    timezone: Mapped[str] = mapped_column(String(50), nullable=False, default="UTC")
+    language: Mapped[str] = mapped_column(String(10), nullable=False, default="en")
+    country: Mapped[Optional[str]] = mapped_column(String(2), index=True)
+    region: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    
+    # URLs
+    logo_url: Mapped[Optional[str]] = mapped_column(Text)
+    favicon_url: Mapped[Optional[str]] = mapped_column(Text)
+    custom_domain: Mapped[Optional[str]] = mapped_column(String(255), unique=True, index=True)
+    
+    # Segurança
+    allowed_ips: Mapped[List[str]] = mapped_column(ARRAY(String(50)), nullable=False, default=[])
+    blocked_ips: Mapped[List[str]] = mapped_column(ARRAY(String(50)), nullable=False, default=[])
+    security_settings: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    onboarded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    suspended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    users: Mapped[List["User"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    bots: Mapped[List["Bot"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    offers: Mapped[List["Offer"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    prices: Mapped[List["Price"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    payment_intents: Mapped[List["PaymentIntent"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    invoices: Mapped[List["Invoice"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    subscriptions: Mapped[List["Subscription"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    entitlements: Mapped[List["Entitlement"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    webhook_events: Mapped[List["WebhookEvent"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    antifraud_events: Mapped[List["AntifraudEvent"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    flow_states: Mapped[List["FlowState"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    stats: Mapped[List["TenantStats"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_tenants_status_tier', 'status', 'tier'),
+        Index('ix_tenants_created', 'created_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<Tenant(id='{self.id}', name='{self.name}', slug='{self.slug}', status='{self.status.value}', tier='{self.tier.value}')>"
+    
+    def to_dict(self, include_stats: bool = False, include_counts: bool = False) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "id": self.id,
+            "external_id": self.external_id,
+            "name": self.name,
+            "slug": self.slug,
+            "email": self.email,
+            "phone": self.phone,
+            "website": self.website,
+            "status": self.status.value,
+            "tier": self.tier.value,
+            "plan_id": self.plan_id,
+            "config": self.config,
+            "features": self.features,
+            "settings": self.settings,
+            "max_users": self.max_users,
+            "max_bots": self.max_bots,
+            "max_storage_gb": self.max_storage_gb,
+            "max_monthly_events": self.max_monthly_events,
+            "max_monthly_revenue": self.max_monthly_revenue,
+            "monthly_price": self.monthly_price,
+            "currency": self.currency,
+            "billing_email": self.billing_email,
+            "billing_address": self.billing_address,
+            "tax_id": self.tax_id,
+            "trial_start_date": self.trial_start_date.isoformat() if self.trial_start_date else None,
+            "trial_end_date": self.trial_end_date.isoformat() if self.trial_end_date else None,
+            "trial_days": self.trial_days,
+            "is_trial": self.is_trial,
+            "trial_converted": self.trial_converted,
+            "support_tier": self.support_tier,
+            "account_manager_id": self.account_manager_id,
+            "sales_rep_id": self.sales_rep_id,
+            "metadata": self.metadata,
+            "tags": self.tags,
+            "notes": self.notes,
+            "timezone": self.timezone,
+            "language": self.language,
+            "country": self.country,
+            "region": self.region,
+            "logo_url": self.logo_url,
+            "favicon_url": self.favicon_url,
+            "custom_domain": self.custom_domain,
+            "allowed_ips": self.allowed_ips,
+            "blocked_ips": self.blocked_ips,
+            "security_settings": self.security_settings,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "onboarded_at": self.onboarded_at.isoformat() if self.onboarded_at else None,
+            "suspended_at": self.suspended_at.isoformat() if self.suspended_at else None,
+            "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None,
+            "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
+            "is_active": self.is_active,
+            "is_trial_period": self.is_trial_period,
+            "is_suspended": self.is_suspended,
+            "is_cancelled": self.is_cancelled,
+            "is_deleted": self.is_deleted,
+            "days_until_trial_end": self.days_until_trial_end,
+            "days_since_creation": self.days_since_creation
+        }
+        
+        if include_stats and self.stats:
+            latest_stats = max(self.stats, key=lambda s: s.calculated_at) if self.stats else None
+            if latest_stats:
+                data["stats"] = {
+                    "total_users": latest_stats.total_users,
+                    "active_users": latest_stats.active_users,
+                    "total_bots": latest_stats.total_bots,
+                    "active_bots": latest_stats.active_bots,
+                    "total_revenue": latest_stats.total_revenue,
+                    "monthly_recurring_revenue": latest_stats.monthly_recurring_revenue,
+                    "calculated_at": latest_stats.calculated_at.isoformat()
+                }
+        
+        if include_counts:
+            data["counts"] = {
+                "users": len([u for u in self.users if u.is_active]),
+                "bots": len([b for b in self.bots if b.is_active]),
+                "offers": len([o for o in self.offers if o.is_available]),
+                "subscriptions": len([s for s in self.subscriptions if s.is_active]),
+                "payment_intents": len(self.payment_intents)
+            }
+        
+        return data
+    
+    @property
+    def is_active(self) -> bool:
+        """Verifica se o tenant está ativo."""
+        return self.status in [TenantStatus.ACTIVE, TenantStatus.TRIAL] and self.deleted_at is None
+    
+    @property
+    def is_trial_period(self) -> bool:
+        """Verifica se está no período de trial."""
+        if not self.is_trial or not self.trial_end_date:
+            return False
+        
+        now = datetime.utcnow()
+        return self.trial_start_date <= now <= self.trial_end_date
+    
+    @property
+    def is_suspended(self) -> bool:
+        """Verifica se o tenant está suspenso."""
+        return self.status == TenantStatus.SUSPENDED or self.suspended_at is not None
+    
+    @property
+    def is_cancelled(self) -> bool:
+        """Verifica se o tenant foi cancelado."""
+        return self.status == TenantStatus.CANCELLED or self.cancelled_at is not None
+    
+    @property
+    def is_deleted(self) -> bool:
+        """Verifica se o tenant foi deletado."""
+        return self.status == TenantStatus.DELETED or self.deleted_at is not None
+    
+    @property
+    def days_until_trial_end(self) -> Optional[int]:
+        """Retorna dias até o fim do trial."""
+        if not self.is_trial_period or not self.trial_end_date:
+            return None
+        
+        now = datetime.utcnow()
+        if now > self.trial_end_date:
+            return 0
+        
+        return (self.trial_end_date - now).days
+    
+    @property
+    def days_since_creation(self) -> int:
+        """Retorna dias desde a criação do tenant."""
+        return (datetime.utcnow() - self.created_at).days
+    
+    def start_trial(self, trial_days: int = 14):
+        """Inicia o período de trial para o tenant."""
+        self.is_trial = True
+        self.status = TenantStatus.TRIAL
+        self.trial_days = trial_days
+        self.trial_start_date = datetime.utcnow()
+        self.trial_end_date = datetime.utcnow() + timedelta(days=trial_days)
+        self.updated_at = datetime.utcnow()
+    
+    def convert_trial(self):
+        """Converte trial em plano pago."""
+        if not self.is_trial_period or self.trial_converted:
+            return
+        
+        self.trial_converted = True
+        self.is_trial = False
+        self.status = TenantStatus.ACTIVE
+        self.updated_at = datetime.utcnow()
+    
+    def suspend(self, reason: str, suspended_by: str):
+        """Suspende o tenant."""
+        self.status = TenantStatus.SUSPENDED
+        self.suspended_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        # Registra motivo
+        if "suspension_log" not in self.metadata:
+            self.metadata["suspension_log"] = []
+        
+        self.metadata["suspension_log"].append({
+            "reason": reason,
+            "suspended_by": suspended_by,
+            "suspended_at": self.suspended_at.isoformat()
+        })
+        
+        # Suspende todos os bots
+        for bot in self.bots:
+            if bot.is_active:
+                bot.deactivate()
+    
+    def activate(self):
+        """Ativa o tenant."""
+        self.status = TenantStatus.ACTIVE
+        self.suspended_at = None
+        self.updated_at = datetime.utcnow()
+    
+    def cancel(self, reason: str, cancelled_by: str):
+        """Cancela o tenant."""
+        self.status = TenantStatus.CANCELLED
+        self.cancelled_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        # Registra motivo
+        if "cancellation_log" not in self.metadata:
+            self.metadata["cancellation_log"] = []
+        
+        self.metadata["cancellation_log"].append({
+            "reason": reason,
+            "cancelled_by": cancelled_by,
+            "cancelled_at": self.cancelled_at.isoformat()
+        })
+        
+        # Cancela todas as assinaturas
+        for subscription in self.subscriptions:
+            if subscription.is_active:
+                subscription.cancel("tenant_cancelled")
+    
+    def upgrade_tier(self, new_tier: TenantTier, new_plan_id: str, new_price: float, changed_by: str):
+        """Upgrade o tier do tenant."""
+        old_tier = self.tier
+        self.tier = new_tier
+        self.plan_id = new_plan_id
+        self.monthly_price = new_price
+        self.updated_at = datetime.utcnow()
+        
+        # Registra mudança
+        if "tier_change_log" not in self.metadata:
+            self.metadata["tier_change_log"] = []
+        
+        self.metadata["tier_change_log"].append({
+            "old_tier": old_tier.value,
+            "new_tier": new_tier.value,
+            "old_plan": self.plan_id,
+            "new_plan": new_plan_id,
+            "old_price": self.monthly_price,
+            "new_price": new_price,
+            "changed_by": changed_by,
+            "changed_at": datetime.utcnow().isoformat()
+        })
+    
+    def update_config(self, new_config: Dict[str, Any], merge: bool = True):
+        """Atualiza a configuração do tenant."""
+        if merge:
+            self.config.update(new_config)
+        else:
+            self.config = new_config
+        self.updated_at = datetime.utcnow()
+    
+    def update_features(self, new_features: Dict[str, Any], merge: bool = True):
+        """Atualiza as features do tenant."""
+        if merge:
+            self.features.update(new_features)
+        else:
+            self.features = new_features
+        self.updated_at = datetime.utcnow()
+    
+    def get_feature_flag(self, feature_name: str, default: Any = False) -> Any:
+        """Obtém o valor de uma feature flag do tenant."""
+        return self.features.get(feature_name, default)
+    
+    def set_feature_flag(self, feature_name: str, value: Any):
+        """Define uma feature flag para o tenant."""
+        self.features[feature_name] = value
+        self.updated_at = datetime.utcnow()
+    
+    def can_create_bot(self) -> bool:
+        """Verifica se o tenant pode criar um novo bot."""
+        if not self.is_active:
+            return False
+        
+        if self.max_bots <= 0:
+            return True
+        
+        active_bots = [bot for bot in self.bots if bot.is_active]
+        return len(active_bots) < self.max_bots
+    
+    def can_create_user(self) -> bool:
+        """Verifica se o tenant pode criar um novo usuário."""
+        if not self.is_active:
+            return False
+        
+        if self.max_users <= 0:
+            return True
+        
+        active_users = [user for user in self.users if user.is_active]
+        return len(active_users) < self.max_users
+    
+    def is_ip_allowed(self, ip_address: str) -> bool:
+        """Verifica se um IP está na lista de permitidos."""
+        if not self.allowed_ips:
+            return True
+        
+        return ip_address in self.allowed_ips
+    
+    def is_ip_blocked(self, ip_address: str) -> bool:
+        """Verifica se um IP está na lista de bloqueados."""
+        return ip_address in self.blocked_ips
+
+
+class TenantStats(Base):
+    """
+    Estatísticas agregadas por tenant para relatórios.
+    Mantido separado para não sobrecarregar o modelo principal.
+    """
+    
+    __tablename__ = "tenant_stats"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Métricas de usuários
+    total_users: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active_users: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    new_users_today: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    new_users_this_week: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    new_users_this_month: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    # Métricas de bots
+    total_bots: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active_bots: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    # Métricas de uso
+    total_messages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    messages_today: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    messages_this_week: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    messages_this_month: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    # Métricas financeiras
+    total_revenue: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    monthly_recurring_revenue: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    average_revenue_per_user: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    revenue_today: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    revenue_this_week: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    revenue_this_month: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    
+    # Métricas de pagamento
+    total_payments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    successful_payments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_payments: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    conversion_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    
+    # Métricas de notificações
+    total_notifications_sent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notifications_delivered: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notifications_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    delivery_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    
+    # Métricas de storage
+    storage_used_gb: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    storage_used_percentage: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    
+    # Timestamps
+    period_start: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    period_end: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="stats")
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_tenant_stats_tenant_period', 'tenant_id', 'period_start', 'period_end'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<TenantStats(tenant_id='{self.tenant_id}', period='{self.period_start} to {self.period_end}')>"

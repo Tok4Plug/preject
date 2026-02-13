@@ -1,0 +1,564 @@
+"""initial_schema
+
+Revision ID: 001_initial_schema
+Revises: 
+Create Date: 2024-01-01 00:00:00.000000
+
+"""
+from alembic import op
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+
+# revision identifiers, used by Alembic.
+revision = '001_initial_schema'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    # Enable UUID extension
+    op.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+    
+    # Enable timescale if available (for audit logs)
+    op.execute('CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE')
+    
+    # tenants table
+    op.create_table('tenants',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('name', sa.String(255), nullable=False),
+        sa.Column('slug', sa.String(100), nullable=False, unique=True),
+        sa.Column('status', sa.String(20), nullable=False, 
+                 server_default='active'),
+        sa.Column('config', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()')),
+        sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True)
+    )
+    op.create_index('idx_tenants_slug', 'tenants', ['slug'])
+    op.create_index('idx_tenants_status', 'tenants', ['status'])
+    
+    # bots table (multi-tenant)
+    op.create_table('bots',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('bot_id', sa.String(64), nullable=False, unique=True),
+        sa.Column('name', sa.String(128), nullable=False),
+        sa.Column('token_hash', sa.String(256), nullable=False),
+        sa.Column('webhook_secret', sa.String(256), nullable=True),
+        sa.Column('status', sa.String(16), nullable=False, 
+                 server_default='active'),
+        sa.Column('default_flow', sa.String(64), nullable=False, 
+                 server_default='main_flow'),
+        sa.Column('config_overrides', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('platform', sa.String(32), nullable=False, 
+                 server_default='telegram'),
+        sa.Column('version', sa.String(16), nullable=False, 
+                 server_default='1.0'),
+        sa.Column('last_active', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('total_users', sa.Integer, server_default='0'),
+        sa.Column('total_payments', sa.Integer, server_default='0'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()'))
+    )
+    op.create_index('idx_bots_tenant', 'bots', ['tenant_id', 'status'])
+    op.create_index('idx_bots_bot_id', 'bots', ['bot_id'])
+    op.create_index('idx_bots_platform', 'bots', ['platform'])
+    op.create_index('idx_bots_last_active', 'bots', ['last_active'])
+    
+    # users table
+    op.create_table('users',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('external_id', sa.String(128), nullable=False),
+        sa.Column('platform', sa.String(32), nullable=False, 
+                 server_default='telegram'),
+        sa.Column('username', sa.String(128), nullable=True),
+        sa.Column('first_name', sa.String(128), nullable=True),
+        sa.Column('last_name', sa.String(128), nullable=True),
+        sa.Column('language_code', sa.String(10), nullable=True),
+        sa.Column('is_premium', sa.Boolean, server_default='false'),
+        sa.Column('fingerprint_hash', sa.String(64), nullable=False),
+        sa.Column('antifraud_score', sa.Integer, server_default='0'),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('last_seen', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()'))
+    )
+    op.create_index('idx_users_tenant_ext', 'users', 
+                   ['tenant_id', 'platform', 'external_id'], 
+                   unique=True)
+    op.create_index('idx_users_fingerprint', 'users', ['fingerprint_hash'])
+    op.create_index('idx_users_antifraud', 'users', ['antifraud_score'])
+    
+    # offers table (multi-currency)
+    op.create_table('offers',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('offer_id', sa.String(128), nullable=False),
+        sa.Column('name', sa.String(255), nullable=False),
+        sa.Column('description', sa.Text, nullable=True),
+        sa.Column('base_price', sa.Numeric(10, 2), nullable=False),
+        sa.Column('base_currency', sa.String(3), nullable=False),
+        sa.Column('prices', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('features', postgresql.JSONB, nullable=False, 
+                 server_default='[]'),
+        sa.Column('duration_days', sa.Integer, nullable=True),
+        sa.Column('is_recurring', sa.Boolean, server_default='false'),
+        sa.Column('billing_interval', sa.String(20), nullable=True),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('status', sa.String(20), nullable=False, 
+                 server_default='active'),
+        sa.Column('valid_from', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('valid_to', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()'))
+    )
+    op.create_index('idx_offers_tenant', 'offers', ['tenant_id', 'status'])
+    op.create_index('idx_offers_offer_id', 'offers', ['offer_id'])
+    op.create_index('idx_offers_validity', 'offers', 
+                   ['valid_from', 'valid_to'])
+    
+    # payment_intents table (immutable core)
+    op.create_table('payment_intents',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('intent_id', sa.String(32), nullable=False, unique=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('users.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('bot_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('bots.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('offer_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('offers.id', ondelete='RESTRICT'), 
+                 nullable=False),
+        sa.Column('flow_id', sa.String(64), nullable=False),
+        sa.Column('amount', sa.Numeric(10, 2), nullable=False),
+        sa.Column('currency', sa.String(3), nullable=False),
+        sa.Column('region', sa.String(16), nullable=False),
+        sa.Column('status', sa.String(20), nullable=False, 
+                 server_default='pending'),
+        sa.Column('payment_rail', sa.String(32), nullable=True),
+        sa.Column('provider', sa.String(64), nullable=True),
+        sa.Column('provider_reference', sa.String(256), nullable=True),
+        sa.Column('fingerprint_hash', sa.String(64), nullable=False),
+        sa.Column('antifraud_score', sa.Integer, server_default='0'),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('expires_at', sa.DateTime(timezone=True), nullable=False),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()')),
+        sa.Column('confirmed_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('failed_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('failure_reason', sa.String(255), nullable=True)
+    )
+    op.create_index('idx_payment_intents_intent_id', 'payment_intents', 
+                   ['intent_id'])
+    op.create_index('idx_payment_intents_user', 'payment_intents', 
+                   ['user_id', 'status'])
+    op.create_index('idx_payment_intents_bot', 'payment_intents', 
+                   ['bot_id', 'created_at'])
+    op.create_index('idx_payment_intents_fingerprint', 'payment_intents', 
+                   ['fingerprint_hash', 'created_at'])
+    op.create_index('idx_payment_intents_expires', 'payment_intents', 
+                   ['expires_at', 'status'])
+    op.create_index('idx_payment_intents_provider_ref', 'payment_intents', 
+                   ['provider', 'provider_reference'], 
+                   unique=True, 
+                   postgresql_where=sa.text("provider_reference IS NOT NULL"))
+    op.create_index('idx_payment_intents_tenant_status', 'payment_intents', 
+                   ['tenant_id', 'status', 'created_at'])
+    
+    # webhook_events table (idempotency core)
+    op.create_table('webhook_events',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('event_id', sa.String(128), nullable=False, unique=True),
+        sa.Column('provider', sa.String(64), nullable=False),
+        sa.Column('event_type', sa.String(64), nullable=False),
+        sa.Column('raw_payload', postgresql.JSONB, nullable=False),
+        sa.Column('processed_payload', postgresql.JSONB, nullable=True),
+        sa.Column('status', sa.String(20), nullable=False, 
+                 server_default='received'),
+        sa.Column('processing_attempts', sa.Integer, server_default='0'),
+        sa.Column('idempotency_key', sa.String(256), nullable=False),
+        sa.Column('signature_valid', sa.Boolean, nullable=True),
+        sa.Column('validation_errors', postgresql.JSONB, nullable=True),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('received_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('processed_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('next_retry_at', sa.DateTime(timezone=True), nullable=True)
+    )
+    op.create_index('idx_webhook_events_event_id', 'webhook_events', 
+                   ['event_id'])
+    op.create_index('idx_webhook_events_idempotency', 'webhook_events', 
+                   ['tenant_id', 'provider', 'idempotency_key'], 
+                   unique=True)
+    op.create_index('idx_webhook_events_status', 'webhook_events', 
+                   ['status', 'next_retry_at'])
+    op.create_index('idx_webhook_events_received', 'webhook_events', 
+                   ['received_at'])
+    
+    # audit_logs table (immutable, timescaledb optimized)
+    op.create_table('audit_logs',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('users.id'), 
+                 nullable=True),
+        sa.Column('bot_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('bots.id'), 
+                 nullable=True),
+        sa.Column('action', sa.String(128), nullable=False),
+        sa.Column('resource_type', sa.String(64), nullable=False),
+        sa.Column('resource_id', sa.String(128), nullable=True),
+        sa.Column('previous_state', postgresql.JSONB, nullable=True),
+        sa.Column('new_state', postgresql.JSONB, nullable=True),
+        sa.Column('changes', postgresql.JSONB, nullable=True),
+        sa.Column('ip_address', sa.String(45), nullable=True),
+        sa.Column('user_agent', sa.String(512), nullable=True),
+        sa.Column('correlation_id', sa.String(128), nullable=False),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'))
+    )
+    # Create hypertable for timescaledb
+    op.execute("""
+        SELECT create_hypertable(
+            'audit_logs', 
+            'created_at',
+            chunk_time_interval => interval '7 days',
+            if_not_exists => TRUE
+        )
+    """)
+    op.create_index('idx_audit_logs_tenant', 'audit_logs', 
+                   ['tenant_id', 'created_at'])
+    op.create_index('idx_audit_logs_action', 'audit_logs', 
+                   ['action', 'created_at'])
+    op.create_index('idx_audit_logs_correlation', 'audit_logs', 
+                   ['correlation_id'])
+    op.create_index('idx_audit_logs_resource', 'audit_logs', 
+                   ['resource_type', 'resource_id', 'created_at'])
+    
+    # subscriptions table
+    op.create_table('subscriptions',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('users.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('offer_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('offers.id', ondelete='RESTRICT'), 
+                 nullable=False),
+        sa.Column('payment_intent_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('payment_intents.id'), 
+                 nullable=False),
+        sa.Column('status', sa.String(20), nullable=False, 
+                 server_default='active'),
+        sa.Column('current_period_start', sa.DateTime(timezone=True), 
+                 nullable=False),
+        sa.Column('current_period_end', sa.DateTime(timezone=True), 
+                 nullable=False),
+        sa.Column('cancel_at_period_end', sa.Boolean, server_default='false'),
+        sa.Column('canceled_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('ended_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('trial_start', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('trial_end', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()'))
+    )
+    op.create_index('idx_subscriptions_user', 'subscriptions', 
+                   ['user_id', 'status'])
+    op.create_index('idx_subscriptions_period', 'subscriptions', 
+                   ['current_period_end', 'status'])
+    op.create_index('idx_subscriptions_tenant', 'subscriptions', 
+                   ['tenant_id', 'created_at'])
+    
+    # entitlements table (access control)
+    op.create_table('entitlements',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('users.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('subscription_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('subscriptions.id', ondelete='CASCADE'), 
+                 nullable=True),
+        sa.Column('feature', sa.String(128), nullable=False),
+        sa.Column('scope', sa.String(64), nullable=False, 
+                 server_default='global'),
+        sa.Column('access_level', sa.String(32), nullable=False, 
+                 server_default='full'),
+        sa.Column('granted_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('expires_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('revoked_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('revocation_reason', sa.String(255), nullable=True),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}')
+    )
+    op.create_index('idx_entitlements_user_feature', 'entitlements', 
+                   ['user_id', 'feature', 'expires_at', 'revoked_at'])
+    op.create_index('idx_entitlements_scope', 'entitlements', 
+                   ['scope', 'granted_at'])
+    op.create_index('idx_entitlements_expires', 'entitlements', 
+                   ['expires_at', 'revoked_at'])
+    
+    # invoices table
+    op.create_table('invoices',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('users.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('subscription_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('subscriptions.id', ondelete='SET NULL'), 
+                 nullable=True),
+        sa.Column('payment_intent_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('payment_intents.id'), 
+                 nullable=False),
+        sa.Column('invoice_number', sa.String(64), nullable=False, unique=True),
+        sa.Column('amount', sa.Numeric(10, 2), nullable=False),
+        sa.Column('currency', sa.String(3), nullable=False),
+        sa.Column('status', sa.String(20), nullable=False, 
+                 server_default='draft'),
+        sa.Column('due_date', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('paid_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('items', postgresql.JSONB, nullable=False, 
+                 server_default='[]'),
+        sa.Column('taxes', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('discounts', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()'))
+    )
+    op.create_index('idx_invoices_number', 'invoices', ['invoice_number'])
+    op.create_index('idx_invoices_user', 'invoices', ['user_id', 'created_at'])
+    op.create_index('idx_invoices_status', 'invoices', ['status', 'due_date'])
+    op.create_index('idx_invoices_tenant', 'invoices', ['tenant_id', 'created_at'])
+    
+    # antifraud_events table
+    op.create_table('antifraud_events',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('users.id'), 
+                 nullable=True),
+        sa.Column('fingerprint_hash', sa.String(64), nullable=False),
+        sa.Column('event_type', sa.String(64), nullable=False),
+        sa.Column('severity', sa.String(20), nullable=False),
+        sa.Column('score_delta', sa.Integer, nullable=False),
+        sa.Column('total_score', sa.Integer, nullable=False),
+        sa.Column('description', sa.Text, nullable=True),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'))
+    )
+    op.create_index('idx_antifraud_fingerprint', 'antifraud_events', 
+                   ['fingerprint_hash', 'created_at'])
+    op.create_index('idx_antifraud_severity', 'antifraud_events', 
+                   ['severity', 'created_at'])
+    op.create_index('idx_antifraud_tenant', 'antifraud_events', 
+                   ['tenant_id', 'event_type', 'created_at'])
+    
+    # flow_states table (session management)
+    op.create_table('flow_states',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('users.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('bot_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('bots.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('session_id', sa.String(64), nullable=False),
+        sa.Column('flow_id', sa.String(64), nullable=False),
+        sa.Column('step', sa.String(128), nullable=False),
+        sa.Column('context', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('expires_at', sa.DateTime(timezone=True), nullable=False),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()'))
+    )
+    op.create_index('idx_flow_states_session', 'flow_states', 
+                   ['session_id'], unique=True)
+    op.create_index('idx_flow_states_user_flow', 'flow_states', 
+                   ['user_id', 'flow_id', 'bot_id'])
+    op.create_index('idx_flow_states_expires', 'flow_states', 
+                   ['expires_at'])
+    
+    # payment_rails table (configuration)
+    op.create_table('payment_rails',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('rail_code', sa.String(32), nullable=False),
+        sa.Column('name', sa.String(128), nullable=False),
+        sa.Column('description', sa.Text, nullable=True),
+        sa.Column('currencies', postgresql.JSONB, nullable=False, 
+                 server_default='[]'),
+        sa.Column('regions', postgresql.JSONB, nullable=False, 
+                 server_default='[]'),
+        sa.Column('providers', postgresql.JSONB, nullable=False, 
+                 server_default='[]'),
+        sa.Column('priority', sa.Integer, nullable=False, server_default='100'),
+        sa.Column('min_amount', sa.Numeric(10, 2), nullable=True),
+        sa.Column('max_amount', sa.Numeric(10, 2), nullable=True),
+        sa.Column('config', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('is_active', sa.Boolean, server_default='true'),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()'))
+    )
+    op.create_index('idx_payment_rails_tenant', 'payment_rails', 
+                   ['tenant_id', 'rail_code'], unique=True)
+    op.create_index('idx_payment_rails_active', 'payment_rails', 
+                   ['is_active', 'priority'])
+    
+    # feature_flags table
+    op.create_table('feature_flags',
+        sa.Column('id', postgresql.UUID(as_uuid=True), 
+                 server_default=sa.text('gen_random_uuid()'), 
+                 primary_key=True),
+        sa.Column('tenant_id', postgresql.UUID(as_uuid=True), 
+                 sa.ForeignKey('tenants.id', ondelete='CASCADE'), 
+                 nullable=False),
+        sa.Column('flag_name', sa.String(128), nullable=False),
+        sa.Column('description', sa.Text, nullable=True),
+        sa.Column('is_enabled', sa.Boolean, server_default='false'),
+        sa.Column('rollout_percentage', sa.Integer, server_default='0'),
+        sa.Column('target_users', postgresql.JSONB, nullable=False, 
+                 server_default='[]'),
+        sa.Column('target_bots', postgresql.JSONB, nullable=False, 
+                 server_default='[]'),
+        sa.Column('target_regions', postgresql.JSONB, nullable=False, 
+                 server_default='[]'),
+        sa.Column('config', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('metadata', postgresql.JSONB, nullable=False, 
+                 server_default='{}'),
+        sa.Column('created_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime(timezone=True), 
+                 server_default=sa.text('now()'), 
+                 onupdate=sa.text('now()'))
+    )
+    op.create_index('idx_feature_flags_tenant', 'feature_flags', 
+                   ['tenant_id', 'flag_name'], unique=True)
+    op.create_index('idx_feature_flags_enabled', 'feature_flags', 
+                   ['is_enabled', 'rollout_percentage'])
+
+
+def downgrade() -> None:
+    op.drop_table('feature_flags')
+    op.drop_table('payment_rails')
+    op.drop_table('flow_states')
+    op.drop_table('antifraud_events')
+    op.drop_table('invoices')
+    op.drop_table('entitlements')
+    op.drop_table('subscriptions')
+    op.drop_table('audit_logs')
+    op.drop_table('webhook_events')
+    op.drop_table('payment_intents')
+    op.drop_table('offers')
+    op.drop_table('users')
+    op.drop_table('bots')
+    op.drop_table('tenants')

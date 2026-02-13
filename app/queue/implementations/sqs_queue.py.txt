@@ -1,0 +1,765 @@
+"""
+Implementação de fila usando AWS SQS.
+Adequada para ambientes cloud na AWS com alta disponibilidade.
+"""
+
+import asyncio
+import json
+import uuid
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Callable
+import logging
+
+import boto3
+from botocore.config import Config
+from aiobotocore.session import get_session
+from aiobotocore.client import AioBaseClient
+
+from ...queue.base import (
+    BaseQueue, QueueMessage, QueueMetadata, DeadLetterQueue,
+    QueueError, QueuePublishError, IdempotencyViolationError
+)
+from ...queue.queue_metrics import QueueMetricsCollector
+
+logger = logging.getLogger(__name__)
+
+
+class SQSQueue(BaseQueue):
+    """
+    Implementação de fila usando AWS SQS.
+    Integração nativa com ecossistema AWS.
+    """
+    
+    def __init__(
+        self,
+        region_name: str = "us-east-1",
+        access_key_id: Optional[str] = None,
+        secret_access_key: Optional[str] = None,
+        endpoint_url: Optional[str] = None,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        
+        self.region_name = region_name
+        self.access_key_id = access_key_id
+        self.secret_access_key = secret_access_key
+        self.endpoint_url = endpoint_url
+        
+        # Cliente SQS
+        self.sqs_client: Optional[AioBaseClient] = None
+        self._session = None
+        
+        # Cache de URLs de fila
+        self.queue_urls: Dict[str, str] = {}
+        self.queue_arns: Dict[str, str] = {}
+        
+        # Controle de consumidores
+        self._consumers: Dict[str, asyncio.Task] = {}
+        
+        # Configurações SQS
+        self.max_message_size = 256 * 1024  # 256KB (limite SQS)
+        self.default_wait_time_seconds = 20
+        self.message_retention_period = 345600  # 4 dias
+        self.visibility_timeout = 300  # 5 minutos padrão
+        self.max_receive_count = 3  # Para redrive policy
+        
+        # Métricas
+        self.metrics_collector = QueueMetricsCollector(self.metrics) if self.metrics else None
+        
+        logger.info(f"SQSQueue initialized for region: {region_name}")
+    
+    async def _get_client(self) -> AioBaseClient:
+        """Retorna cliente SQS assíncrono"""
+        if self.sqs_client:
+            return self.sqs_client
+        
+        session = get_session()
+        
+        client_kwargs = {
+            "region_name": self.region_name,
+            "config": Config(
+                retries={
+                    'max_attempts': 3,
+                    'mode': 'standard'
+                },
+                connect_timeout=10,
+                read_timeout=30
+            )
+        }
+        
+        if self.access_key_id and self.secret_access_key:
+            client_kwargs["aws_access_key_id"] = self.access_key_id
+            client_kwargs["aws_secret_access_key"] = self.secret_access_key
+        
+        if self.endpoint_url:
+            client_kwargs["endpoint_url"] = self.endpoint_url
+        
+        self.sqs_client = await session.create_client(
+            "sqs",
+            **client_kwargs
+        ).__aenter__()
+        
+        return self.sqs_client
+    
+    async def _get_queue_url(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None,
+        create_if_missing: bool = True
+    ) -> str:
+        """Obtém ou cria URL da fila SQS"""
+        
+        cache_key = f"{tenant_id}:{queue_name}" if tenant_id else queue_name
+        
+        if cache_key in self.queue_urls:
+            return self.queue_urls[cache_key]
+        
+        client = await self._get_client()
+        
+        # Nome da fila no SQS
+        sqs_queue_name = f"{tenant_id}_{queue_name}" if tenant_id else queue_name
+        sqs_queue_name = sqs_queue_name.replace(".", "_").replace(":", "_")
+        
+        try:
+            # Tenta obter URL existente
+            response = await client.get_queue_url(QueueName=sqs_queue_name)
+            queue_url = response["QueueUrl"]
+            
+            # Obtém ARN da fila
+            queue_attrs = await client.get_queue_attributes(
+                QueueUrl=queue_url,
+                AttributeNames=["QueueArn"]
+            )
+            queue_arn = queue_attrs["Attributes"]["QueueArn"]
+            
+            self.queue_urls[cache_key] = queue_url
+            self.queue_arns[cache_key] = queue_arn
+            
+            logger.debug(f"Found existing SQS queue: {sqs_queue_name}")
+            
+            return queue_url
+            
+        except client.exceptions.QueueDoesNotExist:
+            if not create_if_missing:
+                raise QueueError(
+                    f"Queue does not exist: {sqs_queue_name}",
+                    tenant_id=tenant_id,
+                    queue_name=queue_name
+                )
+            
+            # Cria nova fila
+            attributes = {
+                "DelaySeconds": "0",
+                "MaximumMessageSize": str(self.max_message_size),
+                "MessageRetentionPeriod": str(self.message_retention_period),
+                "ReceiveMessageWaitTimeSeconds": str(self.default_wait_time_seconds),
+                "VisibilityTimeout": str(self.visibility_timeout),
+            }
+            
+            # Configura DLQ se disponível
+            if self.dead_letter_queue:
+                # Cria DLQ primeiro
+                dlq_name = f"{sqs_queue_name}_dlq"
+                dlq_response = await client.create_queue(
+                    QueueName=dlq_name,
+                    Attributes={
+                        "MessageRetentionPeriod": "1209600"  # 14 dias para DLQ
+                    }
+                )
+                dlq_url = dlq_response["QueueUrl"]
+                
+                # Obtém ARN da DLQ
+                dlq_attrs = await client.get_queue_attributes(
+                    QueueUrl=dlq_url,
+                    AttributeNames=["QueueArn"]
+                )
+                dlq_arn = dlq_attrs["Attributes"]["QueueArn"]
+                
+                # Configura redrive policy
+                attributes["RedrivePolicy"] = json.dumps({
+                    "deadLetterTargetArn": dlq_arn,
+                    "maxReceiveCount": str(self.max_receive_count)
+                })
+            
+            # Cria fila principal
+            response = await client.create_queue(
+                QueueName=sqs_queue_name,
+                Attributes=attributes
+            )
+            queue_url = response["QueueUrl"]
+            
+            # Obtém ARN
+            queue_attrs = await client.get_queue_attributes(
+                QueueUrl=queue_url,
+                AttributeNames=["QueueArn"]
+            )
+            queue_arn = queue_attrs["Attributes"]["QueueArn"]
+            
+            self.queue_urls[cache_key] = queue_url
+            self.queue_arns[cache_key] = queue_arn
+            
+            logger.info(f"Created SQS queue: {sqs_queue_name}")
+            
+            return queue_url
+            
+        except Exception as e:
+            logger.error(f"Error getting queue URL: {str(e)}")
+            raise QueueError(
+                f"Failed to get queue URL: {str(e)}",
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                original_error=e
+            )
+    
+    async def publish(
+        self,
+        queue_name: str,
+        payload: Any,
+        tenant_id: str,
+        delay_seconds: int = 0,
+        idempotency_key: Optional[str] = None,
+        source: str = "unknown"
+    ) -> QueueMessage:
+        """Publica mensagem no SQS"""
+        
+        client = await self._get_client()
+        queue_url = await self._get_queue_url(queue_name, tenant_id)
+        
+        # Cria metadados
+        metadata = QueueMetadata(
+            tenant_id=tenant_id,
+            source=source
+        )
+        
+        # Cria mensagem
+        queue_message = QueueMessage(
+            metadata=metadata,
+            payload=payload,
+            queue_name=queue_name
+        )
+        
+        # Serializa mensagem
+        message_data = queue_message.serialize()
+        
+        # Verifica tamanho
+        if len(message_data) > self.max_message_size:
+            raise QueuePublishError(
+                f"Message too large: {len(message_data)} bytes (max: {self.max_message_size})",
+                tenant_id=tenant_id,
+                queue_name=queue_name
+            )
+        
+        # Atributos da mensagem
+        message_attributes = {
+            "TenantId": {
+                "StringValue": tenant_id,
+                "DataType": "String"
+            },
+            "MessageId": {
+                "StringValue": queue_message.metadata.message_id,
+                "DataType": "String"
+            },
+            "CorrelationId": {
+                "StringValue": queue_message.metadata.correlation_id,
+                "DataType": "String"
+            },
+            "Source": {
+                "StringValue": source,
+                "DataType": "String"
+            },
+            "CreatedAt": {
+                "StringValue": queue_message.metadata.created_at.isoformat(),
+                "DataType": "String"
+            },
+            "QueueName": {
+                "StringValue": queue_name,
+                "DataType": "String"
+            }
+        }
+        
+        if idempotency_key:
+            message_attributes["IdempotencyKey"] = {
+                "StringValue": idempotency_key,
+                "DataType": "String"
+            }
+        
+        try:
+            # Parâmetros de envio
+            send_params = {
+                "QueueUrl": queue_url,
+                "MessageBody": message_data,
+                "MessageAttributes": message_attributes,
+                "DelaySeconds": delay_seconds
+            }
+            
+            # Se FIFO queue, adiciona parâmetros específicos
+            if queue_name.endswith(".fifo"):
+                send_params["MessageGroupId"] = tenant_id or "default"
+                if idempotency_key:
+                    send_params["MessageDeduplicationId"] = idempotency_key
+            
+            # Publica mensagem
+            response = await client.send_message(**send_params)
+            
+            # Armazena MessageId do SQS
+            queue_message._sqs_message_id = response["MessageId"]
+            queue_message._sqs_queue_url = queue_url
+            
+            # Registra métricas
+            if self.metrics_collector:
+                await self.metrics_collector.record_message_published(
+                    queue_name, tenant_id, len(message_data)
+                )
+            
+            logger.debug(
+                f"Published message {queue_message.metadata.message_id} "
+                f"to SQS queue {queue_name} (tenant: {tenant_id})"
+            )
+            
+            return queue_message
+            
+        except Exception as e:
+            logger.error(f"SQS publish error: {str(e)}")
+            raise QueuePublishError(
+                f"SQS error: {str(e)}",
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                original_error=e
+            )
+    
+    async def receive_message(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None,
+        visibility_timeout: int = 300
+    ) -> Optional[QueueMessage]:
+        """Recebe mensagem do SQS"""
+        
+        client = await self._get_client()
+        
+        try:
+            # Obtém URL da fila
+            queue_url = await self._get_queue_url(queue_name, tenant_id, create_if_missing=False)
+            
+            # Recebe mensagem
+            response = await client.receive_message(
+                QueueUrl=queue_url,
+                MaxNumberOfMessages=1,
+                MessageAttributeNames=["All"],
+                AttributeNames=["All"],
+                VisibilityTimeout=visibility_timeout,
+                WaitTimeSeconds=0  # Polling não bloqueante
+            )
+            
+            messages = response.get("Messages", [])
+            
+            if not messages:
+                return None
+            
+            sqs_message = messages[0]
+            
+            # Desserializa mensagem
+            message_data = sqs_message["Body"]
+            queue_message = QueueMessage.deserialize(message_data)
+            
+            # Armazena metadados do SQS
+            queue_message._sqs_message = sqs_message
+            queue_message._sqs_queue_url = queue_url
+            
+            # Registra métricas
+            if self.metrics_collector:
+                # Obtém atributos da fila para profundidade
+                queue_attrs = await client.get_queue_attributes(
+                    QueueUrl=queue_url,
+                    AttributeNames=["ApproximateNumberOfMessages"]
+                )
+                queue_depth = int(queue_attrs["Attributes"].get(
+                    "ApproximateNumberOfMessages", 0
+                ))
+                
+                await self.metrics_collector.record_queue_depth(
+                    queue_name,
+                    queue_message.metadata.tenant_id,
+                    queue_depth
+                )
+            
+            logger.debug(f"Received message {queue_message.metadata.message_id} from SQS")
+            return queue_message
+            
+        except client.exceptions.QueueDoesNotExist:
+            logger.warning(f"Queue does not exist: {queue_name} (tenant: {tenant_id})")
+            return None
+        except Exception as e:
+            logger.error(f"SQS receive error: {str(e)}")
+            return None
+    
+    async def acknowledge(self, message: QueueMessage) -> None:
+        """Confirma processamento de mensagem no SQS"""
+        
+        if not hasattr(message, '_sqs_message') or not hasattr(message, '_sqs_queue_url'):
+            logger.warning(f"No SQS message found to acknowledge: {message.metadata.message_id}")
+            return
+        
+        client = await self._get_client()
+        
+        try:
+            await client.delete_message(
+                QueueUrl=message._sqs_queue_url,
+                ReceiptHandle=message._sqs_message["ReceiptHandle"]
+            )
+            
+            logger.debug(f"Acknowledged SQS message {message.metadata.message_id}")
+            
+        except Exception as e:
+            logger.error(f"SQS acknowledge error: {str(e)}")
+            raise QueueError(
+                f"Failed to acknowledge message: {str(e)}",
+                tenant_id=message.metadata.tenant_id,
+                queue_name=message.queue_name,
+                original_error=e
+            )
+    
+    async def nack(
+        self,
+        message: QueueMessage,
+        error: Optional[str] = None,
+        retry_after: Optional[int] = None
+    ) -> None:
+        """Nega confirmação de mensagem no SQS"""
+        
+        if not hasattr(message, '_sqs_message') or not hasattr(message, '_sqs_queue_url'):
+            logger.warning(f"No SQS message found to nack: {message.metadata.message_id}")
+            return
+        
+        client = await self._get_client()
+        
+        try:
+            if retry_after is not None:
+                # Altera timeout de visibilidade para retry
+                await client.change_message_visibility(
+                    QueueUrl=message._sqs_queue_url,
+                    ReceiptHandle=message._sqs_message["ReceiptHandle"],
+                    VisibilityTimeout=retry_after
+                )
+                
+                logger.debug(f"Changed visibility for retry: {message.metadata.message_id}")
+                
+            else:
+                # SQS gerencia DLQ automaticamente com RedrivePolicy
+                # Apenas registra no nosso DLQ customizado
+                if self.dead_letter_queue:
+                    await self.dead_letter_queue.store_failed_message(
+                        message, error or "Unknown error", error
+                    )
+                
+                # Não deleta - SQS move automaticamente para DLQ após maxReceiveCount
+                # Apenas registra que a mensagem falhou
+                logger.debug(f"Nacked SQS message {message.metadata.message_id}")
+                
+        except Exception as e:
+            logger.error(f"SQS nack error: {str(e)}")
+            raise QueueError(
+                f"Failed to nack message: {str(e)}",
+                tenant_id=message.metadata.tenant_id,
+                queue_name=message.queue_name,
+                original_error=e
+            )
+    
+    async def consume(
+        self,
+        queue_name: str,
+        callback: Callable[[QueueMessage], Any],
+        tenant_id: Optional[str] = None,
+        batch_size: int = 10,
+        visibility_timeout: int = 300
+    ) -> None:
+        """Consome mensagens continuamente do SQS"""
+        
+        consumer_id = f"consumer_{uuid.uuid4().hex[:8]}"
+        logger.info(f"Starting SQS consumer {consumer_id} for queue {queue_name}")
+        
+        # Registra worker ativo
+        if self.metrics_collector:
+            await self.metrics_collector.record_worker_status(
+                consumer_id, tenant_id or "all", True
+            )
+        
+        client = await self._get_client()
+        queue_url = await self._get_queue_url(queue_name, tenant_id, create_if_missing=False)
+        
+        while not self._shutting_down:
+            try:
+                # Recebe mensagens em lote
+                response = await client.receive_message(
+                    QueueUrl=queue_url,
+                    MaxNumberOfMessages=min(batch_size, 10),  # SQS max é 10
+                    MessageAttributeNames=["All"],
+                    AttributeNames=["All"],
+                    VisibilityTimeout=visibility_timeout,
+                    WaitTimeSeconds=self.default_wait_time_seconds
+                )
+                
+                messages = response.get("Messages", [])
+                
+                if not messages:
+                    continue
+                
+                # Processa cada mensagem
+                for sqs_message in messages:
+                    if self._shutting_down:
+                        break
+                    
+                    queue_message = None
+                    
+                    try:
+                        # Desserializa mensagem
+                        message_data = sqs_message["Body"]
+                        queue_message = QueueMessage.deserialize(message_data)
+                        queue_message._sqs_message = sqs_message
+                        queue_message._sqs_queue_url = queue_url
+                        
+                        # Processa mensagem
+                        start_time = time.time()
+                        
+                        if asyncio.iscoroutinefunction(callback):
+                            result = await callback(queue_message)
+                        else:
+                            result = callback(queue_message)
+                        
+                        processing_time = (time.time() - start_time) * 1000
+                        
+                        # Registra métricas de sucesso
+                        if self.metrics_collector:
+                            await self.metrics_collector.record_message_consumed(
+                                queue_name,
+                                queue_message.metadata.tenant_id,
+                                processing_time,
+                                success=True
+                            )
+                        
+                        # Confirma mensagem
+                        await client.delete_message(
+                            QueueUrl=queue_url,
+                            ReceiptHandle=sqs_message["ReceiptHandle"]
+                        )
+                        
+                        logger.debug(
+                            f"Processed message {queue_message.metadata.message_id} "
+                            f"in {processing_time:.2f}ms"
+                        )
+                        
+                    except Exception as e:
+                        # Registra métricas de falha
+                        tenant = queue_message.metadata.tenant_id if queue_message else "unknown"
+                        
+                        if self.metrics_collector:
+                            await self.metrics_collector.record_message_consumed(
+                                queue_name,
+                                tenant,
+                                0,
+                                success=False
+                            )
+                        
+                        logger.error(f"Error processing message: {str(e)}")
+                        
+                        # Nega confirmação
+                        if queue_message:
+                            await self.nack(queue_message, str(e))
+                        else:
+                            # Se não conseguiu desserializar, apenas ignora
+                            await client.delete_message(
+                                QueueUrl=queue_url,
+                                ReceiptHandle=sqs_message["ReceiptHandle"]
+                            )
+                
+            except Exception as e:
+                logger.error(f"Error in SQS consumer {consumer_id}: {str(e)}")
+                await asyncio.sleep(1)
+        
+        # Registra worker inativo
+        if self.metrics_collector:
+            await self.metrics_collector.record_worker_status(
+                consumer_id, tenant_id or "all", False
+            )
+        
+        logger.info(f"SQS consumer {consumer_id} stopped")
+    
+    async def get_queue_stats(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Obtém estatísticas da fila no SQS"""
+        
+        client = await self._get_client()
+        
+        stats = {
+            "queue_name": queue_name,
+            "timestamp": datetime.utcnow().isoformat(),
+            "total_messages": 0,
+            "tenant_distribution": {}
+        }
+        
+        try:
+            # Para cada tenant (ou todos)
+            if tenant_id:
+                tenants = [tenant_id]
+            else:
+                # Lista todas as filas com este padrão
+                response = await client.list_queues(QueueNamePrefix=queue_name.replace(".", "_"))
+                queue_urls = response.get("QueueUrls", [])
+                tenants = []
+                
+                for url in queue_urls:
+                    queue_name_from_url = url.split("/")[-1]
+                    if queue_name in queue_name_from_url:
+                        parts = queue_name_from_url.split("_")
+                        if len(parts) > 1:
+                            tenants.append(parts[0])
+            
+            for t_id in tenants:
+                try:
+                    queue_url = await self._get_queue_url(queue_name, t_id, create_if_missing=False)
+                    
+                    # Obtém atributos da fila
+                    response = await client.get_queue_attributes(
+                        QueueUrl=queue_url,
+                        AttributeNames=[
+                            "ApproximateNumberOfMessages",
+                            "ApproximateNumberOfMessagesNotVisible",
+                            "ApproximateNumberOfMessagesDelayed",
+                            "CreatedTimestamp",
+                            "LastModifiedTimestamp"
+                        ]
+                    )
+                    
+                    attrs = response["Attributes"]
+                    visible = int(attrs.get("ApproximateNumberOfMessages", 0))
+                    not_visible = int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0))
+                    delayed = int(attrs.get("ApproximateNumberOfMessagesDelayed", 0))
+                    
+                    stats["tenant_distribution"][t_id] = {
+                        "visible": visible,
+                        "processing": not_visible,
+                        "delayed": delayed,
+                        "created_at": datetime.fromtimestamp(
+                            int(attrs.get("CreatedTimestamp", 0))
+                        ).isoformat() if attrs.get("CreatedTimestamp") else None
+                    }
+                    stats["total_messages"] += visible + not_visible + delayed
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to get stats for tenant {t_id}: {str(e)}")
+                    stats["tenant_distribution"][t_id] = {
+                        "visible": 0,
+                        "processing": 0,
+                        "delayed": 0
+                    }
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting queue stats: {str(e)}")
+            return stats
+    
+    async def purge_queue(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> None:
+        """Limpa fila inteira no SQS"""
+        
+        client = await self._get_client()
+        queue_url = await self._get_queue_url(queue_name, tenant_id, create_if_missing=False)
+        
+        try:
+            await client.purge_queue(QueueUrl=queue_url)
+            logger.info(f"Purged SQS queue {queue_name}")
+            
+        except Exception as e:
+            logger.error(f"Error purging queue: {str(e)}")
+            raise QueueError(
+                f"Failed to purge queue: {str(e)}",
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                original_error=e
+            )
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Verifica saúde do SQS"""
+        
+        try:
+            client = await self._get_client()
+            
+            # Lista filas para testar conexão
+            await client.list_queues(MaxResults=1)
+            
+            return {
+                "sqs_healthy": True,
+                "connected": True,
+                "region": self.region_name,
+                "queues_cached": len(self.queue_urls),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            return {
+                "sqs_healthy": False,
+                "error": str(e),
+                "connected": False,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+    
+    async def shutdown(self):
+        """Desliga a fila de forma segura"""
+        await super().shutdown()
+        
+        # Para todos os consumers
+        for task in self._consumers.values():
+            task.cancel()
+        
+        if self._consumers:
+            await asyncio.gather(*self._consumers.values(), return_exceptions=True)
+        
+        # Fecha cliente
+        if self.sqs_client:
+            await self.sqs_client.__aexit__(None, None, None)
+            self.sqs_client = None
+        
+        # Limpa caches
+        self.queue_urls.clear()
+        self.queue_arns.clear()
+        
+        logger.info("SQSQueue shut down successfully")
+
+
+def create_sqs_queue(
+    region_name: Optional[str] = None,
+    access_key_id: Optional[str] = None,
+    secret_access_key: Optional[str] = None,
+    endpoint_url: Optional[str] = None,
+    **kwargs
+) -> SQSQueue:
+    """Cria instância de fila SQS"""
+    
+    from ...queue.config import get_queue_settings
+    
+    settings = get_queue_settings()
+    
+    if not region_name:
+        region_name = settings.aws_region
+    
+    if not access_key_id:
+        access_key_id = settings.aws_access_key_id
+    
+    if not secret_access_key:
+        secret_access_key = settings.aws_secret_access_key
+    
+    return SQSQueue(
+        region_name=region_name,
+        access_key_id=access_key_id,
+        secret_access_key=secret_access_key,
+        endpoint_url=endpoint_url,
+        **kwargs
+    )

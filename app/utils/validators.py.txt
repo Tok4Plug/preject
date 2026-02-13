@@ -1,0 +1,539 @@
+"""
+Validadores centrais do sistema SaaS.
+Todas as validações são fail-safe e lançam exceções de domínio.
+"""
+
+import re
+import uuid
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from typing import Any, Optional, Tuple
+from urllib.parse import urlparse
+
+from ..exceptions import (
+    ValidationError,
+    CurrencyValidationError,
+    CountryValidationError,
+    AmountValidationError,
+    URLValidationError,
+    EmailValidationError,
+    TimestampValidationError,
+    IdentifierValidationError,
+)
+
+
+class SaaSValidators:
+    """Validações padronizadas para o sistema SaaS multi-tenant."""
+    
+    # ISO 4217 - Moedas suportadas inicialmente
+    SUPPORTED_CURRENCIES = {'BRL', 'USD', 'EUR', 'GBP', 'MXN', 'COP', 'CLP', 'PEN', 'ARS'}
+    
+    # ISO 3166-1 alpha-2 - Países/regiões suportadas
+    SUPPORTED_REGIONS = {
+        'BR',  # Brasil
+        'US',  # Estados Unidos
+        'GB',  # Reino Unido
+        'DE',  # Alemanha
+        'FR',  # França
+        'ES',  # Espanha
+        'PT',  # Portugal
+        'MX',  # México
+        'CO',  # Colômbia
+        'CL',  # Chile
+        'PE',  # Peru
+        'AR',  # Argentina
+        'EU',  # Região Europeia (abstração)
+        'LATAM',  # América Latina (abstração)
+        'GLOBAL',  # Fallback global
+    }
+    
+    @staticmethod
+    def validate_currency(currency: str) -> str:
+        """
+        Valida código de moeda ISO 4217.
+        
+        Args:
+            currency: Código da moeda (ex: 'USD')
+            
+        Returns:
+            Código da moeda normalizado em maiúsculas
+            
+        Raises:
+            CurrencyValidationError: Se a moeda não for suportada
+        """
+        if not currency:
+            raise CurrencyValidationError("Código da moeda não pode ser vazio")
+        
+        currency = currency.strip().upper()
+        
+        if not re.match(r'^[A-Z]{3}$', currency):
+            raise CurrencyValidationError(f"Código de moeda inválido: {currency}")
+        
+        if currency not in SaaSValidators.SUPPORTED_CURRENCIES:
+            raise CurrencyValidationError(
+                f"Moeda não suportada: {currency}. "
+                f"Suportadas: {', '.join(sorted(SaaSValidators.SUPPORTED_CURRENCIES))}"
+            )
+        
+        return currency
+    
+    @staticmethod
+    def validate_region(region: str) -> str:
+        """
+        Valida região/código de país.
+        
+        Args:
+            region: Código de região (ex: 'BR', 'EU')
+            
+        Returns:
+            Código da região normalizado em maiúsculas
+            
+        Raises:
+            CountryValidationError: Se a região não for suportada
+        """
+        if not region:
+            raise CountryValidationError("Código de região não pode ser vazio")
+        
+        region = region.strip().upper()
+        
+        if region not in SaaSValidators.SUPPORTED_REGIONS:
+            raise CountryValidationError(
+                f"Região não suportada: {region}. "
+                f"Suportadas: {', '.join(sorted(SaaSValidators.SUPPORTED_REGIONS))}"
+            )
+        
+        return region
+    
+    @staticmethod
+    def validate_amount(amount: Any, currency: str) -> Decimal:
+        """
+        Valida valor monetário com precisão específica por moeda.
+        
+        Args:
+            amount: Valor a ser validado (int, float, str, Decimal)
+            currency: Moeda para regras de precisão
+            
+        Returns:
+            Decimal normalizado
+            
+        Raises:
+            AmountValidationError: Se o valor for inválido
+        """
+        try:
+            # Converte para Decimal
+            if isinstance(amount, Decimal):
+                decimal_amount = amount
+            else:
+                decimal_amount = Decimal(str(amount))
+            
+            # Valida valor positivo
+            if decimal_amount <= 0:
+                raise AmountValidationError(
+                    f"Valor deve ser positivo: {decimal_amount}"
+                )
+            
+            # Regras de precisão por moeda
+            precision_rules = {
+                'BRL': 2,  # Reais - 2 casas decimais
+                'USD': 2,  # Dólar - 2 casas decimais
+                'EUR': 2,  # Euro - 2 casas decimais
+                'JPY': 0,  # Iene - 0 casas decimais
+                'KRW': 0,  # Won - 0 casas decimais
+            }
+            
+            # Verifica casas decimais
+            decimals = abs(decimal_amount.as_tuple().exponent)
+            max_decimals = precision_rules.get(currency, 2)
+            
+            if decimals > max_decimals:
+                raise AmountValidationError(
+                    f"Moeda {currency} suporta no máximo {max_decimals} "
+                    f"casas decimais. Valor: {decimal_amount}"
+                )
+            
+            # Valida limites por moeda (opcional)
+            max_amounts = {
+                'BRL': Decimal('1000000'),
+                'USD': Decimal('1000000'),
+                'EUR': Decimal('1000000'),
+            }
+            
+            max_amount = max_amounts.get(currency)
+            if max_amount and decimal_amount > max_amount:
+                raise AmountValidationError(
+                    f"Valor excede o máximo permitido para {currency}: "
+                    f"{decimal_amount} > {max_amount}"
+                )
+            
+            return decimal_amount.normalize()
+            
+        except (InvalidOperation, ValueError, TypeError) as e:
+            raise AmountValidationError(
+                f"Valor inválido: {amount}. Erro: {str(e)}"
+            )
+    
+    @staticmethod
+    def validate_url(url: str, https_required: bool = True) -> str:
+        """
+        Valida URL para webhooks, callbacks, etc.
+        
+        Args:
+            url: URL a ser validada
+            https_required: Exige HTTPS para produção
+            
+        Returns:
+            URL normalizada
+            
+        Raises:
+            URLValidationError: Se a URL for inválida
+        """
+        if not url:
+            raise URLValidationError("URL não pode ser vazia")
+        
+        url = url.strip()
+        
+        # Valida formato básico
+        try:
+            result = urlparse(url)
+        except Exception as e:
+            raise URLValidationError(f"URL com formato inválido: {url}. Erro: {str(e)}")
+        
+        if not all([result.scheme, result.netloc]):
+            raise URLValidationError(f"URL incompleta: {url}")
+        
+        # Valida esquema
+        if https_required and result.scheme != 'https':
+            raise URLValidationError(
+                f"URL deve usar HTTPS (produção): {url}"
+            )
+        
+        if result.scheme not in ('http', 'https'):
+            raise URLValidationError(
+                f"Esquema de URL não suportado: {result.scheme}"
+            )
+        
+        # Valida comprimento
+        if len(url) > 2000:
+            raise URLValidationError(
+                f"URL excede comprimento máximo (2000): {len(url)} caracteres"
+            )
+        
+        # Valida caracteres perigosos (prevenção básica)
+        dangerous_patterns = [
+            r'\.\./',  # Directory traversal
+            r'<script',  # XSS básico
+            r'javascript:',  # XSS
+        ]
+        
+        for pattern in dangerous_patterns:
+            if re.search(pattern, url, re.IGNORECASE):
+                raise URLValidationError(
+                    f"URL contém padrão perigoso: {pattern}"
+                )
+        
+        return url
+    
+    @staticmethod
+    def validate_email(email: str) -> str:
+        """
+        Valida endereço de e-mail com regex robusto.
+        
+        Args:
+            email: E-mail a ser validado
+            
+        Returns:
+            E-mail normalizado em minúsculas
+            
+        Raises:
+            EmailValidationError: Se o e-mail for inválido
+        """
+        if not email:
+            raise EmailValidationError("E-mail não pode ser vazio")
+        
+        email = email.strip().lower()
+        
+        # Regex RFC 5322 simplificado
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        
+        if not re.match(pattern, email):
+            raise EmailValidationError(f"Formato de e-mail inválido: {email}")
+        
+        # Valida comprimento
+        if len(email) > 254:
+            raise EmailValidationError(
+                f"E-mail excede comprimento máximo (254): {len(email)} caracteres"
+            )
+        
+        # Valida domínios conhecidos problemáticos (opcional)
+        disposable_domains = {
+            'tempmail.com', 'throwawaymail.com', '10minutemail.com'
+        }
+        
+        domain = email.split('@')[1]
+        if domain in disposable_domains:
+            raise EmailValidationError(
+                f"Domínios descartáveis não são permitidos: {domain}"
+            )
+        
+        return email
+    
+    @staticmethod
+    def validate_timestamp(
+        timestamp: Any,
+        min_date: Optional[datetime] = None,
+        max_date: Optional[datetime] = None
+    ) -> datetime:
+        """
+        Valida timestamp para auditoria, expirações, etc.
+        
+        Args:
+            timestamp: Timestamp (datetime, str ISO, int epoch)
+            min_date: Data mínima permitida
+            max_date: Data máxima permitida
+            
+        Returns:
+            datetime normalizado em UTC
+            
+        Raises:
+            TimestampValidationError: Se o timestamp for inválido
+        """
+        try:
+            # Converte para datetime
+            if isinstance(timestamp, datetime):
+                dt = timestamp
+            elif isinstance(timestamp, (int, float)):
+                dt = datetime.fromtimestamp(timestamp)
+            elif isinstance(timestamp, str):
+                # Tenta parse ISO
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            else:
+                raise ValueError(f"Tipo não suportado: {type(timestamp)}")
+            
+            # Garante timezone aware (assume UTC se não tiver)
+            from datetime import timezone
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            
+            # Normaliza para UTC
+            dt = dt.astimezone(timezone.utc)
+            
+            # Valida limites
+            if min_date and dt < min_date:
+                raise TimestampValidationError(
+                    f"Timestamp anterior à data mínima: {dt} < {min_date}"
+                )
+            
+            if max_date and dt > max_date:
+                raise TimestampValidationError(
+                    f"Timestamp posterior à data máxima: {dt} > {max_date}"
+                )
+            
+            # Valida não estar no futuro (para alguns casos)
+            now = datetime.now(timezone.utc)
+            if dt > now:
+                raise TimestampValidationError(
+                    f"Timestamp no futuro não permitido: {dt} > {now}"
+                )
+            
+            return dt
+            
+        except Exception as e:
+            raise TimestampValidationError(
+                f"Timestamp inválido: {timestamp}. Erro: {str(e)}"
+            )
+    
+    @staticmethod
+    def validate_identifier(identifier: str, prefix: str = None) -> str:
+        """
+        Valida identificadores internos (payment_intent, invoice, etc.).
+        
+        Args:
+            identifier: Identificador a ser validado
+            prefix: Prefixo esperado (ex: 'pi_' para payment_intent)
+            
+        Returns:
+            Identifier normalizado
+            
+        Raises:
+            IdentifierValidationError: Se o identifier for inválido
+        """
+        if not identifier:
+            raise IdentifierValidationError("Identificador não pode ser vazio")
+        
+        identifier = identifier.strip()
+        
+        # Valida comprimento
+        if len(identifier) < 5 or len(identifier) > 100:
+            raise IdentifierValidationError(
+                f"Identificador fora do tamanho permitido (5-100): {len(identifier)}"
+            )
+        
+        # Valida prefixo se especificado
+        if prefix and not identifier.startswith(prefix):
+            raise IdentifierValidationError(
+                f"Identificador deve começar com '{prefix}': {identifier}"
+            )
+        
+        # Valida caracteres (alphanumérico, underscore, hífen)
+        if not re.match(r'^[a-zA-Z0-9_-]+$', identifier):
+            raise IdentifierValidationError(
+                f"Identificador contém caracteres inválidos: {identifier}"
+            )
+        
+        return identifier
+    
+    @staticmethod
+    def validate_phone_number(phone: str) -> Tuple[str, str]:
+        """
+        Valida número de telefone e extrai código do país.
+        
+        Args:
+            phone: Número de telefone
+            
+        Returns:
+            Tupla (código_país, número_local)
+            
+        Raises:
+            ValidationError: Se o telefone for inválido
+        """
+        if not phone:
+            raise ValidationError("Número de telefone não pode ser vazio")
+        
+        # Remove espaços e caracteres especiais
+        phone = re.sub(r'[^\d+]', '', phone.strip())
+        
+        if not phone:
+            raise ValidationError("Número de telefone vazio após limpeza")
+        
+        # Tenta identificar código do país
+        country_codes = {
+            '55': 'BR',  # Brasil
+            '1': 'US',   # EUA/Canadá
+            '44': 'GB',  # Reino Unido
+            '33': 'FR',  # França
+            '49': 'DE',  # Alemanha
+            '34': 'ES',  # Espanha
+            '351': 'PT', # Portugal
+            '52': 'MX',  # México
+            '57': 'CO',  # Colômbia
+            '56': 'CL',  # Chile
+            '51': 'PE',  # Peru
+            '54': 'AR',  # Argentina
+        }
+        
+        # Procura pelo código do país
+        country_code = None
+        local_number = phone
+        
+        for code, country in sorted(country_codes.items(), key=lambda x: -len(x[0])):
+            if phone.startswith(code):
+                country_code = country
+                local_number = phone[len(code):]
+                break
+        
+        if not country_code:
+            # Assume Brasil como fallback (ajustável)
+            country_code = 'BR'
+        
+        # Valida comprimento do número local
+        if len(local_number) < 8 or len(local_number) > 15:
+            raise ValidationError(
+                f"Número local fora do tamanho válido (8-15): {len(local_number)}"
+            )
+        
+        return country_code, local_number
+    
+    @staticmethod
+    def validate_json_schema(data: dict, schema: dict) -> bool:
+        """
+        Valida dados contra um schema JSON simplificado.
+        
+        Args:
+            data: Dados a serem validados
+            schema: Schema de validação
+            
+        Returns:
+            True se válido
+            
+        Raises:
+            ValidationError: Se a validação falhar
+        """
+        # Implementação básica - pode ser expandida com jsonschema
+        required_fields = schema.get('required', [])
+        
+        for field in required_fields:
+            if field not in data:
+                raise ValidationError(f"Campo obrigatório faltando: {field}")
+        
+        # Valida tipos
+        type_mapping = {
+            'string': str,
+            'integer': int,
+            'number': (int, float, Decimal),
+            'boolean': bool,
+            'object': dict,
+            'array': list,
+        }
+        
+        for field, field_schema in schema.get('properties', {}).items():
+            if field not in data:
+                continue
+            
+            value = data[field]
+            expected_type = field_schema.get('type')
+            
+            if expected_type and expected_type in type_mapping:
+                expected_python_type = type_mapping[expected_type]
+                if not isinstance(value, expected_python_type):
+                    raise ValidationError(
+                        f"Campo '{field}' deve ser do tipo {expected_type}, "
+                        f"recebido {type(value).__name__}"
+                    )
+        
+        return True
+
+
+# Instância global para uso direto
+validators = SaaSValidators()
+
+
+def validate_tenant_id(tenant_id: str) -> str:
+    """Valida e normaliza ID do tenant."""
+    return validators.validate_identifier(tenant_id, 'tenant_')
+
+
+def validate_payment_intent_id(intent_id: str) -> str:
+    """Valida e normaliza ID do payment intent."""
+    return validators.validate_identifier(intent_id, 'pi_')
+
+
+def validate_invoice_id(invoice_id: str) -> str:
+    """Valida e normaliza ID da invoice."""
+    return validators.validate_identifier(invoice_id, 'inv_')
+
+
+def validate_webhook_id(webhook_id: str) -> str:
+    """Valida e normaliza ID do webhook."""
+    return validators.validate_identifier(webhook_id, 'wh_')
+
+
+def validate_uuid(value: str) -> str:
+    """Valida se é um UUID válido."""
+    try:
+        uuid_obj = uuid.UUID(value)
+        return str(uuid_obj)
+    except ValueError:
+        raise ValidationError(f"UUID inválido: {value}")
+
+
+def validate_percentage(value: Any) -> Decimal:
+    """Valida porcentagem (0-100)."""
+    try:
+        decimal_value = Decimal(str(value))
+        if decimal_value < 0 or decimal_value > 100:
+            raise ValidationError(
+                f"Porcentagem deve estar entre 0 e 100: {decimal_value}"
+            )
+        return decimal_value
+    except (InvalidOperation, ValueError) as e:
+        raise ValidationError(f"Porcentagem inválida: {value}. Erro: {str(e)}")

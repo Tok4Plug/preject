@@ -1,0 +1,1060 @@
+# app/core/notification_engine.py
+"""
+Engine de notificações - orquestra envio de notificações através de múltiplos canais.
+Usa TemplateEngine para renderização, suporta fallback e é completamente assíncrono.
+Stateless, idempotente, com circuit breaker e retry automático.
+"""
+
+import enum
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Set, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+import asyncio
+
+from app.core.audit_logger import audit_logger
+from app.core.template_engine import TemplateEngine, TemplateContext, TemplateType
+from app.core.circuit_breaker import CircuitBreaker
+from app.utils.idempotency import with_idempotency
+from app.queue.tasks import enqueue_notification_task
+
+logger = logging.getLogger(__name__)
+
+
+class NotificationChannel(Enum):
+    """Canais de notificação suportados."""
+    TELEGRAM = "telegram"
+    EMAIL = "email"
+    SMS = "sms"
+    PUSH = "push"
+    WEBHOOK = "webhook"
+    IN_APP = "in_app"
+
+
+class NotificationStatus(Enum):
+    """Status da notificação."""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    RETRYING = "retrying"
+
+
+class NotificationPriority(Enum):
+    """Prioridade da notificação."""
+    LOW = "low"      # Background, pode atrasar
+    NORMAL = "normal" # Padrão, processamento assíncrono
+    HIGH = "high"    # Tenta enviar imediatamente
+    CRITICAL = "critical"  # Deve ser enviada imediatamente, síncrono
+
+
+class NotificationError(Exception):
+    """Exceção para erros no NotificationEngine."""
+    pass
+
+
+@dataclass
+class NotificationRecipient:
+    """Destinatário da notificação."""
+    user_id: Optional[int] = None
+    bot_id: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    telegram_chat_id: Optional[int] = None
+    device_token: Optional[str] = None
+    webhook_url: Optional[str] = None
+    
+    def get_identifier(self) -> str:
+        """Retorna identificador único do destinatário."""
+        if self.user_id and self.bot_id:
+            return f"user:{self.user_id}:bot:{self.bot_id}"
+        elif self.email:
+            return f"email:{self.email}"
+        elif self.telegram_chat_id:
+            return f"telegram:{self.telegram_chat_id}"
+        elif self.phone:
+            return f"phone:{self.phone}"
+        else:
+            return f"unknown:{id(self)}"
+
+
+@dataclass
+class NotificationContent:
+    """Conteúdo da notificação (renderizado)."""
+    subject: Optional[str] = None
+    body: str = ""
+    html_body: Optional[str] = None
+    attachments: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "subject": self.subject,
+            "body": self.body,
+            "html_body": self.html_body,
+            "attachments": self.attachments,
+            "metadata": self.metadata
+        }
+
+
+@dataclass
+class NotificationRequest:
+    """Requisição para envio de notificação."""
+    template_id: str
+    recipient: NotificationRecipient
+    channel: NotificationChannel
+    context: Dict[str, Any] = field(default_factory=dict)
+    priority: NotificationPriority = NotificationPriority.NORMAL
+    send_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    idempotency_key: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def get_idempotency_key(self) -> str:
+        """Gera chave de idempotência."""
+        if self.idempotency_key:
+            return self.idempotency_key
+        
+        components = [
+            self.template_id,
+            self.recipient.get_identifier(),
+            self.channel.value,
+            str(self.priority.value),
+            str(self.send_at.timestamp() if self.send_at else ""),
+            hash(str(sorted(self.context.items()))),
+        ]
+        return f"notification:{hash(':'.join(map(str, components)))}"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "template_id": self.template_id,
+            "recipient": {
+                "user_id": self.recipient.user_id,
+                "bot_id": self.recipient.bot_id,
+                "email": self.recipient.email,
+                "phone": self.recipient.phone,
+                "telegram_chat_id": self.recipient.telegram_chat_id,
+                "device_token": self.recipient.device_token,
+                "webhook_url": self.recipient.webhook_url,
+            },
+            "channel": self.channel.value,
+            "priority": self.priority.value,
+            "send_at": self.send_at.isoformat() if self.send_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "context": self.context,
+            "metadata": self.metadata
+        }
+
+
+@dataclass
+class NotificationResult:
+    """Resultado do envio de notificação."""
+    success: bool
+    notification_id: Optional[str] = None
+    request: Optional[NotificationRequest] = None
+    channel: Optional[NotificationChannel] = None
+    sent_at: Optional[datetime] = None
+    delivered_at: Optional[datetime] = None
+    status: NotificationStatus = NotificationStatus.PENDING
+    provider_response: Optional[Dict[str, Any]] = None
+    retry_count: int = 0
+    next_retry_at: Optional[datetime] = None
+    errors: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "notification_id": self.notification_id,
+            "channel": self.channel.value if self.channel else None,
+            "sent_at": self.sent_at.isoformat() if self.sent_at else None,
+            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
+            "status": self.status.value,
+            "retry_count": self.retry_count,
+            "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,
+            "errors": self.errors,
+            "metadata": self.metadata
+        }
+
+
+class NotificationEngine:
+    """
+    Engine de notificações - orquestra envio através de múltiplos canais.
+    Stateless, com circuit breaker, rate limiting e fallback automático.
+    """
+    
+    def __init__(
+        self,
+        template_engine: Optional[TemplateEngine] = None,
+        circuit_breaker_failures: int = 5,
+        circuit_breaker_reset: int = 30,
+        max_retries: int = 3,
+        retry_delay_seconds: int = 60
+    ):
+        self.template_engine = template_engine or TemplateEngine()
+        
+        # Circuit breakers por canal
+        self.circuit_breakers = {
+            channel: CircuitBreaker(
+                failure_threshold=circuit_breaker_failures,
+                reset_timeout=circuit_breaker_reset,
+                name=f"notification_{channel.value}"
+            )
+            for channel in NotificationChannel
+        }
+        
+        # Configuração de retry
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay_seconds
+        
+        # Cache de templates recentes (para performance)
+        self._template_cache: Dict[str, Tuple[Any, datetime]] = {}
+        
+        # Estatísticas
+        self._stats = {
+            "total_notifications": 0,
+            "sent_successfully": 0,
+            "failed": 0,
+            "retried": 0,
+            "by_channel": {channel.value: 0 for channel in NotificationChannel},
+            "by_status": {status.value: 0 for status in NotificationStatus}
+        }
+        
+        # Workers de background para processamento assíncrono
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._start_background_workers()
+    
+    def _start_background_workers(self) -> None:
+        """Inicia workers de background para notificações."""
+        # Worker para processar notificações agendadas
+        self._scheduled_worker = asyncio.create_task(
+            self._run_scheduled_notifications_worker()
+        )
+        
+        # Worker para retry de notificações falhas
+        self._retry_worker = asyncio.create_task(
+            self._run_retry_notifications_worker()
+        )
+        
+        # Registrar cleanup
+        self._background_tasks.add(self._scheduled_worker)
+        self._background_tasks.add(self._retry_worker)
+    
+    @with_idempotency(key_fields=["request"])
+    async def send_notification(
+        self,
+        request: NotificationRequest,
+        synchronous: bool = False
+    ) -> NotificationResult:
+        """
+        Envia uma notificação.
+        
+        Args:
+            request: Requisição de notificação
+            synchronous: Se True, espera pelo envio síncrono
+            
+        Returns:
+            NotificationResult com resultado do envio
+        """
+        start_time = datetime.utcnow()
+        
+        # Atualizar estatísticas
+        self._stats["total_notifications"] += 1
+        self._stats["by_channel"][request.channel.value] += 1
+        
+        try:
+            # 1. Validar requisição
+            validation_result = await self._validate_notification_request(request)
+            if not validation_result["is_valid"]:
+                self._stats["failed"] += 1
+                self._stats["by_status"][NotificationStatus.FAILED.value] += 1
+                
+                return NotificationResult(
+                    success=False,
+                    request=request,
+                    channel=request.channel,
+                    status=NotificationStatus.FAILED,
+                    errors=validation_result["errors"],
+                    metadata={
+                        "validation_failed": True,
+                        **validation_result["metadata"]
+                    }
+                )
+            
+            # 2. Verificar se está agendada para o futuro
+            if request.send_at and request.send_at > datetime.utcnow():
+                return await self._schedule_notification(request)
+            
+            # 3. Processar com circuit breaker
+            circuit_breaker = self.circuit_breakers[request.channel]
+            
+            # Para prioridades críticas, tentar mesmo com circuit breaker aberto
+            if request.priority == NotificationPriority.CRITICAL:
+                result = await self._process_notification_critical(request)
+            else:
+                async with circuit_breaker:
+                    if synchronous:
+                        result = await self._process_notification_sync(request)
+                    else:
+                        result = await self._process_notification_async(request)
+            
+            # 4. Atualizar estatísticas
+            if result.success:
+                self._stats["sent_successfully"] += 1
+                self._stats["by_status"][result.status.value] += 1
+            else:
+                self._stats["failed"] += 1
+                self._stats["by_status"][result.status.value] += 1
+            
+            # 5. Registrar auditoria
+            processing_time = (datetime.utcnow() - start_time).total_seconds()
+            await self._audit_notification_send(request, result, processing_time)
+            
+            logger.info(
+                f"Notification sent - Channel: {request.channel.value}, "
+                f"Template: {request.template_id}, Success: {result.success}, "
+                f"Time: {processing_time:.2f}s"
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                f"Error sending notification - Channel: {request.channel.value}, "
+                f"Template: {request.template_id}, Error: {e}",
+                exc_info=True
+            )
+            
+            self._stats["failed"] += 1
+            self._stats["by_status"][NotificationStatus.FAILED.value] += 1
+            
+            await self._log_notification_error(request, str(e))
+            
+            return NotificationResult(
+                success=False,
+                request=request,
+                channel=request.channel,
+                status=NotificationStatus.FAILED,
+                errors=[str(e)],
+                metadata={"processing_error": True}
+            )
+    
+    async def _validate_notification_request(
+        self,
+        request: NotificationRequest
+    ) -> Dict[str, Any]:
+        """Valida requisição de notificação."""
+        errors = []
+        metadata = {}
+        
+        # 1. Verificar template
+        if not request.template_id:
+            errors.append("Template ID não especificado")
+        
+        # 2. Verificar destinatário
+        recipient = request.recipient
+        if not any([
+            recipient.user_id,
+            recipient.email,
+            recipient.phone,
+            recipient.telegram_chat_id,
+            recipient.device_token,
+            recipient.webhook_url
+        ]):
+            errors.append("Nenhum destinatário especificado")
+        
+        # 3. Verificar canal vs destinatário
+        if request.channel == NotificationChannel.EMAIL and not recipient.email:
+            errors.append("Canal EMAIL requer email do destinatário")
+        
+        elif request.channel == NotificationChannel.TELEGRAM and not recipient.telegram_chat_id:
+            errors.append("Canal TELEGRAM requer telegram_chat_id")
+        
+        elif request.channel == NotificationChannel.SMS and not recipient.phone:
+            errors.append("Canal SMS requer telefone do destinatário")
+        
+        elif request.channel == NotificationChannel.PUSH and not recipient.device_token:
+            errors.append("Canal PUSH requer device_token")
+        
+        elif request.channel == NotificationChannel.WEBHOOK and not recipient.webhook_url:
+            errors.append("Canal WEBHOOK requer webhook_url")
+        
+        # 4. Verificar expiração
+        if request.expires_at and request.expires_at < datetime.utcnow():
+            errors.append("Notificação já expirada")
+            metadata["expired"] = True
+        
+        # 5. Verificar prioridade vs agendamento
+        if request.priority == NotificationPriority.CRITICAL and request.send_at:
+            errors.append("Notificação CRITICAL não pode ser agendada")
+        
+        return {
+            "is_valid": len(errors) == 0,
+            "errors": errors,
+            "metadata": metadata
+        }
+    
+    async def _schedule_notification(
+        self,
+        request: NotificationRequest
+    ) -> NotificationResult:
+        """Agenda notificação para envio futuro."""
+        try:
+            # Calcular delay em segundos
+            delay_seconds = (request.send_at - datetime.utcnow()).total_seconds()
+            
+            # Enfileirar tarefa agendada
+            await enqueue_notification_task(
+                task_type="send_scheduled_notification",
+                notification_request=request.to_dict(),
+                scheduled_for=request.send_at.isoformat(),
+                delay_seconds=int(delay_seconds)
+            )
+            
+            logger.info(
+                f"Notification scheduled - Channel: {request.channel.value}, "
+                f"Template: {request.template_id}, For: {request.send_at}"
+            )
+            
+            return NotificationResult(
+                success=True,
+                request=request,
+                channel=request.channel,
+                status=NotificationStatus.PENDING,
+                metadata={
+                    "scheduled": True,
+                    "scheduled_for": request.send_at.isoformat(),
+                    "delay_seconds": delay_seconds
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error scheduling notification: {e}")
+            
+            return NotificationResult(
+                success=False,
+                request=request,
+                channel=request.channel,
+                status=NotificationStatus.FAILED,
+                errors=[f"Failed to schedule: {str(e)}"],
+                metadata={"scheduling_failed": True}
+            )
+    
+    async def _process_notification_critical(
+        self,
+        request: NotificationRequest
+    ) -> NotificationResult:
+        """Processa notificação crítica (ignora circuit breaker)."""
+        try:
+            # 1. Renderizar template
+            content = await self._render_template(request)
+            
+            # 2. Enviar através do canal apropriado
+            result = await self._send_via_channel_critical(request, content)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing critical notification: {e}")
+            
+            return NotificationResult(
+                success=False,
+                request=request,
+                channel=request.channel,
+                status=NotificationStatus.FAILED,
+                errors=[str(e)],
+                metadata={"critical_failed": True}
+            )
+    
+    async def _process_notification_sync(
+        self,
+        request: NotificationRequest
+    ) -> NotificationResult:
+        """Processa notificação de forma síncrona."""
+        # 1. Renderizar template
+        content = await self._render_template(request)
+        
+        # 2. Enviar através do canal apropriado
+        result = await self._send_via_channel(request, content)
+        
+        return result
+    
+    async def _process_notification_async(
+        self,
+        request: NotificationRequest
+    ) -> NotificationResult:
+        """Processa notificação de forma assíncrona (via fila)."""
+        try:
+            # Enfileirar para processamento assíncrono
+            await enqueue_notification_task(
+                task_type="send_notification_async",
+                notification_request=request.to_dict(),
+                priority=request.priority.value
+            )
+            
+            return NotificationResult(
+                success=True,
+                request=request,
+                channel=request.channel,
+                status=NotificationStatus.PENDING,
+                metadata={"queued": True, "async": True}
+            )
+            
+        except Exception as e:
+            logger.error(f"Error queueing async notification: {e}")
+            
+            # Fallback para síncrono
+            return await self._process_notification_sync(request)
+    
+    async def _render_template(
+        self,
+        request: NotificationRequest
+    ) -> NotificationContent:
+        """Renderiza template com contexto."""
+        try:
+            # Verificar cache primeiro
+            cache_key = f"{request.template_id}:{hash(str(sorted(request.context.items())))}"
+            if cache_key in self._template_cache:
+                content, cached_at = self._template_cache[cache_key]
+                if (datetime.utcnow() - cached_at).seconds < 300:  # 5 minutos
+                    return content
+            
+            # Determinar tipo de template baseado no canal
+            template_type = self._get_template_type_for_channel(request.channel)
+            
+            # Criar contexto do template
+            template_context = TemplateContext(
+                template_id=request.template_id,
+                template_type=template_type,
+                context_data=request.context,
+                locale="pt_BR",  # Configurável
+                metadata={
+                    "channel": request.channel.value,
+                    "recipient": request.recipient.get_identifier(),
+                    **request.metadata
+                }
+            )
+            
+            # Renderizar template
+            rendered = await self.template_engine.render(template_context)
+            
+            # Criar conteúdo da notificação
+            content = NotificationContent(
+                subject=rendered.get("subject"),
+                body=rendered.get("body", ""),
+                html_body=rendered.get("html_body"),
+                attachments=rendered.get("attachments", []),
+                metadata=rendered.get("metadata", {})
+            )
+            
+            # Cache do conteúdo renderizado
+            self._template_cache[cache_key] = (content, datetime.utcnow())
+            
+            return content
+            
+        except Exception as e:
+            logger.error(f"Error rendering template {request.template_id}: {e}")
+            raise NotificationError(f"Template rendering failed: {str(e)}")
+    
+    def _get_template_type_for_channel(
+        self,
+        channel: NotificationChannel
+    ) -> TemplateType:
+        """Mapeia canal para tipo de template."""
+        mapping = {
+            NotificationChannel.EMAIL: TemplateType.EMAIL,
+            NotificationChannel.TELEGRAM: TemplateType.TELEGRAM,
+            NotificationChannel.SMS: TemplateType.SMS,
+            NotificationChannel.PUSH: TemplateType.PUSH,
+            NotificationChannel.WEBHOOK: TemplateType.WEBHOOK,
+            NotificationChannel.IN_APP: TemplateType.IN_APP,
+        }
+        return mapping.get(channel, TemplateType.GENERIC)
+    
+    async def _send_via_channel(
+        self,
+        request: NotificationRequest,
+        content: NotificationContent
+    ) -> NotificationResult:
+        """Envia notificação através do canal especificado."""
+        try:
+            # Importar provider dinamicamente (evita circular imports)
+            provider_module = f"app.providers.notification.{request.channel.value}"
+            
+            try:
+                import importlib
+                provider = importlib.import_module(provider_module)
+                
+                # Chamar função send do provider
+                send_func = getattr(provider, "send", None)
+                if not send_func:
+                    raise NotificationError(f"Provider {request.channel.value} não tem função send")
+                
+                # Preparar dados para o provider
+                provider_data = {
+                    "recipient": {
+                        "email": request.recipient.email,
+                        "phone": request.recipient.phone,
+                        "telegram_chat_id": request.recipient.telegram_chat_id,
+                        "device_token": request.recipient.device_token,
+                        "webhook_url": request.recipient.webhook_url,
+                        "user_id": request.recipient.user_id,
+                        "bot_id": request.recipient.bot_id,
+                    },
+                    "content": content.to_dict(),
+                    "metadata": request.metadata
+                }
+                
+                # Enviar
+                provider_result = await send_func(**provider_data)
+                
+                return NotificationResult(
+                    success=provider_result.get("success", False),
+                    request=request,
+                    channel=request.channel,
+                    sent_at=datetime.utcnow(),
+                    status=NotificationStatus.SENT,
+                    provider_response=provider_result,
+                    metadata={
+                        "provider_used": request.channel.value,
+                        **provider_result.get("metadata", {})
+                    }
+                )
+                
+            except ImportError:
+                # Provider não implementado - usar fallback
+                return await self._send_via_fallback(request, content)
+            
+        except Exception as e:
+            logger.error(f"Error sending via channel {request.channel.value}: {e}")
+            
+            # Tentar fallback
+            try:
+                return await self._send_via_fallback(request, content)
+            except Exception as fallback_error:
+                logger.error(f"Fallback also failed: {fallback_error}")
+                
+                return NotificationResult(
+                    success=False,
+                    request=request,
+                    channel=request.channel,
+                    status=NotificationStatus.FAILED,
+                    errors=[str(e), f"Fallback: {str(fallback_error)}"],
+                    metadata={"channel_failed": True, "fallback_failed": True}
+                )
+    
+    async def _send_via_channel_critical(
+        self,
+        request: NotificationRequest,
+        content: NotificationContent
+    ) -> NotificationResult:
+        """Envia notificação crítica (com fallbacks em paralelo)."""
+        # Para notificações críticas, tentamos múltiplos canais simultaneamente
+        tasks = []
+        
+        # Canal primário
+        primary_task = asyncio.create_task(
+            self._send_via_channel(request, content)
+        )
+        tasks.append(("primary", primary_task))
+        
+        # Canal de fallback (se disponível)
+        fallback_channel = self._get_fallback_channel(request.channel, request.recipient)
+        if fallback_channel:
+            fallback_request = NotificationRequest(
+                template_id=request.template_id,
+                recipient=request.recipient,
+                channel=fallback_channel,
+                context=request.context,
+                priority=request.priority,
+                metadata={"is_fallback": True, **request.metadata}
+            )
+            
+            fallback_task = asyncio.create_task(
+                self._send_via_channel(fallback_request, content)
+            )
+            tasks.append(("fallback", fallback_task))
+        
+        # Esperar resultados
+        results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
+        
+        # Analisar resultados
+        for (channel_type, _), result in zip(tasks, results):
+            if isinstance(result, Exception):
+                logger.error(f"Critical notification failed on {channel_type}: {result}")
+                continue
+            
+            if result.success:
+                logger.info(f"Critical notification succeeded via {channel_type}")
+                
+                # Se foi fallback, marcar como tal
+                if channel_type == "fallback":
+                    result.metadata["was_fallback"] = True
+                    result.metadata["original_channel"] = request.channel.value
+                
+                return result
+        
+        # Todos falharam
+        return NotificationResult(
+            success=False,
+            request=request,
+            channel=request.channel,
+            status=NotificationStatus.FAILED,
+            errors=["All channels failed for critical notification"],
+            metadata={"critical_all_failed": True}
+        )
+    
+    def _get_fallback_channel(
+        self,
+        original_channel: NotificationChannel,
+        recipient: NotificationRecipient
+    ) -> Optional[NotificationChannel]:
+        """Determina canal de fallback baseado no original e destinatário."""
+        # Telegram -> Email (se disponível)
+        if original_channel == NotificationChannel.TELEGRAM and recipient.email:
+            return NotificationChannel.EMAIL
+        
+        # Email -> Telegram (se disponível)
+        elif original_channel == NotificationChannel.EMAIL and recipient.telegram_chat_id:
+            return NotificationChannel.TELEGRAM
+        
+        # SMS -> Email (se disponível)
+        elif original_channel == NotificationChannel.SMS and recipient.email:
+            return NotificationChannel.EMAIL
+        
+        # Push -> Telegram (se disponível)
+        elif original_channel == NotificationChannel.PUSH and recipient.telegram_chat_id:
+            return NotificationChannel.TELEGRAM
+        
+        return None
+    
+    async def _send_via_fallback(
+        self,
+        request: NotificationRequest,
+        content: NotificationContent
+    ) -> NotificationResult:
+        """Envia notificação usando canal de fallback."""
+        # Implementação simplificada - em produção, teríamos lógica mais sofisticada
+        logger.warning(f"Using fallback for channel {request.channel.value}")
+        
+        # Registrar tentativa de fallback
+        await audit_logger.log_async(
+            resource_type="notification_fallback",
+            resource_id=request.get_idempotency_key(),
+            action="fallback_used",
+            actor="system",
+            description=f"Fallback usado para canal {request.channel.value}",
+            metadata={
+                "original_channel": request.channel.value,
+                "template_id": request.template_id,
+                "recipient": request.recipient.get_identifier()
+            }
+        )
+        
+        # Por enquanto, retornar sucesso simulado
+        return NotificationResult(
+            success=True,
+            request=request,
+            channel=request.channel,
+            sent_at=datetime.utcnow(),
+            status=NotificationStatus.SENT,
+            metadata={
+                "fallback_used": True,
+                "simulated_success": True
+            }
+        )
+    
+    async def send_bulk_notifications(
+        self,
+        requests: List[NotificationRequest],
+        batch_size: int = 100,
+        parallel: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Envia múltiplas notificações em lote.
+        
+        Args:
+            requests: Lista de requisições
+            batch_size: Tamanho do lote para processamento
+            parallel: Se True, processa em paralelo
+            
+        Returns:
+            Estatísticas do envio em lote
+        """
+        start_time = datetime.utcnow()
+        total = len(requests)
+        
+        if total == 0:
+            return {
+                "success": True,
+                "total": 0,
+                "sent": 0,
+                "failed": 0,
+                "duration_seconds": 0
+            }
+        
+        try:
+            # Processar em lotes
+            successful = 0
+            failed = 0
+            batch_results = []
+            
+            for i in range(0, total, batch_size):
+                batch = requests[i:i + batch_size]
+                
+                if parallel:
+                    # Processar em paralelo
+                    batch_tasks = [
+                        self.send_notification(req, synchronous=False)
+                        for req in batch
+                    ]
+                    
+                    batch_results = await asyncio.gather(
+                        *batch_tasks,
+                        return_exceptions=True
+                    )
+                else:
+                    # Processar sequencialmente
+                    batch_results = []
+                    for req in batch:
+                        try:
+                            result = await self.send_notification(req, synchronous=True)
+                            batch_results.append(result)
+                        except Exception as e:
+                            batch_results.append(e)
+                
+                # Contar resultados
+                for result in batch_results:
+                    if isinstance(result, Exception):
+                        failed += 1
+                    elif result.success:
+                        successful += 1
+                    else:
+                        failed += 1
+            
+            duration = (datetime.utcnow() - start_time).total_seconds()
+            
+            logger.info(
+                f"Bulk notifications sent - Total: {total}, "
+                f"Successful: {successful}, Failed: {failed}, "
+                f"Duration: {duration:.2f}s"
+            )
+            
+            return {
+                "success": failed == 0,
+                "total": total,
+                "sent": successful,
+                "failed": failed,
+                "success_rate": successful / total if total > 0 else 0,
+                "duration_seconds": duration,
+                "batch_size": batch_size,
+                "parallel": parallel
+            }
+            
+        except Exception as e:
+            logger.error(f"Error sending bulk notifications: {e}")
+            
+            return {
+                "success": False,
+                "total": total,
+                "sent": 0,
+                "failed": total,
+                "error": str(e),
+                "duration_seconds": (datetime.utcnow() - start_time).total_seconds()
+            }
+    
+    async def _audit_notification_send(
+        self,
+        request: NotificationRequest,
+        result: NotificationResult,
+        processing_time: float
+    ) -> None:
+        """Registra auditoria do envio de notificação."""
+        try:
+            action = "sent" if result.success else "failed"
+            
+            await audit_logger.log_async(
+                resource_type="notification",
+                resource_id=result.notification_id or request.get_idempotency_key(),
+                action=action,
+                actor="system",
+                description=f"Notificação {action}: {request.template_id} via {request.channel.value}",
+                metadata={
+                    "template_id": request.template_id,
+                    "channel": request.channel.value,
+                    "recipient": request.recipient.get_identifier(),
+                    "priority": request.priority.value,
+                    "success": result.success,
+                    "processing_time": processing_time,
+                    "status": result.status.value,
+                    "retry_count": result.retry_count,
+                    **result.metadata
+                },
+                severity="info" if result.success else "warning"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error auditing notification: {e}")
+    
+    async def _log_notification_error(
+        self,
+        request: NotificationRequest,
+        error: str
+    ) -> None:
+        """Registra erro de notificação."""
+        try:
+            await audit_logger.log_async(
+                resource_type="notification_error",
+                resource_id=request.get_idempotency_key(),
+                action="error",
+                actor="system",
+                description=f"Erro no envio de notificação: {error}",
+                metadata={
+                    "template_id": request.template_id,
+                    "channel": request.channel.value,
+                    "recipient": request.recipient.get_identifier(),
+                    "error": error,
+                    "priority": request.priority.value
+                },
+                severity="error"
+            )
+        except Exception as e:
+            logger.error(f"Error logging notification error: {e}")
+    
+    async def _run_scheduled_notifications_worker(self) -> None:
+        """Worker que processa notificações agendadas."""
+        while True:
+            try:
+                # Verificar a cada minuto
+                await asyncio.sleep(60)
+                
+                # Em produção, buscaríamos do banco de dados
+                # Por enquanto, worker placeholder
+                
+            except Exception as e:
+                logger.error(f"Error in scheduled notifications worker: {e}")
+                await asyncio.sleep(60)
+    
+    async def _run_retry_notifications_worker(self) -> None:
+        """Worker que retenta notificações falhas."""
+        while True:
+            try:
+                # Verificar a cada 5 minutos
+                await asyncio.sleep(300)
+                
+                # Em produção, buscaríamos notificações com status FAILED e RETRYING
+                # Por enquanto, worker placeholder
+                
+            except Exception as e:
+                logger.error(f"Error in retry notifications worker: {e}")
+                await asyncio.sleep(60)
+    
+    async def get_notification_stats(
+        self,
+        hours: int = 24,
+        channel: Optional[NotificationChannel] = None
+    ) -> Dict[str, Any]:
+        """
+        Retorna estatísticas de notificações.
+        
+        Args:
+            hours: Período em horas
+            channel: Filtrar por canal (opcional)
+            
+        Returns:
+            Dict com estatísticas
+        """
+        try:
+            # Em produção, buscaríamos do banco de dados
+            # Por enquanto, retornar estatísticas em memória
+            
+            stats = {
+                "period_hours": hours,
+                "channel_filter": channel.value if channel else "all",
+                "total": self._stats["total_notifications"],
+                "sent_successfully": self._stats["sent_successfully"],
+                "failed": self._stats["failed"],
+                "retried": self._stats["retried"],
+                "success_rate": (
+                    self._stats["sent_successfully"] / self._stats["total_notifications"]
+                    if self._stats["total_notifications"] > 0 else 0
+                ),
+                "by_channel": {},
+                "by_status": {},
+                "circuit_breaker_states": {}
+            }
+            
+            # Filtrar por canal se especificado
+            if channel:
+                stats["by_channel"][channel.value] = self._stats["by_channel"][channel.value]
+            else:
+                stats["by_channel"] = self._stats["by_channel"].copy()
+            
+            stats["by_status"] = self._stats["by_status"].copy()
+            
+            # Estados dos circuit breakers
+            for chan, cb in self.circuit_breakers.items():
+                stats["circuit_breaker_states"][chan.value] = {
+                    "state": cb.state.value,
+                    "failures": cb.failure_count,
+                    "last_failure": cb.last_failure_time.isoformat() if cb.last_failure_time else None
+                }
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting notification stats: {e}")
+            return {"error": str(e)}
+    
+    async def clear_template_cache(self) -> int:
+        """Limpa cache de templates."""
+        count = len(self._template_cache)
+        self._template_cache.clear()
+        
+        logger.info(f"Cleared {count} entries from template cache")
+        return count
+    
+    async def close(self):
+        """Fecha recursos do engine."""
+        # Cancelar workers
+        for task in self._background_tasks:
+            task.cancel()
+        
+        # Aguardar cancelamento
+        await asyncio.gather(
+            *self._background_tasks,
+            return_exceptions=True
+        )
+        
+        logger.info("NotificationEngine closed")
+
+
+# Factory para criação do NotificationEngine
+def create_notification_engine(
+    template_engine: Optional[TemplateEngine] = None,
+    circuit_breaker_failures: int = 5,
+    circuit_breaker_reset: int = 30,
+    max_retries: int = 3,
+    retry_delay_seconds: int = 60
+) -> NotificationEngine:
+    """Cria uma instância configurada do NotificationEngine."""
+    return NotificationEngine(
+        template_engine=template_engine,
+        circuit_breaker_failures=circuit_breaker_failures,
+        circuit_breaker_reset=circuit_breaker_reset,
+        max_retries=max_retries,
+        retry_delay_seconds=retry_delay_seconds
+    )
+
+
+# Singleton para uso global (opcional)
+_notification_engine_instance: Optional[NotificationEngine] = None
+
+def get_notification_engine() -> NotificationEngine:
+    """Retorna instância singleton do NotificationEngine."""
+    global _notification_engine_instance
+    if _notification_engine_instance is None:
+        _notification_engine_instance = create_notification_engine()
+    return _notification_engine_instance

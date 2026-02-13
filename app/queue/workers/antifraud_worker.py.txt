@@ -1,0 +1,762 @@
+"""
+Worker especializado para análise anti-fraude em tempo real.
+Analisa padrões, fingerprints, comportamentos suspeitos.
+"""
+
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, List, Tuple
+import asyncio
+
+from ...core.antifraud import AntifraudEngine
+from ...core.metrics_engine import MetricsEngine
+from ...core.audit_logger import AuditLogger
+from ...models.antifraud_event import AntifraudEvent, RiskLevel
+from ...models.payment_intent import PaymentIntent
+from ...queue import BaseWorker, BaseTask, AntifraudAnalysisTask, PaymentWebhookTask
+from ...queue.tasks import TaskFactory
+from ...utils.fingerprint import generate_fingerprint
+
+logger = logging.getLogger(__name__)
+
+
+class AntifraudWorker(BaseWorker):
+    """
+    Worker para análise anti-fraude.
+    Detecta padrões suspeitos em pagamentos, acessos e comportamentos.
+    """
+    
+    def __init__(
+        self,
+        queue,
+        worker_id: str,
+        antifraud_engine: AntifraudEngine,
+        tenant_id: Optional[str] = None,
+        audit_logger: Optional[AuditLogger] = None,
+        metrics_engine: Optional[MetricsEngine] = None
+    ):
+        super().__init__(
+            queue=queue,
+            worker_id=worker_id,
+            tenant_id=tenant_id,
+            audit_logger=audit_logger,
+            metrics_engine=metrics_engine
+        )
+        
+        self.antifraud_engine = antifraud_engine
+        
+        # Configurações de detecção
+        self.max_risk_score = 100
+        self.block_threshold = 75
+        self.review_threshold = 50
+        self.time_window_minutes = 30  # Janela para análise temporal
+        
+        # Cache para análise em tempo real
+        self._recent_events: Dict[str, List[Tuple[datetime, Dict]]] = {}
+        
+        logger.info(f"AntifraudWorker {worker_id} initialized")
+    
+    async def process_task(self, task: BaseTask) -> Any:
+        """Processa uma tarefa anti-fraude baseada no tipo"""
+        
+        if task.task_type == "antifraud_analysis":
+            return await self._process_antifraud_analysis(task)
+        elif task.task_type == "payment_webhook":
+            return await self._process_payment_for_fraud(task)
+        else:
+            raise ValueError(f"Tipo de tarefa não suportada: {task.task_type}")
+    
+    async def _process_antifraud_analysis(self, task: AntifraudAnalysisTask) -> Dict[str, Any]:
+        """
+        Análise completa de fraude para um evento.
+        Combina múltiplos sinais e regras.
+        """
+        
+        start_time = time.time()
+        tenant_id = task.metadata.tenant_id
+        user_id = task.payload["user_id"]
+        event_type = task.payload["event_type"]
+        event_data = task.payload["event_data"]
+        initial_risk_score = task.payload.get("risk_score", 0)
+        
+        logger.info(
+            f"Processing antifraud analysis",
+            extra={
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "event_type": event_type,
+                "task_id": str(task.metadata.task_id)
+            }
+        )
+        
+        try:
+            # 1. Análise básica do evento
+            basic_analysis = await self._analyze_basic_patterns(
+                tenant_id, user_id, event_type, event_data
+            )
+            
+            # 2. Análise de fingerprint
+            fingerprint_analysis = await self._analyze_fingerprint(
+                tenant_id, user_id, event_data
+            )
+            
+            # 3. Análise comportamental temporal
+            temporal_analysis = await self._analyze_temporal_patterns(
+                tenant_id, user_id, event_type
+            )
+            
+            # 4. Análise de rede/relacionamentos
+            network_analysis = await self._analyze_network_patterns(
+                tenant_id, user_id, event_data
+            )
+            
+            # 5. Combinar scores
+            combined_score = await self._combine_risk_scores(
+                tenant_id,
+                initial_risk_score,
+                basic_analysis.get("score", 0),
+                fingerprint_analysis.get("score", 0),
+                temporal_analysis.get("score", 0),
+                network_analysis.get("score", 0)
+            )
+            
+            # 6. Determinar ação
+            risk_level = self._determine_risk_level(combined_score)
+            action = self._determine_action(risk_level, event_type)
+            
+            # 7. Registrar evento de fraude
+            fraud_event_id = await self._record_fraud_event(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                event_type=event_type,
+                risk_score=combined_score,
+                risk_level=risk_level,
+                analysis_details={
+                    "basic_analysis": basic_analysis,
+                    "fingerprint_analysis": fingerprint_analysis,
+                    "temporal_analysis": temporal_analysis,
+                    "network_analysis": network_analysis,
+                    "combined_score": combined_score,
+                    "action": action
+                }
+            )
+            
+            # 8. Executar ação se necessário
+            action_result = await self._execute_antifraud_action(
+                tenant_id, user_id, action, combined_score, fraud_event_id
+            )
+            
+            # 9. Atualizar cache para análise futura
+            await self._update_analysis_cache(
+                tenant_id, user_id, event_type, combined_score
+            )
+            
+            # 10. Registrar métricas
+            if self.metrics_engine:
+                await self.metrics_engine.increment_counter(
+                    name="antifraud_analyses",
+                    tenant_id=tenant_id,
+                    tags={
+                        "event_type": event_type,
+                        "risk_level": risk_level.value,
+                        "action": action
+                    }
+                )
+                
+                await self.metrics_engine.record_histogram(
+                    name="antifraud_analysis_time_ms",
+                    tenant_id=tenant_id,
+                    value=(time.time() - start_time) * 1000,
+                    tags={"event_type": event_type}
+                )
+                
+                # Métrica de score
+                await self.metrics_engine.record_gauge(
+                    name="antifraud_risk_score",
+                    tenant_id=tenant_id,
+                    value=combined_score,
+                    tags={
+                        "user_id": user_id,
+                        "event_type": event_type
+                    }
+                )
+            
+            # 11. Registrar auditoria
+            if self.audit_logger:
+                await self.audit_logger.log(
+                    action="antifraud_analysis_completed",
+                    resource_type="antifraud_event",
+                    resource_id=fraud_event_id,
+                    tenant_id=tenant_id,
+                    details={
+                        "user_id": user_id,
+                        "event_type": event_type,
+                        "risk_score": combined_score,
+                        "risk_level": risk_level.value,
+                        "action": action,
+                        "action_result": action_result,
+                        "processing_time_ms": (time.time() - start_time) * 1000
+                    }
+                )
+            
+            logger.info(
+                f"Antifraud analysis completed",
+                extra={
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "event_type": event_type,
+                    "risk_score": combined_score,
+                    "risk_level": risk_level.value,
+                    "action": action,
+                    "processing_time": time.time() - start_time
+                }
+            )
+            
+            return {
+                "status": "success",
+                "fraud_event_id": fraud_event_id,
+                "risk_score": combined_score,
+                "risk_level": risk_level.value,
+                "action": action,
+                "action_result": action_result,
+                "analysis_details": {
+                    "basic": basic_analysis,
+                    "fingerprint": fingerprint_analysis,
+                    "temporal": temporal_analysis,
+                    "network": network_analysis
+                },
+                "processing_time_ms": (time.time() - start_time) * 1000,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(
+                f"Error in antifraud analysis: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "event_type": event_type
+                },
+                exc_info=True
+            )
+            
+            if self.metrics_engine:
+                await self.metrics_engine.increment_counter(
+                    name="antifraud_analyses_failed",
+                    tenant_id=tenant_id,
+                    tags={
+                        "event_type": event_type,
+                        "error_type": type(e).__name__
+                    }
+                )
+            
+            raise
+    
+    async def _process_payment_for_fraud(self, task: PaymentWebhookTask) -> Dict[str, Any]:
+        """Análise específica para webhooks de pagamento"""
+        
+        tenant_id = task.metadata.tenant_id
+        provider = task.payload["provider"]
+        event_data = task.payload["event_data"]
+        
+        # Extrai informações do pagamento
+        user_id = event_data.get("user_id") or event_data.get("customer_id")
+        amount = event_data.get("amount")
+        currency = event_data.get("currency")
+        
+        if not user_id:
+            logger.warning(
+                f"Cannot analyze payment without user_id",
+                extra={"tenant_id": tenant_id, "provider": provider}
+            )
+            return {"status": "skipped", "reason": "missing_user_id"}
+        
+        # Cria tarefa de análise
+        analysis_task = TaskFactory.create_antifraud_analysis(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            event_type="payment_received",
+            event_data={
+                "provider": provider,
+                "amount": amount,
+                "currency": currency,
+                "payment_data": event_data
+            }
+        )
+        
+        # Processa análise
+        return await self._process_antifraud_analysis(analysis_task)
+    
+    async def _analyze_basic_patterns(
+        self,
+        tenant_id: str,
+        user_id: str,
+        event_type: str,
+        event_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Análise de padrões básicos de fraude"""
+        
+        score = 0
+        flags = []
+        
+        # 1. Verifica velocidade de ações
+        if event_type in ["payment_attempt", "login_attempt"]:
+            speed_score = await self._check_action_speed(
+                tenant_id, user_id, event_type
+            )
+            score += speed_score
+            if speed_score > 20:
+                flags.append("high_action_speed")
+        
+        # 2. Verifica dados inconsistentes
+        inconsistency_score = await self._check_data_inconsistencies(event_data)
+        score += inconsistency_score
+        if inconsistency_score > 15:
+            flags.append("data_inconsistencies")
+        
+        # 3. Verifica padrões conhecidos de fraude
+        pattern_score = await self._check_known_fraud_patterns(
+            tenant_id, event_type, event_data
+        )
+        score += pattern_score
+        if pattern_score > 25:
+            flags.append("known_fraud_pattern")
+        
+        # 4. Verifica geolocalização suspeita
+        geo_score = await self._check_geolocation(tenant_id, user_id, event_data)
+        score += geo_score
+        if geo_score > 10:
+            flags.append("suspicious_geolocation")
+        
+        return {
+            "score": min(score, 100),
+            "flags": flags,
+            "components": {
+                "action_speed": speed_score,
+                "data_inconsistency": inconsistency_score,
+                "known_patterns": pattern_score,
+                "geolocation": geo_score
+            }
+        }
+    
+    async def _analyze_fingerprint(
+        self,
+        tenant_id: str,
+        user_id: str,
+        event_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Análise baseada em fingerprint do usuário"""
+        
+        score = 0
+        flags = []
+        
+        # Gera/recupera fingerprint
+        fingerprint = generate_fingerprint(event_data)
+        
+        # 1. Verifica múltiplas contas com mesmo fingerprint
+        duplicate_accounts = await self.antifraud_engine.check_fingerprint_duplicates(
+            tenant_id, fingerprint
+        )
+        
+        if duplicate_accounts > 1:
+            score += duplicate_accounts * 10
+            flags.append(f"fingerprint_used_{duplicate_accounts}_times")
+        
+        # 2. Verifica fingerprint recentemente bloqueado
+        recently_blocked = await self.antifraud_engine.is_fingerprint_blocked(
+            tenant_id, fingerprint
+        )
+        
+        if recently_blocked:
+            score += 50
+            flags.append("fingerprint_previously_blocked")
+        
+        # 3. Verifica mudanças súbitas no fingerprint
+        fingerprint_changes = await self.antifraud_engine.detect_fingerprint_changes(
+            tenant_id, user_id, fingerprint
+        )
+        
+        if fingerprint_changes.get("suspicious", False):
+            score += fingerprint_changes.get("change_score", 0)
+            flags.append("suspicious_fingerprint_changes")
+        
+        return {
+            "score": min(score, 100),
+            "flags": flags,
+            "fingerprint": fingerprint,
+            "duplicate_accounts": duplicate_accounts,
+            "previously_blocked": recently_blocked,
+            "changes_detected": fingerprint_changes
+        }
+    
+    async def _analyze_temporal_patterns(
+        self,
+        tenant_id: str,
+        user_id: str,
+        event_type: str
+    ) -> Dict[str, Any]:
+        """Análise de padrões temporais"""
+        
+        score = 0
+        flags = []
+        
+        # Obtém eventos recentes do usuário
+        recent_events = await self._get_recent_user_events(tenant_id, user_id)
+        
+        # 1. Frequência anormal de eventos
+        event_count = len(recent_events)
+        normal_threshold = self._get_normal_threshold(event_type)
+        
+        if event_count > normal_threshold * 2:
+            excess_ratio = event_count / normal_threshold
+            score += min(int(excess_ratio * 10), 30)
+            flags.append("high_event_frequency")
+        
+        # 2. Padrão temporal suspeito (ex: sempre às 3AM)
+        time_pattern_score = await self._check_time_patterns(recent_events)
+        score += time_pattern_score
+        if time_pattern_score > 15:
+            flags.append("suspicious_time_pattern")
+        
+        # 3. Sequência de ações suspeita
+        sequence_score = await self._check_action_sequence(recent_events)
+        score += sequence_score
+        if sequence_score > 10:
+            flags.append("suspicious_action_sequence")
+        
+        return {
+            "score": min(score, 100),
+            "flags": flags,
+            "recent_event_count": event_count,
+            "normal_threshold": normal_threshold,
+            "time_pattern_score": time_pattern_score,
+            "sequence_score": sequence_score
+        }
+    
+    async def _analyze_network_patterns(
+        self,
+        tenant_id: str,
+        user_id: str,
+        event_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Análise de padrões de rede e relacionamentos"""
+        
+        score = 0
+        flags = []
+        
+        # 1. Verifica IP compartilhado com usuários bloqueados
+        ip_address = event_data.get("ip_address")
+        if ip_address:
+            shared_with_blocked = await self.antifraud_engine.check_ip_shared_with_blocked(
+                tenant_id, ip_address
+            )
+            
+            if shared_with_blocked > 0:
+                score += shared_with_blocked * 15
+                flags.append(f"ip_shared_with_{shared_with_blocked}_blocked_users")
+        
+        # 2. Verifica padrões de proxy/VPN
+        if ip_address:
+            is_proxy = await self.antifraud_engine.check_proxy_vpn(ip_address)
+            if is_proxy:
+                score += 25
+                flags.append("proxy_or_vpn_detected")
+        
+        # 3. Verifica relacionamentos suspeitos (graph analysis)
+        relationships = await self.antifraud_engine.analyze_user_relationships(
+            tenant_id, user_id
+        )
+        
+        if relationships.get("suspicious_cluster", False):
+            score += relationships.get("cluster_risk", 0)
+            flags.append("suspicious_relationship_cluster")
+        
+        return {
+            "score": min(score, 100),
+            "flags": flags,
+            "ip_address": ip_address,
+            "shared_with_blocked": shared_with_blocked if 'shared_with_blocked' in locals() else 0,
+            "is_proxy": is_proxy if 'is_proxy' in locals() else False,
+            "relationships": relationships
+        }
+    
+    async def _combine_risk_scores(
+        self,
+        tenant_id: str,
+        initial_score: int,
+        basic_score: int,
+        fingerprint_score: int,
+        temporal_score: int,
+        network_score: int
+    ) -> int:
+        """Combina scores de múltiplas análises com pesos"""
+        
+        weights = {
+            "basic": 0.3,
+            "fingerprint": 0.25,
+            "temporal": 0.2,
+            "network": 0.25
+        }
+        
+        weighted_score = (
+            (initial_score * 0.1) +
+            (basic_score * weights["basic"]) +
+            (fingerprint_score * weights["fingerprint"]) +
+            (temporal_score * weights["temporal"]) +
+            (network_score * weights["network"])
+        )
+        
+        # Ajusta baseado em regras do tenant
+        tenant_multiplier = await self._get_tenant_risk_multiplier(tenant_id)
+        
+        combined_score = int(weighted_score * tenant_multiplier)
+        
+        return min(combined_score, self.max_risk_score)
+    
+    def _determine_risk_level(self, score: int) -> RiskLevel:
+        """Determina nível de risco baseado no score"""
+        
+        if score >= self.block_threshold:
+            return RiskLevel.CRITICAL
+        elif score >= self.review_threshold:
+            return RiskLevel.HIGH
+        elif score >= 25:
+            return RiskLevel.MEDIUM
+        elif score >= 10:
+            return RiskLevel.LOW
+        else:
+            return RiskLevel.NONE
+    
+    def _determine_action(self, risk_level: RiskLevel, event_type: str) -> str:
+        """Determina ação baseada no nível de risco e tipo de evento"""
+        
+        if risk_level == RiskLevel.CRITICAL:
+            return "block_immediately"
+        elif risk_level == RiskLevel.HIGH:
+            if event_type.startswith("payment"):
+                return "require_manual_review"
+            else:
+                return "require_verification"
+        elif risk_level == RiskLevel.MEDIUM:
+            return "flag_for_review"
+        elif risk_level == RiskLevel.LOW:
+            return "monitor_closely"
+        else:
+            return "allow"
+    
+    async def _record_fraud_event(
+        self,
+        tenant_id: str,
+        user_id: str,
+        event_type: str,
+        risk_score: int,
+        risk_level: RiskLevel,
+        analysis_details: Dict[str, Any]
+    ) -> str:
+        """Registra evento de fraude no banco"""
+        
+        # Em produção, salvaria no banco de dados
+        fraud_event_id = f"fraud_{tenant_id}_{user_id}_{int(time.time())}"
+        
+        return fraud_event_id
+    
+    async def _execute_antifraud_action(
+        self,
+        tenant_id: str,
+        user_id: str,
+        action: str,
+        risk_score: int,
+        fraud_event_id: str
+    ) -> Dict[str, Any]:
+        """Executa ação determinada pela análise"""
+        
+        result = {"action": action, "executed": False}
+        
+        if action == "block_immediately":
+            # Bloqueia usuário temporariamente
+            block_result = await self.antifraud_engine.block_user(
+                tenant_id, user_id, "high_fraud_risk", fraud_event_id
+            )
+            result.update(block_result)
+            result["executed"] = True
+            
+        elif action == "require_manual_review":
+            # Cria ticket para revisão manual
+            ticket_result = await self.antifraud_engine.create_review_ticket(
+                tenant_id, user_id, risk_score, fraud_event_id
+            )
+            result.update(ticket_result)
+            result["executed"] = True
+            
+        elif action == "require_verification":
+            # Solicita verificação adicional
+            verification_result = await self.antifraud_engine.request_verification(
+                tenant_id, user_id, fraud_event_id
+            )
+            result.update(verification_result)
+            result["executed"] = True
+        
+        return result
+    
+    # Métodos auxiliares de análise (implementações simplificadas)
+    
+    async def _check_action_speed(
+        self, tenant_id: str, user_id: str, event_type: str
+    ) -> int:
+        """Verifica velocidade de ações (ex: muitos cliques rápidos)"""
+        return 0  # Implementação real
+    
+    async def _check_data_inconsistencies(self, event_data: Dict[str, Any]) -> int:
+        """Verifica inconsistências nos dados"""
+        return 0
+    
+    async def _check_known_fraud_patterns(
+        self, tenant_id: str, event_type: str, event_data: Dict[str, Any]
+    ) -> int:
+        """Verifica padrões conhecidos de fraude"""
+        return 0
+    
+    async def _check_geolocation(
+        self, tenant_id: str, user_id: str, event_data: Dict[str, Any]
+    ) -> int:
+        """Verifica geolocalização suspeita"""
+        return 0
+    
+    async def _get_recent_user_events(
+        self, tenant_id: str, user_id: str
+    ) -> List[Dict[str, Any]]:
+        """Obtém eventos recentes do usuário"""
+        return []
+    
+    def _get_normal_threshold(self, event_type: str) -> int:
+        """Retorna threshold normal para tipo de evento"""
+        thresholds = {
+            "login_attempt": 5,
+            "payment_attempt": 3,
+            "page_view": 20,
+            "api_call": 10
+        }
+        return thresholds.get(event_type, 5)
+    
+    async def _check_time_patterns(self, recent_events: List[Dict]) -> int:
+        """Verifica padrões temporais suspeitos"""
+        return 0
+    
+    async def _check_action_sequence(self, recent_events: List[Dict]) -> int:
+        """Verifica sequência de ações suspeita"""
+        return 0
+    
+    async def _get_tenant_risk_multiplier(self, tenant_id: str) -> float:
+        """Retorna multiplicador de risco específico do tenant"""
+        return 1.0
+    
+    async def _update_analysis_cache(
+        self, tenant_id: str, user_id: str, event_type: str, score: int
+    ):
+        """Atualiza cache para análise futura"""
+        cache_key = f"{tenant_id}:{user_id}"
+        if cache_key not in self._recent_events:
+            self._recent_events[cache_key] = []
+        
+        self._recent_events[cache_key].append(
+            (datetime.utcnow(), {"event_type": event_type, "score": score})
+        )
+        
+        # Limpa eventos antigos
+        cutoff = datetime.utcnow() - timedelta(minutes=self.time_window_minutes)
+        self._recent_events[cache_key] = [
+            e for e in self._recent_events[cache_key] if e[0] > cutoff
+        ]
+
+
+class AntifraudWorkerManager:
+    """Gerencia múltiplos workers de anti-fraude"""
+    
+    def __init__(self, queue, **dependencies):
+        self.queue = queue
+        self.dependencies = dependencies
+        self.workers: Dict[str, AntifraudWorker] = {}
+        self.worker_tasks: Dict[str, asyncio.Task] = {}
+    
+    async def start_worker(
+        self,
+        worker_id: str,
+        tenant_id: Optional[str] = None,
+        concurrency: int = 3
+    ) -> AntifraudWorker:
+        """Inicia um worker de anti-fraude"""
+        
+        worker = AntifraudWorker(
+            queue=self.queue,
+            worker_id=worker_id,
+            tenant_id=tenant_id,
+            **self.dependencies
+        )
+        
+        self.workers[worker_id] = worker
+        
+        # Inicia worker em background
+        task = asyncio.create_task(
+            worker.start("antifraud_queue", concurrency)
+        )
+        self.worker_tasks[worker_id] = task
+        
+        logger.info(f"AntifraudWorker {worker_id} started")
+        return worker
+    
+    async def stop_worker(self, worker_id: str):
+        """Para um worker de anti-fraude"""
+        
+        if worker_id in self.workers:
+            await self.workers[worker_id].stop()
+            del self.workers[worker_id]
+        
+        if worker_id in self.worker_tasks:
+            self.worker_tasks[worker_id].cancel()
+            try:
+                await self.worker_tasks[worker_id]
+            except asyncio.CancelledError:
+                pass
+            del self.worker_tasks[worker_id]
+        
+        logger.info(f"AntifraudWorker {worker_id} stopped")
+    
+    async def stop_all(self):
+        """Para todos os workers"""
+        
+        for worker_id in list(self.workers.keys()):
+            await self.stop_worker(worker_id)
+        
+        logger.info("All antifraud workers stopped")
+    
+    async def analyze_immediately(
+        self,
+        tenant_id: str,
+        user_id: str,
+        event_type: str,
+        event_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Análise imediata de fraude (bypass fila)"""
+        
+        worker_id = f"immediate_antifraud_{tenant_id}"
+        
+        if worker_id not in self.workers:
+            worker = AntifraudWorker(
+                queue=self.queue,
+                worker_id=worker_id,
+                tenant_id=tenant_id,
+                **self.dependencies
+            )
+            self.workers[worker_id] = worker
+        
+        # Cria tarefa local
+        task = TaskFactory.create_antifraud_analysis(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            event_type=event_type,
+            event_data=event_data
+        )
+        
+        # Processa imediatamente
+        return await self.workers[worker_id].process_task(task)

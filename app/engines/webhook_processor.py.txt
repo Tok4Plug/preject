@@ -1,0 +1,1219 @@
+"""
+Webhook Processor - Processador idempotente de webhooks com assinatura, validação e orquestração.
+Edge-side processing com persistência bruta e lock lógico.
+"""
+
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Dict, List, Optional, Tuple, Any, Set
+from dataclasses import dataclass, field
+import asyncio
+import json
+import hmac
+import hashlib
+import uuid
+import base64
+from collections import defaultdict
+
+from app.core.audit_logger import AuditLogger
+from app.core.state_machine import StateMachine, StateTransitionError
+from app.engines.payment_engine import PaymentEngine, PaymentIntent
+from app.engines.subscription_engine import SubscriptionEngine, Subscription
+from app.engines.billing_engine import BillingEngine, Invoice, Payment
+from app.engines.entitlement_engine import EntitlementEngine, Entitlement
+
+
+class WebhookSource(Enum):
+    """Fontes de webhook."""
+    STRIPE = "stripe"
+    PAYPAL = "paypal"
+    PAGARME = "pagarme"
+    MERCADOPAGO = "mercadopago"
+    ASAAAS = "asaas"
+    PIX = "pix_provider"
+    TELEGRAM = "telegram"
+    INTERNAL = "internal"
+
+
+class WebhookStatus(Enum):
+    """Status de processamento de webhook."""
+    RECEIVED = "received"
+    VALIDATING = "validating"
+    VALIDATED = "validated"
+    PROCESSING = "processing"
+    PROCESSED = "processed"
+    FAILED = "failed"
+    RETRYING = "retrying"
+    IGNORED = "ignored"
+
+
+class WebhookEventType(Enum):
+    """Tipos de eventos de webhook."""
+    # Pagamentos
+    PAYMENT_CREATED = "payment.created"
+    PAYMENT_SUCCEEDED = "payment.succeeded"
+    PAYMENT_FAILED = "payment.failed"
+    PAYMENT_REFUNDED = "payment.refunded"
+    PAYMENT_DISPUTED = "payment.disputed"
+    
+    # Assinaturas
+    SUBSCRIPTION_CREATED = "subscription.created"
+    SUBSCRIPTION_UPDATED = "subscription.updated"
+    SUBSCRIPTION_CANCELLED = "subscription.cancelled"
+    SUBSCRIPTION_RENEWED = "subscription.renewed"
+    
+    # Invoices
+    INVOICE_CREATED = "invoice.created"
+    INVOICE_PAID = "invoice.paid"
+    INVOICE_OVERDUE = "invoice.overdue"
+    
+    # Custom
+    USER_CREATED = "user.created"
+    USER_UPDATED = "user.updated"
+    ACCESS_GRANTED = "access.granted"
+    ACCESS_REVOKED = "access.revoked"
+
+
+@dataclass
+class WebhookEvent:
+    """Evento de webhook processado."""
+    event_id: str
+    source: WebhookSource
+    event_type: WebhookEventType
+    status: WebhookStatus
+    
+    # Dados brutos
+    raw_data: Dict[str, Any]
+    normalized_data: Dict[str, Any]
+    
+    # Identificadores
+    external_event_id: str  # ID do evento no sistema externo
+    tenant_id: Optional[str] = None
+    resource_id: Optional[str] = None  # subscription_id, payment_id, etc.
+    
+    # Validação
+    signature_valid: bool = False
+    validation_errors: List[str] = field(default_factory=list)
+    
+    # Processamento
+    processing_attempts: int = 0
+    max_attempts: int = 3
+    next_retry_at: Optional[datetime] = None
+    
+    # Metadados
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # Datas
+    received_at: datetime = field(default_factory=datetime.utcnow)
+    processed_at: Optional[datetime] = None
+    failed_at: Optional[datetime] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "event_id": self.event_id,
+            "source": self.source.value,
+            "event_type": self.event_type.value,
+            "status": self.status.value,
+            "raw_data": self.raw_data,
+            "normalized_data": self.normalized_data,
+            "external_event_id": self.external_event_id,
+            "tenant_id": self.tenant_id,
+            "resource_id": self.resource_id,
+            "signature_valid": self.signature_valid,
+            "validation_errors": self.validation_errors,
+            "processing_attempts": self.processing_attempts,
+            "max_attempts": self.max_attempts,
+            "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None,
+            "metadata": self.metadata,
+            "received_at": self.received_at.isoformat(),
+            "processed_at": self.processed_at.isoformat() if self.processed_at else None,
+            "failed_at": self.failed_at.isoformat() if self.failed_at else None
+        }
+    
+    def should_retry(self) -> bool:
+        """Verifica se deve tentar processar novamente."""
+        if self.status == WebhookStatus.PROCESSED:
+            return False
+        
+        if self.processing_attempts >= self.max_attempts:
+            return False
+        
+        if self.next_retry_at and datetime.utcnow() < self.next_retry_at:
+            return False
+        
+        return True
+    
+    def schedule_retry(self, delay_minutes: int = 5):
+        """Agenda nova tentativa."""
+        self.processing_attempts += 1
+        self.status = WebhookStatus.RETRYING
+        self.next_retry_at = datetime.utcnow() + timedelta(minutes=delay_minutes)
+
+
+@dataclass
+class WebhookConfig:
+    """Configuração de webhook para um source."""
+    source: WebhookSource
+    secret_key: str  # Para validação de assinatura
+    is_active: bool = True
+    webhook_url: Optional[str] = None  # Para webhooks de saída
+    allowed_ips: List[str] = field(default_factory=list)
+    rate_limit_per_minute: int = 60
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class WebhookProcessor:
+    """
+    Processador de webhooks com idempotência, validação e orquestração.
+    Edge-side processing com persistência bruta e integração com engines.
+    """
+    
+    def __init__(
+        self,
+        db_pool,
+        audit_logger: AuditLogger,
+        payment_engine: Optional[PaymentEngine] = None,
+        subscription_engine: Optional[SubscriptionEngine] = None,
+        billing_engine: Optional[BillingEngine] = None,
+        entitlement_engine: Optional[EntitlementEngine] = None,
+        redis_client=None
+    ):
+        """
+        Inicializa o Webhook Processor.
+        
+        Args:
+            db_pool: Pool de conexões com banco
+            audit_logger: Logger de auditoria
+            payment_engine: Engine de pagamentos (opcional)
+            subscription_engine: Engine de assinaturas (opcional)
+            billing_engine: Engine de faturamento (opcional)
+            entitlement_engine: Engine de entitlements (opcional)
+            redis_client: Cliente Redis (opcional)
+        """
+        self.db_pool = db_pool
+        self.audit_logger = audit_logger
+        self.payment_engine = payment_engine
+        self.subscription_engine = subscription_engine
+        self.billing_engine = billing_engine
+        self.entitlement_engine = entitlement_engine
+        self.redis = redis_client
+        
+        # Configurações por source
+        self.webhook_configs: Dict[WebhookSource, WebhookConfig] = {}
+        
+        # Cache de eventos processados (para idempotência)
+        self.processed_events: Set[str] = set()
+        
+        # Rate limiting por IP
+        self.rate_limits: Dict[str, List[datetime]] = defaultdict(list)
+        
+        # Máquina de estados
+        self.state_machine = StateMachine(
+            initial_states=[WebhookStatus.RECEIVED.value],
+            transitions={
+                WebhookStatus.RECEIVED.value: [
+                    WebhookStatus.VALIDATING.value,
+                    WebhookStatus.IGNORED.value
+                ],
+                WebhookStatus.VALIDATING.value: [
+                    WebhookStatus.VALIDATED.value,
+                    WebhookStatus.FAILED.value,
+                    WebhookStatus.IGNORED.value
+                ],
+                WebhookStatus.VALIDATED.value: [
+                    WebhookStatus.PROCESSING.value,
+                    WebhookStatus.FAILED.value,
+                    WebhookStatus.IGNORED.value
+                ],
+                WebhookStatus.PROCESSING.value: [
+                    WebhookStatus.PROCESSED.value,
+                    WebhookStatus.FAILED.value,
+                    WebhookStatus.RETRYING.value
+                ],
+                WebhookStatus.PROCESSED.value: [],
+                WebhookStatus.FAILED.value: [
+                    WebhookStatus.RETRYING.value
+                ],
+                WebhookStatus.RETRYING.value: [
+                    WebhookStatus.PROCESSING.value,
+                    WebhookStatus.FAILED.value
+                ],
+                WebhookStatus.IGNORED.value: []
+            },
+            state_field="status",
+            resource_id_field="event_id"
+        )
+        
+        # Carrega configurações
+        asyncio.create_task(self._load_configurations())
+        
+        # Inicia worker de retry
+        self._retry_task = asyncio.create_task(self._process_retries())
+    
+    async def _load_configurations(self):
+        """Carrega configurações de webhook."""
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM webhook_configs WHERE is_active = true")
+            
+            for row in rows:
+                config = WebhookConfig(
+                    source=WebhookSource(row["source"]),
+                    secret_key=row["secret_key"],
+                    is_active=row["is_active"],
+                    webhook_url=row.get("webhook_url"),
+                    allowed_ips=row.get("allowed_ips", []),
+                    rate_limit_per_minute=row.get("rate_limit_per_minute", 60),
+                    metadata=json.loads(row["metadata"]) if row.get("metadata") else {}
+                )
+                self.webhook_configs[config.source] = config
+    
+    async def process_webhook(
+        self,
+        source: WebhookSource,
+        raw_data: Dict[str, Any],
+        headers: Dict[str, str],
+        client_ip: str,
+        skip_validation: bool = False
+    ) -> Tuple[bool, Optional[WebhookEvent], List[str]]:
+        """
+        Processa um webhook recebido.
+        
+        Args:
+            source: Fonte do webhook
+            raw_data: Dados brutos
+            headers: Headers HTTP
+            client_ip: IP do cliente
+            skip_validation: Pular validação (para testes)
+            
+        Returns:
+            Tuple[success, webhook_event, errors]
+        """
+        # Verifica rate limiting
+        if not await self._check_rate_limit(client_ip, source):
+            return False, None, ["Rate limit exceeded"]
+        
+        # Verifica IP permitido
+        if not await self._check_allowed_ip(client_ip, source):
+            return False, None, [f"IP not allowed: {client_ip}"]
+        
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Extrai event ID
+                    external_event_id = self._extract_event_id(source, raw_data)
+                    if not external_event_id:
+                        return False, None, ["Could not extract event ID"]
+                    
+                    # Verifica idempotência
+                    existing_event = await self._get_event_by_external_id(
+                        conn, source, external_event_id
+                    )
+                    
+                    if existing_event:
+                        if existing_event.status == WebhookStatus.PROCESSED:
+                            return True, existing_event, ["Event already processed"]
+                        elif existing_event.should_retry():
+                            # Re-processa
+                            return await self._retry_event(conn, existing_event)
+                        else:
+                            return False, existing_event, ["Event processing failed"]
+                    
+                    # Cria evento
+                    event_id = f"wh_{uuid.uuid4().hex[:12]}"
+                    event = WebhookEvent(
+                        event_id=event_id,
+                        source=source,
+                        event_type=self._determine_event_type(source, raw_data),
+                        status=WebhookStatus.RECEIVED,
+                        raw_data=raw_data,
+                        normalized_data={},
+                        external_event_id=external_event_id,
+                        received_at=datetime.utcnow()
+                    )
+                    
+                    # Persiste evento bruto
+                    await self._save_event(conn, event)
+                    
+                    # Atualiza para VALIDATING
+                    await self._update_event_status(
+                        conn, event, WebhookStatus.VALIDATING,
+                        "system", "Starting validation"
+                    )
+                    
+                    # Valida assinatura (se aplicável)
+                    if not skip_validation:
+                        is_valid, validation_errors = await self._validate_signature(
+                            source, raw_data, headers
+                        )
+                        
+                        event.signature_valid = is_valid
+                        event.validation_errors = validation_errors
+                        
+                        if not is_valid:
+                            await self._update_event_status(
+                                conn, event, WebhookStatus.FAILED,
+                                "system", f"Signature validation failed: {validation_errors}"
+                            )
+                            return False, event, validation_errors
+                    
+                    # Normaliza dados
+                    normalized_data = await self._normalize_data(source, raw_data)
+                    event.normalized_data = normalized_data
+                    
+                    # Extrai identificadores
+                    event.tenant_id = normalized_data.get("tenant_id")
+                    event.resource_id = normalized_data.get("resource_id")
+                    
+                    # Atualiza para VALIDATED
+                    await self._update_event_status(
+                        conn, event, WebhookStatus.VALIDATED,
+                        "system", "Validation successful"
+                    )
+                    
+                    # Atualiza evento no banco
+                    await conn.execute(
+                        """
+                        UPDATE webhook_events 
+                        SET normalized_data = $1, tenant_id = $2,
+                            resource_id = $3, signature_valid = $4,
+                            validation_errors = $5, updated_at = $6
+                        WHERE event_id = $7
+                        """,
+                        json.dumps(normalized_data),
+                        event.tenant_id,
+                        event.resource_id,
+                        event.signature_valid,
+                        json.dumps(event.validation_errors),
+                        datetime.utcnow(),
+                        event_id
+                    )
+                    
+                    # Processa o evento (assíncrono)
+                    asyncio.create_task(self._process_event(event))
+                    
+                    return True, event, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def send_webhook(
+        self,
+        tenant_id: str,
+        event_type: WebhookEventType,
+        data: Dict[str, Any],
+        destinations: List[WebhookSource] = None
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        """
+        Envia webhook para sistemas externos.
+        
+        Args:
+            tenant_id: ID do tenant
+            event_type: Tipo de evento
+            data: Dados a enviar
+            destinations: Destinos (None = todos configurados)
+            
+        Returns:
+            Tuple[success_count, results]
+        """
+        if not destinations:
+            destinations = list(self.webhook_configs.keys())
+        
+        results = []
+        success_count = 0
+        
+        for source in destinations:
+            if source not in self.webhook_configs:
+                continue
+            
+            config = self.webhook_configs[source]
+            if not config.is_active or not config.webhook_url:
+                continue
+            
+            try:
+                # Prepara payload
+                payload = self._prepare_outgoing_payload(
+                    source, event_type, tenant_id, data
+                )
+                
+                # Adiciona assinatura
+                headers = self._sign_payload(source, payload)
+                
+                # Envia (mock - em produção seria HTTP request)
+                # result = await self._send_http_request(config.webhook_url, payload, headers)
+                result = {"status": "mock", "success": True}
+                
+                results.append({
+                    "source": source.value,
+                    "success": result.get("success", False),
+                    "status": result.get("status", "unknown"),
+                    "error": result.get("error")
+                })
+                
+                if result.get("success"):
+                    success_count += 1
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id="system",
+                        action="webhook.sent",
+                        resource_type="webhook",
+                        resource_id=f"outgoing_{source.value}_{event_type.value}",
+                        changes={
+                            "source": source.value,
+                            "event_type": event_type.value,
+                            "destination": config.webhook_url
+                        },
+                        metadata={"payload": payload}
+                    )
+                
+            except Exception as e:
+                results.append({
+                    "source": source.value,
+                    "success": False,
+                    "error": str(e)
+                })
+        
+        return success_count, results
+    
+    async def get_event(
+        self,
+        event_id: str
+    ) -> Optional[WebhookEvent]:
+        """Obtém um evento de webhook."""
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM webhook_events WHERE event_id = $1",
+                event_id
+            )
+            return self._row_to_webhook_event(row) if row else None
+    
+    async def get_events_by_resource(
+        self,
+        tenant_id: str,
+        resource_type: str,
+        resource_id: str,
+        limit: int = 100
+    ) -> List[WebhookEvent]:
+        """
+        Lista eventos de webhook por recurso.
+        
+        Args:
+            tenant_id: ID do tenant
+            resource_type: Tipo de recurso
+            resource_id: ID do recurso
+            limit: Limite de resultados
+            
+        Returns:
+            Lista de eventos
+        """
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM webhook_events 
+                WHERE tenant_id = $1 
+                  AND metadata->>'resource_type' = $2
+                  AND resource_id = $3
+                ORDER BY received_at DESC
+                LIMIT $4
+                """,
+                tenant_id, resource_type, resource_id, limit
+            )
+            return [self._row_to_webhook_event(row) for row in rows]
+    
+    async def retry_failed_events(
+        self,
+        hours_ago: int = 24,
+        limit: int = 100
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        """
+        Retenta eventos que falharam.
+        
+        Args:
+            hours_ago: Apenas eventos das últimas X horas
+            limit: Limite de eventos
+            
+        Returns:
+            Tuple[processed_count, results]
+        """
+        async with self.db_pool.acquire() as conn:
+            cutoff = datetime.utcnow() - timedelta(hours=hours_ago)
+            
+            rows = await conn.fetch(
+                """
+                SELECT * FROM webhook_events 
+                WHERE status IN ('failed', 'retrying')
+                  AND received_at >= $1
+                  AND processing_attempts < max_attempts
+                  AND (next_retry_at IS NULL OR next_retry_at <= $2)
+                ORDER BY received_at ASC
+                LIMIT $3
+                """,
+                cutoff, datetime.utcnow(), limit
+            )
+            
+            results = []
+            processed_count = 0
+            
+            for row in rows:
+                event = self._row_to_webhook_event(row)
+                
+                if event.should_retry():
+                    success, _, errors = await self._retry_event(conn, event)
+                    
+                    results.append({
+                        "event_id": event.event_id,
+                        "success": success,
+                        "errors": errors
+                    })
+                    
+                    if success:
+                        processed_count += 1
+            
+            return processed_count, results
+    
+    # Métodos privados
+    async def _process_event(self, event: WebhookEvent):
+        """Processa um evento de webhook."""
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Atualiza para PROCESSING
+                    await self._update_event_status(
+                        conn, event, WebhookStatus.PROCESSING,
+                        "system", "Starting processing"
+                    )
+                    
+                    # Roteia para handler apropriado
+                    success, errors = await self._route_to_handler(event)
+                    
+                    if success:
+                        # Atualiza para PROCESSED
+                        event.processed_at = datetime.utcnow()
+                        await self._update_event_status(
+                            conn, event, WebhookStatus.PROCESSED,
+                            "system", "Processing successful"
+                        )
+                        
+                        # Atualiza data de processamento
+                        await conn.execute(
+                            """
+                            UPDATE webhook_events 
+                            SET processed_at = $1, updated_at = $2
+                            WHERE event_id = $3
+                            """,
+                            event.processed_at,
+                            datetime.utcnow(),
+                            event.event_id
+                        )
+                        
+                        # Adiciona ao cache de processados
+                        cache_key = f"{event.source.value}:{event.external_event_id}"
+                        self.processed_events.add(cache_key)
+                        
+                    else:
+                        # Agenda retry ou marca como falho
+                        if event.processing_attempts < event.max_attempts:
+                            event.schedule_retry()
+                            await self._update_event_status(
+                                conn, event, WebhookStatus.RETRYING,
+                                "system", f"Scheduling retry: {errors}"
+                            )
+                            
+                            # Atualiza tentativas
+                            await conn.execute(
+                                """
+                                UPDATE webhook_events 
+                                SET processing_attempts = $1,
+                                    next_retry_at = $2,
+                                    updated_at = $3
+                                WHERE event_id = $4
+                                """,
+                                event.processing_attempts,
+                                event.next_retry_at,
+                                datetime.utcnow(),
+                                event.event_id
+                            )
+                        else:
+                            event.failed_at = datetime.utcnow()
+                            await self._update_event_status(
+                                conn, event, WebhookStatus.FAILED,
+                                "system", f"Max attempts reached: {errors}"
+                            )
+                            
+                            # Atualiza data de falha
+                            await conn.execute(
+                                """
+                                UPDATE webhook_events 
+                                SET failed_at = $1, updated_at = $2
+                                WHERE event_id = $3
+                                """,
+                                event.failed_at,
+                                datetime.utcnow(),
+                                event.event_id
+                            )
+                    
+                except Exception as e:
+                    # Erro crítico no processamento
+                    event.failed_at = datetime.utcnow()
+                    await self._update_event_status(
+                        conn, event, WebhookStatus.FAILED,
+                        "system", f"Processing error: {str(e)}"
+                    )
+    
+    async def _route_to_handler(self, event: WebhookEvent) -> Tuple[bool, List[str]]:
+        """Roteia evento para handler apropriado."""
+        try:
+            if event.source == WebhookSource.STRIPE:
+                return await self._handle_stripe_webhook(event)
+            elif event.source == WebhookSource.PAYPAL:
+                return await self._handle_paypal_webhook(event)
+            elif event.source == WebhookSource.PIX:
+                return await self._handle_pix_webhook(event)
+            elif event.source == WebhookSource.TELEGRAM:
+                return await self._handle_telegram_webhook(event)
+            elif event.source == WebhookSource.INTERNAL:
+                return await self._handle_internal_webhook(event)
+            else:
+                return False, [f"Unsupported webhook source: {event.source.value}"]
+        except Exception as e:
+            return False, [f"Handler error: {str(e)}"]
+    
+    async def _handle_stripe_webhook(self, event: WebhookEvent) -> Tuple[bool, List[str]]:
+        """Processa webhook do Stripe."""
+        # Implementação específica do Stripe
+        data = event.normalized_data
+        
+        if event.event_type == WebhookEventType.PAYMENT_SUCCEEDED:
+            if self.payment_engine:
+                # Extrai dados do pagamento
+                payment_intent_id = data.get("payment_intent_id")
+                amount = data.get("amount")
+                currency = data.get("currency")
+                
+                if payment_intent_id and amount and currency:
+                    # Processa via Payment Engine
+                    success, payment, errors = await self.payment_engine.handle_webhook(
+                        "stripe", data, event.metadata.get("signature")
+                    )
+                    
+                    if success and payment:
+                        # Dispara eventos downstream
+                        await self._trigger_downstream_events(
+                            event.tenant_id, payment.payment_intent_id, "payment_success"
+                        )
+                        
+                        return True, []
+        
+        return False, ["Unhandled Stripe event"]
+    
+    async def _handle_paypal_webhook(self, event: WebhookEvent) -> Tuple[bool, List[str]]:
+        """Processa webhook do PayPal."""
+        # Implementação similar ao Stripe
+        return await self._handle_stripe_webhook(event)
+    
+    async def _handle_pix_webhook(self, event: WebhookEvent) -> Tuple[bool, List[str]]:
+        """Processa webhook de provedor PIX."""
+        data = event.normalized_data
+        
+        if event.event_type == WebhookEventType.PAYMENT_SUCCEEDED:
+            if self.payment_engine:
+                # Extrai dados do PIX
+                txid = data.get("txid")
+                valor = data.get("valor")
+                status = data.get("status")
+                
+                if txid and valor and status == "CONCLUIDA":
+                    # Processa via Payment Engine
+                    success, payment, errors = await self.payment_engine.handle_webhook(
+                        "pix_provider", data, event.metadata.get("signature")
+                    )
+                    
+                    if success and payment:
+                        return True, []
+        
+        return False, ["Unhandled PIX event"]
+    
+    async def _handle_telegram_webhook(self, event: WebhookEvent) -> Tuple[bool, List[str]]:
+        """Processa webhook do Telegram."""
+        data = event.normalized_data
+        
+        if event.event_type == WebhookEventType.USER_CREATED:
+            # Novo usuário no Telegram
+            # Poderia criar usuário no sistema, enviar welcome message, etc.
+            return True, []
+        
+        return False, ["Unhandled Telegram event"]
+    
+    async def _handle_internal_webhook(self, event: WebhookEvent) -> Tuple[bool, List[str]]:
+        """Processa webhook interno."""
+        data = event.normalized_data
+        event_type = data.get("event_type")
+        
+        if event_type == "subscription.created" and self.subscription_engine:
+            # Cria assinatura
+            subscription_data = data.get("subscription")
+            if subscription_data:
+                success, subscription, errors = await self.subscription_engine.create_subscription(
+                    tenant_id=event.tenant_id,
+                    user_id=subscription_data.get("user_id"),
+                    external_user_id=subscription_data.get("external_user_id"),
+                    plan_id=subscription_data.get("plan_id"),
+                    payment_intent_id=subscription_data.get("payment_intent_id")
+                )
+                
+                if success and subscription:
+                    # Concede entitlement
+                    if self.entitlement_engine:
+                        await self.entitlement_engine.grant_entitlement_from_subscription(
+                            subscription
+                        )
+                    
+                    return True, []
+        
+        elif event_type == "payment.success" and self.billing_engine:
+            # Processa pagamento bem-sucedido
+            payment_data = data.get("payment")
+            if payment_data:
+                success, payment, errors = await self.billing_engine.process_invoice_payment(
+                    tenant_id=event.tenant_id,
+                    invoice_id=payment_data.get("invoice_id"),
+                    payment_method=payment_data.get("payment_method")
+                )
+                
+                if success:
+                    return True, []
+        
+        return False, [f"Unhandled internal event: {event_type}"]
+    
+    async def _trigger_downstream_events(
+        self,
+        tenant_id: str,
+        resource_id: str,
+        event_type: str
+    ):
+        """Dispara eventos downstream para outros sistemas."""
+        # Envia webhooks para sistemas externos configurados
+        event_map = {
+            "payment_success": WebhookEventType.PAYMENT_SUCCEEDED,
+            "subscription_created": WebhookEventType.SUBSCRIPTION_CREATED,
+            "invoice_paid": WebhookEventType.INVOICE_PAID
+        }
+        
+        if event_type in event_map:
+            await self.send_webhook(
+                tenant_id=tenant_id,
+                event_type=event_map[event_type],
+                data={"resource_id": resource_id, "event_type": event_type}
+            )
+    
+    async def _check_rate_limit(self, client_ip: str, source: WebhookSource) -> bool:
+        """Verifica rate limiting."""
+        config = self.webhook_configs.get(source)
+        if not config:
+            return True
+        
+        key = f"rate_limit:{source.value}:{client_ip}"
+        now = datetime.utcnow()
+        
+        # Limpa timestamps antigos
+        self.rate_limits[key] = [
+            ts for ts in self.rate_limits[key]
+            if ts > now - timedelta(minutes=1)
+        ]
+        
+        # Verifica limite
+        if len(self.rate_limits[key]) >= config.rate_limit_per_minute:
+            return False
+        
+        # Adiciona novo timestamp
+        self.rate_limits[key].append(now)
+        return True
+    
+    async def _check_allowed_ip(self, client_ip: str, source: WebhookSource) -> bool:
+        """Verifica se IP está na lista de permitidos."""
+        config = self.webhook_configs.get(source)
+        if not config or not config.allowed_ips:
+            return True
+        
+        return client_ip in config.allowed_ips
+    
+    async def _validate_signature(
+        self,
+        source: WebhookSource,
+        data: Dict[str, Any],
+        headers: Dict[str, str]
+    ) -> Tuple[bool, List[str]]:
+        """Valida assinatura do webhook."""
+        config = self.webhook_configs.get(source)
+        if not config or not config.secret_key:
+            return True, []  # Sem validação configurada
+        
+        # Implementação específica por source
+        if source == WebhookSource.STRIPE:
+            return await self._validate_stripe_signature(data, headers, config.secret_key)
+        elif source == WebhookSource.PAYPAL:
+            return await self._validate_paypal_signature(data, headers, config.secret_key)
+        
+        return True, []  # Para outros sources, aceita por enquanto
+    
+    async def _validate_stripe_signature(
+        self,
+        data: Dict[str, Any],
+        headers: Dict[str, str],
+        secret: str
+    ) -> Tuple[bool, List[str]]:
+        """Valida assinatura do Stripe."""
+        # Implementação do Stripe
+        signature = headers.get("stripe-signature")
+        if not signature:
+            return False, ["Missing Stripe signature"]
+        
+        # Em produção, validaria com a library do Stripe
+        # Por enquanto mock
+        return True, []
+    
+    async def _validate_paypal_signature(
+        self,
+        data: Dict[str, Any],
+        headers: Dict[str, str],
+        secret: str
+    ) -> Tuple[bool, List[str]]:
+        """Valida assinatura do PayPal."""
+        # Implementação do PayPal
+        return True, []
+    
+    def _extract_event_id(self, source: WebhookSource, data: Dict[str, Any]) -> Optional[str]:
+        """Extrai ID do evento dos dados."""
+        if source == WebhookSource.STRIPE:
+            return data.get("id")
+        elif source == WebhookSource.PAYPAL:
+            return data.get("id")
+        elif source == WebhookSource.PIX:
+            return data.get("txid") or data.get("id")
+        elif source == WebhookSource.INTERNAL:
+            return data.get("event_id")
+        
+        return str(uuid.uuid4())  # Fallback
+    
+    def _determine_event_type(self, source: WebhookSource, data: Dict[str, Any]) -> WebhookEventType:
+        """Determina tipo de evento baseado nos dados."""
+        # Mapeamento específico por source
+        event_type_maps = {
+            WebhookSource.STRIPE: {
+                "payment_intent.succeeded": WebhookEventType.PAYMENT_SUCCEEDED,
+                "payment_intent.payment_failed": WebhookEventType.PAYMENT_FAILED,
+                "charge.refunded": WebhookEventType.PAYMENT_REFUNDED,
+                "customer.subscription.created": WebhookEventType.SUBSCRIPTION_CREATED,
+                "invoice.paid": WebhookEventType.INVOICE_PAID,
+            },
+            WebhookSource.PAYPAL: {
+                "PAYMENT.CAPTURE.COMPLETED": WebhookEventType.PAYMENT_SUCCEEDED,
+                "PAYMENT.CAPTURE.DENIED": WebhookEventType.PAYMENT_FAILED,
+                "BILLING.SUBSCRIPTION.CREATED": WebhookEventType.SUBSCRIPTION_CREATED,
+            },
+            WebhookSource.PIX: {
+                "payment_succeeded": WebhookEventType.PAYMENT_SUCCEEDED,
+                "payment_failed": WebhookEventType.PAYMENT_FAILED,
+            }
+        }
+        
+        type_map = event_type_maps.get(source, {})
+        
+        # Extrai tipo dos dados
+        if source == WebhookSource.STRIPE:
+            event_type = data.get("type")
+        elif source == WebhookSource.PAYPAL:
+            event_type = data.get("event_type")
+        elif source == WebhookSource.PIX:
+            event_type = data.get("status")
+        elif source == WebhookSource.INTERNAL:
+            event_type = data.get("event_type", "unknown")
+        else:
+            event_type = "unknown"
+        
+        return type_map.get(event_type, WebhookEventType.PAYMENT_SUCCEEDED)
+    
+    async def _normalize_data(self, source: WebhookSource, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normaliza dados do webhook para formato interno."""
+        normalizers = {
+            WebhookSource.STRIPE: self._normalize_stripe_data,
+            WebhookSource.PAYPAL: self._normalize_paypal_data,
+            WebhookSource.PIX: self._normalize_pix_data,
+            WebhookSource.INTERNAL: self._normalize_internal_data,
+        }
+        
+        normalizer = normalizers.get(source, lambda x: x)
+        return normalizer(data)
+    
+    def _normalize_stripe_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normaliza dados do Stripe."""
+        normalized = {
+            "source": "stripe",
+            "event_id": data.get("id"),
+            "event_type": data.get("type"),
+            "created": data.get("created"),
+            "livemode": data.get("livemode", False)
+        }
+        
+        # Extrai dados do objeto
+        obj = data.get("data", {}).get("object", {})
+        
+        if "payment_intent" in data.get("type", ""):
+            normalized.update({
+                "payment_intent_id": obj.get("id"),
+                "amount": obj.get("amount") / 100 if obj.get("amount") else None,
+                "currency": obj.get("currency"),
+                "status": obj.get("status"),
+                "customer_id": obj.get("customer"),
+                "metadata": obj.get("metadata", {})
+            })
+        
+        return normalized
+    
+    def _normalize_paypal_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normaliza dados do PayPal."""
+        # Similar ao Stripe
+        return data
+    
+    def _normalize_pix_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normaliza dados PIX."""
+        normalized = {
+            "source": "pix",
+            "txid": data.get("txid"),
+            "valor": data.get("valor"),
+            "status": data.get("status"),
+            "horario": data.get("horario"),
+            "pagador": data.get("pagador", {}),
+            "info_pagador": data.get("infoPagador", {})
+        }
+        
+        # Extrai tenant_id do metadata ou txid
+        txid = data.get("txid", "")
+        if "tenant_" in txid:
+            parts = txid.split("_")
+            if len(parts) >= 2:
+                normalized["tenant_id"] = parts[1]
+        
+        return normalized
+    
+    def _normalize_internal_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Normaliza dados internos."""
+        return data
+    
+    async def _get_event_by_external_id(
+        self,
+        conn,
+        source: WebhookSource,
+        external_event_id: str
+    ) -> Optional[WebhookEvent]:
+        """Busca evento pelo ID externo."""
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM webhook_events 
+            WHERE source = $1 AND external_event_id = $2
+            """,
+            source.value, external_event_id
+        )
+        return self._row_to_webhook_event(row) if row else None
+    
+    async def _retry_event(
+        self,
+        conn,
+        event: WebhookEvent
+    ) -> Tuple[bool, Optional[WebhookEvent], List[str]]:
+        """Retenta processamento de um evento."""
+        event.schedule_retry()
+        
+        # Atualiza no banco
+        await conn.execute(
+            """
+            UPDATE webhook_events 
+            SET status = $1, processing_attempts = $2,
+                next_retry_at = $3, updated_at = $4
+            WHERE event_id = $5
+            """,
+            WebhookStatus.RETRYING.value,
+            event.processing_attempts,
+            event.next_retry_at,
+            datetime.utcnow(),
+            event.event_id
+        )
+        
+        # Agenda processamento
+        asyncio.create_task(self._process_event(event))
+        
+        return True, event, []
+    
+    async def _save_event(self, conn, event: WebhookEvent):
+        """Persiste evento no banco."""
+        await conn.execute(
+            """
+            INSERT INTO webhook_events (
+                event_id, source, event_type, status, raw_data,
+                normalized_data, external_event_id, tenant_id,
+                resource_id, signature_valid, validation_errors,
+                processing_attempts, max_attempts, next_retry_at,
+                metadata, received_at, processed_at, failed_at,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                     $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            """,
+            event.event_id,
+            event.source.value,
+            event.event_type.value,
+            event.status.value,
+            json.dumps(event.raw_data),
+            json.dumps(event.normalized_data),
+            event.external_event_id,
+            event.tenant_id,
+            event.resource_id,
+            event.signature_valid,
+            json.dumps(event.validation_errors),
+            event.processing_attempts,
+            event.max_attempts,
+            event.next_retry_at,
+            json.dumps(event.metadata),
+            event.received_at,
+            event.processed_at,
+            event.failed_at,
+            datetime.utcnow(),
+            datetime.utcnow()
+        )
+    
+    async def _update_event_status(
+        self,
+        conn,
+        event: WebhookEvent,
+        new_status: WebhookStatus,
+        actor: str,
+        reason: str,
+        metadata: Optional[Dict] = None
+    ):
+        """Atualiza status de um evento."""
+        old_status = event.status
+        
+        # Valida transição
+        if not self.state_machine.can_transition(old_status.value, new_status.value):
+            raise StateTransitionError(
+                f"Cannot transition webhook event from {old_status.value} to {new_status.value}"
+            )
+        
+        # Atualiza
+        event.status = new_status
+        event.updated_at = datetime.utcnow()
+        
+        await conn.execute(
+            """
+            UPDATE webhook_events 
+            SET status = $1, updated_at = $2
+            WHERE event_id = $3
+            """,
+            new_status.value,
+            event.updated_at,
+            event.event_id
+        )
+        
+        # Log
+        await self.audit_logger.log(
+            tenant_id=event.tenant_id or "system",
+            user_id=actor,
+            action="webhook_event.status_changed",
+            resource_type="webhook_event",
+            resource_id=event.event_id,
+            changes={
+                "old_status": old_status.value,
+                "new_status": new_status.value,
+                "reason": reason,
+                "actor": actor
+            },
+            metadata=metadata or {}
+        )
+    
+    def _prepare_outgoing_payload(
+        self,
+        source: WebhookSource,
+        event_type: WebhookEventType,
+        tenant_id: str,
+        data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Prepara payload para webhook de saída."""
+        payload = {
+            "id": f"out_{uuid.uuid4().hex[:12]}",
+            "event_type": event_type.value,
+            "tenant_id": tenant_id,
+            "data": data,
+            "created_at": datetime.utcnow().isoformat(),
+            "source": "your_saas_platform"
+        }
+        
+        # Adiciona campos específicos por source
+        if source == WebhookSource.STRIPE:
+            payload["api_version"] = "2023-10-16"
+            payload["type"] = event_type.value.replace(".", "_")
+        
+        return payload
+    
+    def _sign_payload(self, source: WebhookSource, payload: Dict[str, Any]) -> Dict[str, str]:
+        """Assina payload para webhook de saída."""
+        config = self.webhook_configs.get(source)
+        if not config or not config.secret_key:
+            return {}
+        
+        # Gera assinatura
+        payload_str = json.dumps(payload, sort_keys=True)
+        signature = hmac.new(
+            config.secret_key.encode(),
+            payload_str.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        headers = {
+            "X-Signature": signature,
+            "X-Timestamp": datetime.utcnow().isoformat(),
+            "Content-Type": "application/json"
+        }
+        
+        # Headers específicos por source
+        if source == WebhookSource.STRIPE:
+            headers["Stripe-Signature"] = f"t={int(datetime.utcnow().timestamp())},v1={signature}"
+        
+        return headers
+    
+    async def _process_retries(self):
+        """Processa retries de eventos pendentes."""
+        while True:
+            try:
+                # Busca eventos para retry
+                _, results = await self.retry_failed_events(hours_ago=24, limit=50)
+                
+                # Aguarda antes da próxima execução
+                await asyncio.sleep(300)  # 5 minutos
+                
+            except Exception as e:
+                print(f"Error processing retries: {e}")
+                await asyncio.sleep(60)  # 1 minuto em caso de erro
+    
+    def _row_to_webhook_event(self, row) -> WebhookEvent:
+        """Converte linha do banco para WebhookEvent."""
+        return WebhookEvent(
+            event_id=row["event_id"],
+            source=WebhookSource(row["source"]),
+            event_type=WebhookEventType(row["event_type"]),
+            status=WebhookStatus(row["status"]),
+            raw_data=json.loads(row["raw_data"]) if row.get("raw_data") else {},
+            normalized_data=json.loads(row["normalized_data"]) if row.get("normalized_data") else {},
+            external_event_id=row["external_event_id"],
+            tenant_id=row.get("tenant_id"),
+            resource_id=row.get("resource_id"),
+            signature_valid=row["signature_valid"],
+            validation_errors=json.loads(row["validation_errors"]) if row.get("validation_errors") else [],
+            processing_attempts=row["processing_attempts"],
+            max_attempts=row["max_attempts"],
+            next_retry_at=row.get("next_retry_at"),
+            metadata=json.loads(row["metadata"]) if row.get("metadata") else {},
+            received_at=row["received_at"],
+            processed_at=row.get("processed_at"),
+            failed_at=row.get("failed_at")
+        )

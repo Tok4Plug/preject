@@ -1,0 +1,365 @@
+# app/models/price.py
+"""
+Modelo de Price - Preços dinâmicos e regras de cobrança.
+Multi-moeda, multi-região, com versionamento.
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text, Enum, Numeric
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
+import enum
+
+from app.database import Base
+
+
+class PriceType(enum.Enum):
+    """Tipo de preço."""
+    ONE_TIME = "one_time"           # Cobrança única
+    RECURRING = "recurring"         # Recorrente (assinatura)
+    USAGE = "usage"                 # Baseado no uso
+    TIERED = "tiered"               # Por faixa de uso
+    PACKAGE = "package"             # Pacote (créditos, etc.)
+    LIFETIME = "lifetime"           # Vitalício
+
+
+class PriceStatus(enum.Enum):
+    """Status do preço."""
+    DRAFT = "draft"                 # Rascunho, não visível
+    ACTIVE = "active"               # Ativo e disponível
+    ARCHIVED = "archived"           # Arquivado, histórico
+    DELETED = "deleted"             # Deletado
+
+
+class PriceTierMode(enum.Enum):
+    """Modo de tier de preço."""
+    GRADUATED = "graduated"         # Cada tier tem preço diferente
+    VOLUME = "volume"               # Preço único por volume
+
+
+class Price(Base):
+    """
+    Preço - configuração de cobrança para ofertas.
+    
+    Princípios:
+    1. Multi-moeda: Preços em diferentes moedas
+    2. Multi-região: Preços específicos por região
+    3. Versionamento: Histórico de alterações
+    4. Tiers: Preços graduados ou por volume
+    5. Isolamento por tenant
+    """
+    
+    __tablename__ = "prices"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    price_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # price_xxx
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Relacionamentos
+    offer_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.offers.id"), index=True)
+    plan_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # ID do plano no catálogo
+    
+    # Informações básicas
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    
+    # Tipo e status
+    price_type: Mapped[PriceType] = mapped_column(Enum(PriceType), nullable=False, default=PriceType.ONE_TIME)
+    status: Mapped[PriceStatus] = mapped_column(Enum(PriceStatus), nullable=False, default=PriceStatus.DRAFT)
+    
+    # Valores base
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)  # Moeda base
+    unit_amount: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)  # Valor unitário
+    unit_amount_decimal: Mapped[str] = mapped_column(String(50), nullable=False)  # Valor em string para precisão
+    
+    # Cobrança recorrente (se aplicável)
+    billing_cycle: Mapped[Optional[str]] = mapped_column(String(50), index=True)  # monthly, yearly, etc.
+    billing_interval: Mapped[Optional[int]] = mapped_column(Integer)  # 1, 3, 6, 12, etc.
+    billing_interval_unit: Mapped[Optional[str]] = mapped_column(String(20))  # day, week, month, year
+    
+    # Tiers (para preços graduados ou por volume)
+    tier_mode: Mapped[Optional[PriceTierMode]] = mapped_column(Enum(PriceTierMode))
+    tiers: Mapped[List[Dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    
+    # Transformações (para preços baseados em uso)
+    transform_usage: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB)  # Divisão, arredondamento
+    
+    # Regras de preço
+    rules: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Aplicabilidade
+    regions: Mapped[List[str]] = mapped_column(ARRAY(String(50)), nullable=False, default=[])  # Regiões onde se aplica
+    countries: Mapped[List[str]] = mapped_column(ARRAY(String(2)), nullable=False, default=[])  # Países específicos
+    applicable_to: Mapped[List[str]] = mapped_column(ARRAY(String(100)), nullable=False, default=[])  # IDs de ofertas/planos
+    
+    # Limites
+    min_quantity: Mapped[Optional[int]] = mapped_column(Integer)
+    max_quantity: Mapped[Optional[int]] = mapped_column(Integer)
+    
+    # Validade
+    valid_from: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    valid_until: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Versionamento
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_latest_version: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    previous_version_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    
+    # Estatísticas
+    usage_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    archived_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="prices")
+    offer: Mapped["Offer"] = relationship(back_populates="prices")
+    invoices: Mapped[List["Invoice"]] = relationship(back_populates="price", cascade="all, delete-orphan")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="price", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_prices_tenant_status', 'tenant_id', 'status'),
+        Index('ix_prices_offer_currency', 'offer_id', 'currency', 'status'),
+        Index('ix_prices_validity', 'valid_from', 'valid_until', 'status'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<Price(id='{self.id}', price_id='{self.price_id}', amount={self.unit_amount} {self.currency}, type='{self.price_type.value}')>"
+    
+    @classmethod
+    def generate_price_id(cls) -> str:
+        """Gera um ID único para o preço."""
+        timestamp = int(datetime.utcnow().timestamp() * 1000)
+        random_str = uuid.uuid4().hex[:8]
+        return f"price_{timestamp}_{random_str}"
+    
+    def to_dict(self, include_tiers: bool = True) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "price_id": self.price_id,
+            "tenant_id": self.tenant_id,
+            "offer_id": self.offer_id,
+            "plan_id": self.plan_id,
+            "name": self.name,
+            "description": self.description,
+            "price_type": self.price_type.value,
+            "status": self.status.value,
+            "currency": self.currency,
+            "unit_amount": float(self.unit_amount),
+            "unit_amount_decimal": self.unit_amount_decimal,
+            "billing_cycle": self.billing_cycle,
+            "billing_interval": self.billing_interval,
+            "billing_interval_unit": self.billing_interval_unit,
+            "tier_mode": self.tier_mode.value if self.tier_mode else None,
+            "transform_usage": self.transform_usage,
+            "rules": self.rules,
+            "metadata": self.metadata,
+            "regions": self.regions,
+            "countries": self.countries,
+            "applicable_to": self.applicable_to,
+            "min_quantity": self.min_quantity,
+            "max_quantity": self.max_quantity,
+            "valid_from": self.valid_from.isoformat() if self.valid_from else None,
+            "valid_until": self.valid_until.isoformat() if self.valid_until else None,
+            "version": self.version,
+            "is_latest_version": self.is_latest_version,
+            "previous_version_id": self.previous_version_id,
+            "usage_count": self.usage_count,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
+            "archived_at": self.archived_at.isoformat() if self.archived_at else None,
+            "is_available": self.is_available,
+            "is_recurring": self.is_recurring,
+            "has_tiers": self.has_tiers
+        }
+        
+        if include_tiers and self.tiers:
+            data["tiers"] = self.tiers
+        
+        return data
+    
+    @property
+    def is_available(self) -> bool:
+        """Verifica se o preço está disponível para uso."""
+        if self.status != PriceStatus.ACTIVE:
+            return False
+        
+        if self.deleted_at is not None:
+            return False
+        
+        now = datetime.utcnow()
+        
+        # Verifica validade temporal
+        if self.valid_from and now < self.valid_from:
+            return False
+        
+        if self.valid_until and now > self.valid_until:
+            return False
+        
+        return True
+    
+    @property
+    def is_recurring(self) -> bool:
+        """Verifica se é um preço recorrente."""
+        return self.price_type == PriceType.RECURRING
+    
+    @property
+    def has_tiers(self) -> bool:
+        """Verifica se tem tiers de preço."""
+        return bool(self.tiers) and self.tier_mode is not None
+    
+    def calculate_amount(self, quantity: int = 1, usage: Optional[float] = None) -> float:
+        """Calcula o valor total baseado na quantidade e uso."""
+        if not self.is_available:
+            raise ValueError("Price is not available")
+        
+        # Verifica limites de quantidade
+        if self.min_quantity and quantity < self.min_quantity:
+            raise ValueError(f"Minimum quantity is {self.min_quantity}")
+        
+        if self.max_quantity and quantity > self.max_quantity:
+            raise ValueError(f"Maximum quantity is {self.max_quantity}")
+        
+        # Preço simples
+        if not self.has_tiers and not usage:
+            return float(self.unit_amount) * quantity
+        
+        # Preço por uso
+        if usage is not None:
+            if self.has_tiers:
+                return self._calculate_tiered_amount(usage)
+            else:
+                return float(self.unit_amount) * usage
+        
+        # Preço com tiers por quantidade
+        if self.has_tiers and self.tier_mode == PriceTierMode.VOLUME:
+            return self._calculate_volume_tiered_amount(quantity)
+        
+        return float(self.unit_amount) * quantity
+    
+    def _calculate_tiered_amount(self, usage: float) -> float:
+        """Calcula valor para preços tiered baseados em uso."""
+        if not self.tiers:
+            return 0.0
+        
+        total = 0.0
+        previous_upto = 0.0
+        
+        for tier in self.tiers:
+            upto = tier.get("up_to")
+            unit_amount = tier.get("unit_amount", 0)
+            
+            if upto is None:  # Último tier (infinito)
+                tier_usage = usage - previous_upto
+                total += unit_amount * tier_usage
+                break
+            elif usage > upto:
+                tier_usage = upto - previous_upto
+                total += unit_amount * tier_usage
+                previous_upto = upto
+            else:
+                tier_usage = usage - previous_upto
+                total += unit_amount * tier_usage
+                break
+        
+        return total
+    
+    def _calculate_volume_tiered_amount(self, quantity: int) -> float:
+        """Calcula valor para preços tiered por volume."""
+        if not self.tiers:
+            return 0.0
+        
+        # Ordena tiers por quantidade
+        sorted_tiers = sorted(self.tiers, key=lambda x: x.get("up_to", float('inf')))
+        
+        for tier in sorted_tiers:
+            upto = tier.get("up_to")
+            unit_amount = tier.get("unit_amount", 0)
+            
+            if upto is None or quantity <= upto:
+                return unit_amount * quantity
+        
+        return 0.0
+    
+    def is_applicable_to_region(self, region: str) -> bool:
+        """Verifica se o preço é aplicável a uma região."""
+        if not self.regions:  # Se não tem restrição, aplica a todas
+            return True
+        
+        return region in self.regions
+    
+    def is_applicable_to_country(self, country_code: str) -> bool:
+        """Verifica se o preço é aplicável a um país."""
+        if not self.countries:
+            return True
+        
+        return country_code.upper() in [c.upper() for c in self.countries]
+    
+    def publish(self):
+        """Publica o preço (torna ativo)."""
+        if self.status == PriceStatus.DRAFT:
+            self.status = PriceStatus.ACTIVE
+            self.published_at = datetime.utcnow()
+            self.updated_at = datetime.utcnow()
+    
+    def archive(self):
+        """Arquiva o preço."""
+        self.status = PriceStatus.ARCHIVED
+        self.archived_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def create_new_version(self) -> "Price":
+        """Cria uma nova versão do preço."""
+        new_price = Price(
+            price_id=self.generate_price_id(),
+            tenant_id=self.tenant_id,
+            offer_id=self.offer_id,
+            plan_id=self.plan_id,
+            name=self.name,
+            description=self.description,
+            price_type=self.price_type,
+            status=PriceStatus.DRAFT,  # Nova versão começa como draft
+            currency=self.currency,
+            unit_amount=self.unit_amount,
+            unit_amount_decimal=self.unit_amount_decimal,
+            billing_cycle=self.billing_cycle,
+            billing_interval=self.billing_interval,
+            billing_interval_unit=self.billing_interval_unit,
+            tier_mode=self.tier_mode,
+            tiers=self.tiers.copy() if self.tiers else [],
+            transform_usage=self.transform_usage.copy() if self.transform_usage else None,
+            rules=self.rules.copy(),
+            metadata=self.metadata.copy(),
+            regions=self.regions.copy(),
+            countries=self.countries.copy(),
+            applicable_to=self.applicable_to.copy(),
+            min_quantity=self.min_quantity,
+            max_quantity=self.max_quantity,
+            valid_from=self.valid_from,
+            valid_until=self.valid_until,
+            version=self.version + 1,
+            is_latest_version=True,
+            previous_version_id=self.id,
+            usage_count=0  # Reinicia contador de uso
+        )
+        
+        # Marca versão atual como não mais a mais recente
+        self.is_latest_version = False
+        
+        return new_price
+    
+    def increment_usage(self):
+        """Incrementa contador de uso."""
+        self.usage_count += 1
+        self.updated_at = datetime.utcnow()

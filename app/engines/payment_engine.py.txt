@@ -1,0 +1,1248 @@
+"""
+Payment Engine - Orquestrador de pagamentos com multi-rails e multi-providers.
+Gerencia intents, escolhe rails, rotaciona providers e processa webhooks com idempotência.
+"""
+
+from datetime import datetime, timedelta
+from decimal import Decimal
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Any, Set
+from dataclasses import dataclass, field
+import asyncio
+import hashlib
+import json
+import uuid
+from collections import defaultdict
+
+from app.core.state_machine import StateMachine, StateTransitionError
+from app.core.audit_logger import AuditLogger
+from app.core.geo_resolver import GeoResolver, Region
+from app.core.antifraud import AntiFraudEngine, FraudAction, Fingerprint
+from app.models.payment_intent import PaymentIntent, PaymentIntentStatus
+
+
+class PaymentRail(Enum):
+    """Rails de pagamento suportados."""
+    PIX_STATIC = "pix_static"
+    PIX_DYNAMIC = "pix_dynamic"
+    MBWAY = "mbway"
+    SEPA_INSTANT = "sepa_instant"
+    CARD = "card"
+    CARD_USD = "card_usd"
+    CARD_EUR = "card_eur"
+    P2P_US = "p2p_us"
+    WALLET_GLOBAL = "wallet_global"
+    CRYPTO = "crypto"
+    CASH_APP = "cash_app"
+    PAYPAL = "paypal"
+    LOCAL_TRANSFER = "local_transfer"
+
+
+class PaymentRailStatus(Enum):
+    """Status de um rail de pagamento."""
+    ACTIVE = "active"
+    DEGRADED = "degraded"  # Funcionando mas com problemas
+    MAINTENANCE = "maintenance"
+    DISABLED = "disabled"
+
+
+class PaymentRailCapability(Enum):
+    """Capacidades de um rail."""
+    STATIC_QR = "static_qr"
+    DYNAMIC_QR = "dynamic_qr"
+    P2P = "p2p"
+    CARD = "card"
+    BANK_TRANSFER = "bank_transfer"
+    WALLET = "wallet"
+    CRYPTO = "crypto"
+    INSTANT = "instant"  # Liquidação instantânea
+    DEFERRED = "deferred"  # Liquidação diferida
+
+
+@dataclass
+class PaymentRailConfig:
+    """Configuração de um rail de pagamento."""
+    rail: PaymentRail
+    name: str
+    description: str
+    
+    # Capacidades
+    capabilities: Set[PaymentRailCapability]
+    
+    # Moedas suportadas
+    supported_currencies: Set[str]
+    
+    # Regiões suportadas
+    supported_regions: Set[Region]
+    
+    # Valores mínimos/máximos
+    min_amount: Optional[Decimal] = None
+    max_amount: Optional[Decimal] = None
+    
+    # Taxas
+    fixed_fee: Decimal = Decimal("0.00")
+    percentage_fee: Decimal = Decimal("0.00")
+    
+    # Tempos
+    settlement_time_minutes: int = 0  # 0 = instantâneo
+    expiration_minutes: int = 30
+    
+    # Controles
+    status: PaymentRailStatus = PaymentRailStatus.ACTIVE
+    priority: int = 100  # Quanto menor, maior prioridade
+    
+    # Metadata
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def can_handle(self, amount: Decimal, currency: str, region: Region) -> bool:
+        """Verifica se o rail pode processar um pagamento."""
+        if self.status != PaymentRailStatus.ACTIVE:
+            return False
+        
+        if currency not in self.supported_currencies:
+            return False
+        
+        if region not in self.supported_regions and Region.GLOBAL not in self.supported_regions:
+            return False
+        
+        if self.min_amount and amount < self.min_amount:
+            return False
+        
+        if self.max_amount and amount > self.max_amount:
+            return False
+        
+        return True
+    
+    def calculate_fee(self, amount: Decimal) -> Decimal:
+        """Calcula a taxa para um valor."""
+        fee = self.fixed_fee + (amount * self.percentage_fee / Decimal("100.00"))
+        return fee.quantize(Decimal("0.01"))
+
+
+@dataclass
+class ProviderConfig:
+    """Configuração de um provider de pagamento."""
+    provider_id: str
+    name: str
+    rail: PaymentRail
+    
+    # Credenciais (encriptadas)
+    credentials: Dict[str, Any]
+    
+    # Capacidades específicas
+    capabilities: Set[PaymentRailCapability]
+    
+    # Limites
+    daily_limit: Optional[Decimal] = None
+    transaction_limit: Optional[Decimal] = None
+    
+    # Controles
+    is_active: bool = True
+    priority: int = 100
+    
+    # Métricas
+    success_rate: float = 1.0
+    average_settlement_time: int = 0
+    
+    # Metadata
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def can_process(self, amount: Decimal) -> bool:
+        """Verifica se o provider pode processar um valor."""
+        if not self.is_active:
+            return False
+        
+        if self.transaction_limit and amount > self.transaction_limit:
+            return False
+        
+        return True
+
+
+@dataclass
+class PaymentResult:
+    """Resultado de uma tentativa de pagamento."""
+    success: bool
+    payment_id: str
+    provider_id: str
+    provider_reference: str
+    payment_data: Dict[str, Any]  # QR code, link, etc.
+    provider_metadata: Dict[str, Any]
+    error_message: Optional[str] = None
+    requires_action: bool = False  # Se precisa ação do usuário (ex: redirecionamento)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "success": self.success,
+            "payment_id": self.payment_id,
+            "provider_id": self.provider_id,
+            "provider_reference": self.provider_reference,
+            "payment_data": self.payment_data,
+            "provider_metadata": self.provider_metadata,
+            "error_message": self.error_message,
+            "requires_action": self.requires_action
+        }
+
+
+@dataclass
+class WebhookResult:
+    """Resultado do processamento de webhook."""
+    payment_intent_id: str
+    provider_id: str
+    provider_reference: str
+    status: str  # "paid", "failed", "cancelled"
+    amount: Decimal
+    currency: str
+    metadata: Dict[str, Any]
+    timestamp: datetime
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "payment_intent_id": self.payment_intent_id,
+            "provider_id": self.provider_id,
+            "provider_reference": self.provider_reference,
+            "status": self.status,
+            "amount": str(self.amount),
+            "currency": self.currency,
+            "metadata": self.metadata,
+            "timestamp": self.timestamp.isoformat()
+        }
+
+
+class PaymentEngine:
+    """
+    Engine de orquestração de pagamentos com multi-rails e multi-providers.
+    
+    Características:
+    - Escolha dinâmica de rail baseado em oferta, região, moeda
+    - Rotação de providers por rail com fallback
+    - Gerenciamento de Payment Intents
+    - Processamento idempotente de webhooks
+    - Integração com anti-fraude e auditoria
+    """
+    
+    def __init__(
+        self,
+        db_pool,
+        audit_logger: AuditLogger,
+        geo_resolver: GeoResolver,
+        antifraud_engine: AntiFraudEngine,
+        redis_client=None
+    ):
+        """
+        Inicializa o Payment Engine.
+        
+        Args:
+            db_pool: Pool de conexões com banco
+            audit_logger: Logger de auditoria
+            geo_resolver: Resolvedor de geolocalização
+            antifraud_engine: Engine anti-fraude
+            redis_client: Cliente Redis (opcional)
+        """
+        self.db_pool = db_pool
+        self.audit_logger = audit_logger
+        self.geo_resolver = geo_resolver
+        self.antifraud = antifraud_engine
+        self.redis = redis_client
+        
+        # Configurações de rails
+        self.rail_configs: Dict[PaymentRail, PaymentRailConfig] = {}
+        
+        # Providers por rail
+        self.providers_by_rail: Dict[PaymentRail, List[ProviderConfig]] = defaultdict(list)
+        
+        # Instâncias de providers (carregadas dinamicamente)
+        self.provider_instances: Dict[str, Any] = {}
+        
+        # Cache
+        self._cache_ttl = 300  # 5 minutos
+        
+        # Locks para concorrência
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._lock = asyncio.Lock()
+        
+        # Máquina de estados para Payment Intents
+        self.state_machine = StateMachine(
+            initial_states=[PaymentIntentStatus.PENDING.value],
+            transitions={
+                PaymentIntentStatus.PENDING.value: [
+                    PaymentIntentStatus.PROCESSING.value,
+                    PaymentIntentStatus.CANCELLED.value,
+                    PaymentIntentStatus.EXPIRED.value
+                ],
+                PaymentIntentStatus.PROCESSING.value: [
+                    PaymentIntentStatus.AWAITING_PAYMENT.value,
+                    PaymentIntentStatus.FAILED.value,
+                    PaymentIntentStatus.CANCELLED.value
+                ],
+                PaymentIntentStatus.AWAITING_PAYMENT.value: [
+                    PaymentIntentStatus.PAID.value,
+                    PaymentIntentStatus.EXPIRED.value,
+                    PaymentIntentStatus.FAILED.value
+                ],
+                PaymentIntentStatus.PAID.value: [],
+                PaymentIntentStatus.EXPIRED.value: [],
+                PaymentIntentStatus.FAILED.value: [
+                    PaymentIntentStatus.PROCESSING.value  # Retry
+                ],
+                PaymentIntentStatus.CANCELLED.value: []
+            },
+            state_field="status",
+            resource_id_field="payment_intent_id"
+        )
+        
+        # Carrega configurações
+        asyncio.create_task(self._load_configurations())
+    
+    async def _load_configurations(self):
+        """Carrega configurações de rails e providers do banco."""
+        async with self.db_pool.acquire() as conn:
+            # Carrega rails
+            rows = await conn.fetch("SELECT * FROM payment_rails WHERE is_active = true")
+            for row in rows:
+                rail = PaymentRail(row["rail"])
+                self.rail_configs[rail] = PaymentRailConfig(
+                    rail=rail,
+                    name=row["name"],
+                    description=row["description"],
+                    capabilities=set(PaymentRailCapability(c) for c in json.loads(row["capabilities"])),
+                    supported_currencies=set(json.loads(row["supported_currencies"])),
+                    supported_regions=set(Region(r) for r in json.loads(row["supported_regions"])),
+                    min_amount=Decimal(str(row["min_amount"])) if row["min_amount"] else None,
+                    max_amount=Decimal(str(row["max_amount"])) if row["max_amount"] else None,
+                    fixed_fee=Decimal(str(row["fixed_fee"])),
+                    percentage_fee=Decimal(str(row["percentage_fee"])),
+                    settlement_time_minutes=row["settlement_time_minutes"],
+                    expiration_minutes=row["expiration_minutes"],
+                    status=PaymentRailStatus(row["status"]),
+                    priority=row["priority"],
+                    metadata=json.loads(row["metadata"]) if row["metadata"] else {}
+                )
+            
+            # Carrega providers
+            rows = await conn.fetch("SELECT * FROM payment_providers WHERE is_active = true")
+            for row in rows:
+                provider = ProviderConfig(
+                    provider_id=row["provider_id"],
+                    name=row["name"],
+                    rail=PaymentRail(row["rail"]),
+                    credentials=json.loads(row["credentials"]) if row["credentials"] else {},
+                    capabilities=set(PaymentRailCapability(c) for c in json.loads(row["capabilities"])),
+                    daily_limit=Decimal(str(row["daily_limit"])) if row["daily_limit"] else None,
+                    transaction_limit=Decimal(str(row["transaction_limit"])) if row["transaction_limit"] else None,
+                    is_active=row["is_active"],
+                    priority=row["priority"],
+                    success_rate=float(row["success_rate"]),
+                    average_settlement_time=row["average_settlement_time"],
+                    metadata=json.loads(row["metadata"]) if row["metadata"] else {}
+                )
+                
+                self.providers_by_rail[provider.rail].append(provider)
+            
+            # Ordena providers por prioridade
+            for rail in self.providers_by_rail:
+                self.providers_by_rail[rail].sort(key=lambda p: p.priority)
+    
+    async def create_payment_intent(
+        self,
+        tenant_id: str,
+        user_id: str,
+        external_user_id: str,
+        bot_id: str,
+        offer_id: str,
+        amount: Decimal,
+        currency: str,
+        fingerprint_data: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+        created_by: str = "system"
+    ) -> Tuple[bool, Optional[PaymentIntent], List[str]]:
+        """
+        Cria um Payment Intent com validação de anti-fraude e escolha de rail.
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID interno do usuário
+            external_user_id: ID externo (Telegram, etc.)
+            bot_id: ID do bot
+            offer_id: ID da oferta
+            amount: Valor
+            currency: Moeda
+            fingerprint_data: Dados para fingerprint
+            metadata: Metadados adicionais
+            idempotency_key: Chave para idempotência
+            created_by: Quem criou o intent
+            
+        Returns:
+            Tuple[success, payment_intent, errors]
+        """
+        # Verifica idempotência
+        if idempotency_key:
+            existing = await self._get_intent_by_idempotency_key(idempotency_key)
+            if existing:
+                return True, existing, ["Idempotent: returning existing intent"]
+        
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # 1. Verifica anti-fraude
+                    antifraud_action, score, reason, fp_id = await self.antifraud.analyze_request(
+                        tenant_id=tenant_id,
+                        bot_id=bot_id,
+                        user_id=user_id,
+                        fingerprint_data=fingerprint_data,
+                        request_type="payment_intent",
+                        amount=amount,
+                        currency=currency
+                    )
+                    
+                    if antifraud_action in [FraudAction.BLOCK, FraudAction.BAN]:
+                        return False, None, [f"Antifraud blocked: {reason}"]
+                    
+                    # 2. Resolve região do usuário
+                    geo_result, geo_warnings = await self.geo_resolver.resolve_for_payment(
+                        telegram_data=fingerprint_data.get("telegram"),
+                        ip_address=fingerprint_data.get("ip_address"),
+                        phone_number=fingerprint_data.get("phone_number"),
+                        timezone=fingerprint_data.get("timezone"),
+                        user_id=user_id,
+                        tenant_id=tenant_id
+                    )
+                    
+                    if not geo_result.is_valid_for_payment():
+                        return False, None, ["Could not determine valid region for payment"]
+                    
+                    # 3. Seleciona rail de pagamento
+                    rail = await self._select_payment_rail(
+                        amount=amount,
+                        currency=currency,
+                        region=geo_result.region,
+                        capabilities=set()  # Poderia especificar capabilities requeridas
+                    )
+                    
+                    if not rail:
+                        return False, None, ["No suitable payment rail found"]
+                    
+                    # 4. Cria Payment Intent
+                    payment_intent_id = f"pi_{uuid.uuid4().hex[:12]}"
+                    now = datetime.utcnow()
+                    
+                    # Calcula expiração
+                    rail_config = self.rail_configs[rail]
+                    expires_at = now + timedelta(minutes=rail_config.expiration_minutes)
+                    
+                    intent = PaymentIntent(
+                        payment_intent_id=payment_intent_id,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        external_user_id=external_user_id,
+                        bot_id=bot_id,
+                        offer_id=offer_id,
+                        amount=amount,
+                        currency=currency,
+                        status=PaymentIntentStatus.PENDING,
+                        rail=rail,
+                        selected_provider=None,
+                        provider_reference=None,
+                        antifraud_score=score,
+                        antifraud_action=antifraud_action.value,
+                        fingerprint_id=fp_id,
+                        region=geo_result.region.value,
+                        country_code=geo_result.country_code,
+                        metadata={
+                            "geo_result": geo_result.to_dict(),
+                            "geo_warnings": geo_warnings,
+                            "antifraud_reason": reason,
+                            **(metadata or {})
+                        },
+                        idempotency_key=idempotency_key,
+                        created_by=created_by,
+                        created_at=now,
+                        updated_at=now,
+                        expires_at=expires_at
+                    )
+                    
+                    # 5. Persiste no banco
+                    await conn.execute(
+                        """
+                        INSERT INTO payment_intents (
+                            payment_intent_id, tenant_id, user_id, external_user_id,
+                            bot_id, offer_id, amount, currency, status, rail,
+                            selected_provider, provider_reference, antifraud_score,
+                            antifraud_action, fingerprint_id, region, country_code,
+                            metadata, idempotency_key, created_by, created_at,
+                            updated_at, expires_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                        """,
+                        intent.payment_intent_id,
+                        intent.tenant_id,
+                        intent.user_id,
+                        intent.external_user_id,
+                        intent.bot_id,
+                        intent.offer_id,
+                        intent.amount,
+                        intent.currency,
+                        intent.status.value,
+                        intent.rail.value,
+                        intent.selected_provider,
+                        intent.provider_reference,
+                        intent.antifraud_score,
+                        intent.antifraud_action,
+                        intent.fingerprint_id,
+                        intent.region,
+                        intent.country_code,
+                        json.dumps(intent.metadata),
+                        intent.idempotency_key,
+                        intent.created_by,
+                        intent.created_at,
+                        intent.updated_at,
+                        intent.expires_at
+                    )
+                    
+                    # 6. Log de auditoria
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        action="payment_intent.created",
+                        resource_type="payment_intent",
+                        resource_id=payment_intent_id,
+                        changes={
+                            "amount": str(amount),
+                            "currency": currency,
+                            "rail": rail.value,
+                            "region": geo_result.region.value,
+                            "antifraud_score": score
+                        },
+                        metadata=intent.to_dict()
+                    )
+                    
+                    return True, intent, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def process_payment_intent(
+        self,
+        tenant_id: str,
+        payment_intent_id: str,
+        user_ip: Optional[str] = None,
+        user_agent: Optional[str] = None
+    ) -> Tuple[bool, Optional[PaymentIntent], Optional[Dict[str, Any]], List[str]]:
+        """
+        Processa um Payment Intent, escolhendo provider e gerando instruções de pagamento.
+        
+        Args:
+            tenant_id: ID do tenant
+            payment_intent_id: ID do intent
+            user_ip: IP do usuário (para logging)
+            user_agent: User-Agent (para logging)
+            
+        Returns:
+            Tuple[success, payment_intent, payment_data, errors]
+            payment_data: Dados específicos do provider (QR code, link, etc.)
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Busca o intent
+                    intent = await self._get_payment_intent(conn, tenant_id, payment_intent_id)
+                    if not intent:
+                        return False, None, None, [f"Payment intent not found: {payment_intent_id}"]
+                    
+                    # Verifica se já está processado
+                    if intent.status != PaymentIntentStatus.PENDING:
+                        return False, None, None, [f"Intent already {intent.status.value}"]
+                    
+                    # Verifica expiração
+                    if intent.expires_at < datetime.utcnow():
+                        await self._expire_intent(conn, intent)
+                        return False, None, None, ["Payment intent expired"]
+                    
+                    # 1. Seleciona provider
+                    provider_config = await self._select_provider(intent.rail, intent.amount)
+                    if not provider_config:
+                        return False, None, None, ["No available provider for rail"]
+                    
+                    # 2. Obtém instância do provider
+                    provider = await self._get_provider_instance(provider_config.provider_id)
+                    if not provider:
+                        return False, None, None, [f"Provider not available: {provider_config.provider_id}"]
+                    
+                    # 3. Atualiza intent para PROCESSING
+                    await self._update_intent_status(
+                        conn, intent, PaymentIntentStatus.PROCESSING,
+                        "system", "Starting payment processing",
+                        {"selected_provider": provider_config.provider_id}
+                    )
+                    
+                    # 4. Executa pagamento no provider (mock - em produção seria integração real)
+                    try:
+                        payment_result = await self._mock_provider_payment(
+                            provider_config, intent, user_ip, user_agent
+                        )
+                        
+                        if not payment_result.success:
+                            raise Exception(payment_result.error_message)
+                        
+                    except Exception as e:
+                        # Provider falhou, tenta outro
+                        await self.audit_logger.log(
+                            tenant_id=tenant_id,
+                            user_id=intent.user_id,
+                            action="payment.provider_failed",
+                            resource_type="payment_intent",
+                            resource_id=payment_intent_id,
+                            changes={
+                                "provider": provider_config.provider_id,
+                                "error": str(e)
+                            },
+                            severity="warning"
+                        )
+                        
+                        # Tenta outro provider
+                        return await self._retry_with_fallback(
+                            conn, intent, provider_config, user_ip, user_agent
+                        )
+                    
+                    # 5. Atualiza intent com referência do provider
+                    await conn.execute(
+                        """
+                        UPDATE payment_intents 
+                        SET selected_provider = $1,
+                            provider_reference = $2,
+                            provider_metadata = $3,
+                            updated_at = $4
+                        WHERE payment_intent_id = $5
+                        """,
+                        provider_config.provider_id,
+                        payment_result.provider_reference,
+                        json.dumps(payment_result.provider_metadata),
+                        datetime.utcnow(),
+                        payment_intent_id
+                    )
+                    
+                    # 6. Atualiza para AWAITING_PAYMENT
+                    await self._update_intent_status(
+                        conn, intent, PaymentIntentStatus.AWAITING_PAYMENT,
+                        "system", "Awaiting payment confirmation",
+                        {
+                            "provider": provider_config.provider_id,
+                            "provider_reference": payment_result.provider_reference
+                        }
+                    )
+                    
+                    # 7. Log de auditoria
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=intent.user_id,
+                        action="payment.processing",
+                        resource_type="payment_intent",
+                        resource_id=payment_intent_id,
+                        changes={
+                            "provider": provider_config.provider_id,
+                            "provider_reference": payment_result.provider_reference,
+                            "payment_data_keys": list(payment_result.payment_data.keys())
+                        },
+                        metadata={
+                            "payment_data": payment_result.payment_data,
+                            "provider_metadata": payment_result.provider_metadata
+                        }
+                    )
+                    
+                    # Busca intent atualizado
+                    intent = await self._get_payment_intent(conn, tenant_id, payment_intent_id)
+                    
+                    return True, intent, payment_result.payment_data, []
+                    
+                except Exception as e:
+                    return False, None, None, [f"Processing error: {str(e)}"]
+    
+    async def handle_webhook(
+        self,
+        provider_id: str,
+        webhook_data: Dict[str, Any],
+        signature: Optional[str] = None,
+        ip_address: Optional[str] = None
+    ) -> Tuple[bool, Optional[PaymentIntent], List[str]]:
+        """
+        Processa webhook de um provider de pagamento.
+        
+        Args:
+            provider_id: ID do provider
+            webhook_data: Dados do webhook
+            signature: Assinatura do webhook (para validação)
+            ip_address: IP de origem (para validação)
+            
+        Returns:
+            Tuple[success, payment_intent, errors]
+        """
+        try:
+            # 1. Valida provider
+            provider_config = await self._get_provider_config(provider_id)
+            if not provider_config:
+                return False, None, [f"Provider not found: {provider_id}"]
+            
+            # 2. Em produção, validaria webhook com provider real
+            # Por enquanto mock
+            is_valid = True  # await provider.validate_webhook(webhook_data, signature, ip_address)
+            if not is_valid:
+                return False, None, ["Invalid webhook signature or origin"]
+            
+            # 3. Extrai dados do pagamento
+            webhook_result = await self._mock_process_webhook(provider_id, webhook_data)
+            
+            # 4. Busca intent pela referência do provider
+            async with self.db_pool.acquire() as conn:
+                intent = await self._get_intent_by_provider_reference(
+                    conn, provider_id, webhook_result.provider_reference
+                )
+                
+                if not intent:
+                    return False, None, [
+                        f"Payment intent not found for reference: {webhook_result.provider_reference}"
+                    ]
+                
+                # 5. Verifica se já foi processado (idempotência)
+                if intent.status == PaymentIntentStatus.PAID:
+                    return True, intent, ["Webhook already processed"]
+                
+                # 6. Valida montante
+                if webhook_result.amount != intent.amount:
+                    await self.audit_logger.log(
+                        tenant_id=intent.tenant_id,
+                        user_id=intent.user_id,
+                        action="payment.amount_mismatch",
+                        resource_type="payment_intent",
+                        resource_id=intent.payment_intent_id,
+                        changes={
+                            "expected": str(intent.amount),
+                            "received": str(webhook_result.amount),
+                            "provider_reference": webhook_result.provider_reference
+                        },
+                        severity="error"
+                    )
+                    return False, None, ["Amount mismatch"]
+                
+                # 7. Atualiza status baseado no resultado
+                if webhook_result.status == "paid":
+                    new_status = PaymentIntentStatus.PAID
+                    reason = "Payment confirmed via webhook"
+                elif webhook_result.status == "failed":
+                    new_status = PaymentIntentStatus.FAILED
+                    reason = "Payment failed via webhook"
+                elif webhook_result.status == "cancelled":
+                    new_status = PaymentIntentStatus.CANCELLED
+                    reason = "Payment cancelled via webhook"
+                else:
+                    return False, None, [f"Unknown webhook status: {webhook_result.status}"]
+                
+                # 8. Atualiza intent
+                await self._update_intent_status(
+                    conn, intent, new_status,
+                    "system", reason,
+                    {
+                        "webhook_data": webhook_data,
+                        "webhook_result": webhook_result.to_dict(),
+                        "provider_id": provider_id
+                    }
+                )
+                
+                # 9. Se pago, dispara eventos downstream
+                if new_status == PaymentIntentStatus.PAID:
+                    await self._on_payment_success(conn, intent, webhook_result)
+                
+                # Busca intent atualizado
+                intent = await self._get_payment_intent(conn, intent.tenant_id, intent.payment_intent_id)
+                
+                return True, intent, []
+                
+        except Exception as e:
+            return False, None, [f"Webhook processing error: {str(e)}"]
+    
+    async def get_available_payment_methods(
+        self,
+        tenant_id: str,
+        amount: Decimal,
+        currency: str,
+        region: Region,
+        user_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Obtém métodos de pagamento disponíveis para um contexto.
+        
+        Args:
+            tenant_id: ID do tenant
+            amount: Valor
+            currency: Moeda
+            region: Região
+            user_id: ID do usuário (para histórico)
+            
+        Returns:
+            Lista de métodos disponíveis
+        """
+        methods = []
+        
+        for rail, config in self.rail_configs.items():
+            if not config.can_handle(amount, currency, region):
+                continue
+            
+            # Verifica se há providers disponíveis
+            available_providers = [
+                p for p in self.providers_by_rail.get(rail, [])
+                if p.can_process(amount)
+            ]
+            
+            if not available_providers:
+                continue
+            
+            # Calcula taxa
+            fee = config.calculate_fee(amount)
+            total_amount = amount + fee
+            
+            methods.append({
+                "rail": rail.value,
+                "name": config.name,
+                "description": config.description,
+                "capabilities": [c.value for c in config.capabilities],
+                "fee": {
+                    "fixed": str(config.fixed_fee),
+                    "percentage": str(config.percentage_fee),
+                    "total": str(fee)
+                },
+                "total_amount": str(total_amount),
+                "settlement_time": config.settlement_time_minutes,
+                "expiration": config.expiration_minutes,
+                "providers_count": len(available_providers),
+                "metadata": config.metadata
+            })
+        
+        # Ordena por prioridade
+        methods.sort(key=lambda x: self.rail_configs[PaymentRail(x["rail"])].priority)
+        
+        return methods
+    
+    async def cancel_payment_intent(
+        self,
+        tenant_id: str,
+        payment_intent_id: str,
+        cancelled_by: str,
+        reason: str
+    ) -> Tuple[bool, Optional[PaymentIntent], List[str]]:
+        """Cancela um Payment Intent."""
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    intent = await self._get_payment_intent(conn, tenant_id, payment_intent_id)
+                    if not intent:
+                        return False, None, [f"Payment intent not found: {payment_intent_id}"]
+                    
+                    # Verifica se pode cancelar
+                    if intent.status not in [PaymentIntentStatus.PENDING, PaymentIntentStatus.AWAITING_PAYMENT]:
+                        return False, None, [f"Cannot cancel intent in status {intent.status.value}"]
+                    
+                    # Atualiza status
+                    await self._update_intent_status(
+                        conn, intent, PaymentIntentStatus.CANCELLED,
+                        cancelled_by, reason
+                    )
+                    
+                    # Se estava aguardando pagamento, cancela no provider
+                    if intent.status == PaymentIntentStatus.AWAITING_PAYMENT and intent.selected_provider:
+                        # Em produção chamaria provider.cancel_payment()
+                        pass
+                    
+                    # Busca intent atualizado
+                    intent = await self._get_payment_intent(conn, tenant_id, payment_intent_id)
+                    return True, intent, []
+                    
+                except Exception as e:
+                    return False, None, [f"Cancellation error: {str(e)}"]
+    
+    async def retry_failed_payment(
+        self,
+        tenant_id: str,
+        payment_intent_id: str,
+        retried_by: str
+    ) -> Tuple[bool, Optional[PaymentIntent], List[str]]:
+        """Retenta um pagamento que falhou."""
+        # Similar ao process_payment_intent, mas para intents FAILED
+        # Com lógica de backoff e limite de retries
+        pass
+    
+    # Métodos privados
+    async def _select_payment_rail(
+        self,
+        amount: Decimal,
+        currency: str,
+        region: Region,
+        capabilities: Set[PaymentRailCapability]
+    ) -> Optional[PaymentRail]:
+        """Seleciona o rail de pagamento apropriado."""
+        available_rails = []
+        
+        for rail, config in self.rail_configs.items():
+            if not config.can_handle(amount, currency, region):
+                continue
+            
+            # Verifica capabilities requeridas
+            if capabilities and not capabilities.issubset(config.capabilities):
+                continue
+            
+            # Verifica providers disponíveis
+            available_providers = [
+                p for p in self.providers_by_rail.get(rail, [])
+                if p.can_process(amount)
+            ]
+            
+            if not available_providers:
+                continue
+            
+            available_rails.append((rail, config))
+        
+        if not available_rails:
+            return None
+        
+        # Ordena por: 1. Prioridade, 2. Taxa mais baixa, 3. Tempo de liquidação
+        available_rails.sort(key=lambda x: (
+            x[1].priority,
+            x[1].calculate_fee(amount),
+            x[1].settlement_time_minutes
+        ))
+        
+        return available_rails[0][0]
+    
+    async def _select_provider(
+        self,
+        rail: PaymentRail,
+        amount: Decimal
+    ) -> Optional[ProviderConfig]:
+        """Seleciona provider para um rail."""
+        providers = self.providers_by_rail.get(rail, [])
+        
+        # Filtra providers que podem processar o valor
+        available = [p for p in providers if p.can_process(amount)]
+        
+        if not available:
+            return None
+        
+        # Ordena por: 1. Prioridade, 2. Taxa de sucesso, 3. Tempo médio
+        available.sort(key=lambda p: (
+            p.priority,
+            -p.success_rate,  # Negativo para ordem decrescente
+            p.average_settlement_time
+        ))
+        
+        return available[0]
+    
+    async def _get_provider_instance(self, provider_id: str) -> Optional[Any]:
+        """Obtém instância de um provider."""
+        if provider_id in self.provider_instances:
+            return self.provider_instances[provider_id]
+        
+        # Em produção, carregaria dinamicamente baseado no tipo
+        # Por enquanto retorna mock
+        class MockProvider:
+            async def create_payment(self, **kwargs):
+                return PaymentResult(
+                    success=True,
+                    payment_id=f"pay_{uuid.uuid4().hex[:8]}",
+                    provider_id=provider_id,
+                    provider_reference=f"ref_{uuid.uuid4().hex[:8]}",
+                    payment_data={"type": "mock", "instructions": "Mock payment"},
+                    provider_metadata={}
+                )
+        
+        provider = MockProvider()
+        self.provider_instances[provider_id] = provider
+        return provider
+    
+    async def _get_provider_config(self, provider_id: str) -> Optional[ProviderConfig]:
+        """Obtém configuração de um provider."""
+        for rail_providers in self.providers_by_rail.values():
+            for provider in rail_providers:
+                if provider.provider_id == provider_id:
+                    return provider
+        return None
+    
+    async def _mock_provider_payment(
+        self,
+        provider_config: ProviderConfig,
+        intent: PaymentIntent,
+        user_ip: Optional[str],
+        user_agent: Optional[str]
+    ) -> PaymentResult:
+        """Mock de processamento de pagamento."""
+        # Em produção, integração real com provider
+        return PaymentResult(
+            success=True,
+            payment_id=f"pay_{uuid.uuid4().hex[:8]}",
+            provider_id=provider_config.provider_id,
+            provider_reference=f"ref_{uuid.uuid4().hex[:8]}",
+            payment_data={
+                "type": intent.rail.value,
+                "instructions": f"Pay {intent.amount} {intent.currency}",
+                "expires_at": intent.expires_at.isoformat()
+            },
+            provider_metadata={
+                "rail": intent.rail.value,
+                "user_ip": user_ip,
+                "user_agent": user_agent
+            }
+        )
+    
+    async def _mock_process_webhook(
+        self,
+        provider_id: str,
+        webhook_data: Dict[str, Any]
+    ) -> WebhookResult:
+        """Mock de processamento de webhook."""
+        # Em produção, extrairia dados do webhook real
+        return WebhookResult(
+            payment_intent_id=webhook_data.get("payment_intent_id", "unknown"),
+            provider_id=provider_id,
+            provider_reference=webhook_data.get("reference", "unknown"),
+            status=webhook_data.get("status", "paid"),
+            amount=Decimal(str(webhook_data.get("amount", "0.00"))),
+            currency=webhook_data.get("currency", "USD"),
+            metadata=webhook_data,
+            timestamp=datetime.utcnow()
+        )
+    
+    async def _retry_with_fallback(
+        self,
+        conn,
+        intent: PaymentIntent,
+        failed_provider: ProviderConfig,
+        user_ip: Optional[str],
+        user_agent: Optional[str]
+    ) -> Tuple[bool, Optional[PaymentIntent], Optional[Dict[str, Any]], List[str]]:
+        """Tenta processar com outro provider após falha."""
+        # Obtém outros providers para o mesmo rail
+        providers = self.providers_by_rail.get(intent.rail, [])
+        
+        # Remove o que falhou
+        fallback_providers = [p for p in providers if p.provider_id != failed_provider.provider_id]
+        
+        for provider_config in fallback_providers:
+            if not provider_config.can_process(intent.amount):
+                continue
+            
+            try:
+                provider = await self._get_provider_instance(provider_config.provider_id)
+                if not provider:
+                    continue
+                
+                # Tenta processar
+                payment_result = await self._mock_provider_payment(
+                    provider_config, intent, user_ip, user_agent
+                )
+                
+                # Atualiza intent
+                await conn.execute(
+                    """
+                    UPDATE payment_intents 
+                    SET selected_provider = $1,
+                        provider_reference = $2,
+                        provider_metadata = $3,
+                        updated_at = $4
+                    WHERE payment_intent_id = $5
+                    """,
+                    provider_config.provider_id,
+                    payment_result.provider_reference,
+                    json.dumps(payment_result.provider_metadata),
+                    datetime.utcnow(),
+                    intent.payment_intent_id
+                )
+                
+                # Log
+                await self.audit_logger.log(
+                    tenant_id=intent.tenant_id,
+                    user_id=intent.user_id,
+                    action="payment.fallback_success",
+                    resource_type="payment_intent",
+                    resource_id=intent.payment_intent_id,
+                    changes={
+                        "failed_provider": failed_provider.provider_id,
+                        "fallback_provider": provider_config.provider_id,
+                        "provider_reference": payment_result.provider_reference
+                    }
+                )
+                
+                # Busca intent atualizado
+                intent = await self._get_payment_intent(conn, intent.tenant_id, intent.payment_intent_id)
+                
+                return True, intent, payment_result.payment_data, []
+                
+            except Exception:
+                continue  # Tenta próximo
+        
+        # Todos os providers falharam
+        await self._update_intent_status(
+            conn, intent, PaymentIntentStatus.FAILED,
+            "system", "All providers failed"
+        )
+        
+        return False, None, None, ["All payment providers failed"]
+    
+    async def _on_payment_success(
+        self,
+        conn,
+        intent: PaymentIntent,
+        webhook_result: WebhookResult
+    ):
+        """Dispara eventos quando um pagamento é confirmado."""
+        # 1. Atualiza métricas do provider
+        provider_config = await self._get_provider_config(intent.selected_provider)
+        if provider_config:
+            # Em produção, atualizar success_rate, etc.
+            pass
+        
+        # 2. Cria invoice (se aplicável)
+        # await self._create_invoice(conn, intent, webhook_result)
+        
+        # 3. Dispara evento para Subscription Engine
+        # await self._trigger_subscription_activation(conn, intent)
+        
+        # 4. Dispara evento para Entitlement Engine
+        # await self._trigger_entitlement_grant(conn, intent)
+        
+        # 5. Notifica usuário
+        # await self._send_payment_confirmation(conn, intent)
+        
+        # Log
+        await self.audit_logger.log(
+            tenant_id=intent.tenant_id,
+            user_id=intent.user_id,
+            action="payment.success",
+            resource_type="payment_intent",
+            resource_id=intent.payment_intent_id,
+            changes={
+                "amount": str(intent.amount),
+                "currency": intent.currency,
+                "provider": intent.selected_provider
+            },
+            severity="info"
+        )
+    
+    async def _get_payment_intent(self, conn, tenant_id: str, payment_intent_id: str) -> Optional[PaymentIntent]:
+        """Busca Payment Intent do banco."""
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM payment_intents 
+            WHERE tenant_id = $1 AND payment_intent_id = $2
+            """,
+            tenant_id, payment_intent_id
+        )
+        return self._row_to_payment_intent(row) if row else None
+    
+    async def _get_intent_by_idempotency_key(self, key: str) -> Optional[PaymentIntent]:
+        """Busca intent por chave de idempotência."""
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM payment_intents WHERE idempotency_key = $1",
+                key
+            )
+            return self._row_to_payment_intent(row) if row else None
+    
+    async def _get_intent_by_provider_reference(
+        self,
+        conn,
+        provider_id: str,
+        reference: str
+    ) -> Optional[PaymentIntent]:
+        """Busca intent por referência do provider."""
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM payment_intents 
+            WHERE selected_provider = $1 AND provider_reference = $2
+            """,
+            provider_id, reference
+        )
+        return self._row_to_payment_intent(row) if row else None
+    
+    async def _update_intent_status(
+        self,
+        conn,
+        intent: PaymentIntent,
+        new_status: PaymentIntentStatus,
+        actor: str,
+        reason: str,
+        metadata: Optional[Dict] = None
+    ):
+        """Atualiza status de um Payment Intent."""
+        old_status = intent.status
+        
+        # Valida transição
+        if not self.state_machine.can_transition(old_status.value, new_status.value):
+            raise StateTransitionError(
+                f"Cannot transition payment intent from {old_status.value} to {new_status.value}"
+            )
+        
+        # Atualiza
+        updated_at = datetime.utcnow()
+        await conn.execute(
+            """
+            UPDATE payment_intents 
+            SET status = $1, updated_at = $2
+            WHERE payment_intent_id = $3
+            """,
+            new_status.value,
+            updated_at,
+            intent.payment_intent_id
+        )
+        
+        # Log de auditoria
+        await self.audit_logger.log(
+            tenant_id=intent.tenant_id,
+            user_id=intent.user_id,
+            action="payment_intent.status_changed",
+            resource_type="payment_intent",
+            resource_id=intent.payment_intent_id,
+            changes={
+                "old_status": old_status.value,
+                "new_status": new_status.value,
+                "reason": reason,
+                "actor": actor
+            },
+            metadata=metadata or {}
+        )
+    
+    async def _expire_intent(self, conn, intent: PaymentIntent):
+        """Marca um intent como expirado."""
+        await self._update_intent_status(
+            conn, intent, PaymentIntentStatus.EXPIRED,
+            "system", "Payment intent expired"
+        )
+    
+    def _row_to_payment_intent(self, row) -> PaymentIntent:
+        """Converte linha do banco para PaymentIntent."""
+        # Importação local para evitar circular dependency
+        from app.models.payment_intent import PaymentIntentStatus
+        
+        return PaymentIntent(
+            payment_intent_id=row["payment_intent_id"],
+            tenant_id=row["tenant_id"],
+            user_id=row["user_id"],
+            external_user_id=row["external_user_id"],
+            bot_id=row["bot_id"],
+            offer_id=row["offer_id"],
+            amount=Decimal(str(row["amount"])),
+            currency=row["currency"],
+            status=PaymentIntentStatus(row["status"]),
+            rail=PaymentRail(row["rail"]),
+            selected_provider=row["selected_provider"],
+            provider_reference=row["provider_reference"],
+            antifraud_score=row["antifraud_score"],
+            antifraud_action=row["antifraud_action"],
+            fingerprint_id=row["fingerprint_id"],
+            region=row["region"],
+            country_code=row["country_code"],
+            metadata=json.loads(row["metadata"]) if row.get("metadata") else {},
+            idempotency_key=row["idempotency_key"],
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            expires_at=row["expires_at"]
+        )

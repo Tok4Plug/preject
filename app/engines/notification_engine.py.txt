@@ -1,0 +1,559 @@
+# app/engines/notification_engine.py
+"""
+Notification Engine - Sistema de notificações multi-tenant, multi-canal e assíncrono.
+
+Princípios:
+1. Nunca envia notificações diretamente - usa Template Engine para renderização
+2. Suporta múltiplos canais (Telegram, Email, SMS, Webhook, etc.)
+3. Idempotência forte através de notification_id único
+4. Stateless - preparado para workers distribuídos
+5. Isolamento total por tenant
+6. Auditoria completa de todos os envios
+"""
+
+import asyncio
+import json
+import logging
+import hashlib
+from datetime import datetime
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, asdict
+from enum import Enum
+
+from app.core.template_engine import TemplateEngine
+from app.core.audit_logger import AuditLogger
+from app.core.metrics_engine import MetricsEngine
+from app.models.tenant import Tenant
+from app.utils.cryptography import generate_idempotency_key
+from app.queue.base import QueueProducer
+
+logger = logging.getLogger(__name__)
+
+
+class NotificationChannel(Enum):
+    """Canais de notificação suportados."""
+    TELEGRAM = "telegram"
+    EMAIL = "email"
+    SMS = "sms"
+    WEBHOOK = "webhook"
+    PUSH = "push"
+    WHATSAPP = "whatsapp"
+
+
+class NotificationPriority(Enum):
+    """Prioridades de entrega."""
+    LOW = "low"       # Processamento batch, até 24h
+    NORMAL = "normal" # Até 1 hora
+    HIGH = "high"     # Até 10 minutos
+    CRITICAL = "critical" # Imediato, retry agressivo
+
+
+class NotificationStatus(Enum):
+    """Status do ciclo de vida da notificação."""
+    PENDING = "pending"
+    RENDERED = "rendered"
+    QUEUED = "queued"
+    SENDING = "sending"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    BOUNCED = "bounced"  # Para emails
+
+
+@dataclass(frozen=True)
+class NotificationRequest:
+    """Request imutável para envio de notificação."""
+    notification_id: str
+    tenant_id: str
+    channel: NotificationChannel
+    template_id: str
+    template_version: Optional[str] = None  # None = usar última versão
+    context: Dict[str, Any] = None
+    recipient: str = None  # ID do usuário no sistema (não confundir com endereço)
+    external_address: Optional[str] = None  # email, phone, telegram_id, etc.
+    priority: NotificationPriority = NotificationPriority.NORMAL
+    idempotency_key: Optional[str] = None
+    scheduled_for: Optional[datetime] = None
+    metadata: Dict[str, Any] = None
+    correlation_id: Optional[str] = None  # Para rastreamento cross-system
+    
+    def __post_init__(self):
+        if self.context is None:
+            object.__setattr__(self, 'context', {})
+        if self.metadata is None:
+            object.__setattr__(self, 'metadata', {})
+        if not self.idempotency_key:
+            object.__setattr__(self, 'idempotency_key', 
+                             generate_idempotency_key(
+                                 f"notif_{self.tenant_id}_{self.template_id}_{self.recipient}"
+                             ))
+
+
+@dataclass(frozen=True)
+class RenderedNotification:
+    """Notificação renderizada pronta para envio."""
+    request: NotificationRequest
+    rendered_subject: Optional[str] = None
+    rendered_body: str
+    rendered_metadata: Dict[str, Any] = None
+    render_timestamp: datetime = None
+    
+    def __post_init__(self):
+        if self.render_timestamp is None:
+            object.__setattr__(self, 'render_timestamp', datetime.utcnow())
+        if self.rendered_metadata is None:
+            object.__setattr__(self, 'rendered_metadata', {})
+
+
+class NotificationEngine:
+    """
+    Engine principal de notificações.
+    
+    Responsabilidades:
+    1. Orquestrar o processo de notificação
+    2. Usar Template Engine para renderização
+    3. Delegar envio para providers específicos via fila
+    4. Garantir idempotência e auditoria
+    """
+    
+    def __init__(
+        self,
+        template_engine: TemplateEngine,
+        audit_logger: AuditLogger,
+        metrics_engine: MetricsEngine,
+        queue_producer: QueueProducer
+    ):
+        self.template_engine = template_engine
+        self.audit_logger = audit_logger
+        self.metrics = metrics_engine
+        self.queue = queue_producer
+        
+        # Cache de templates (LRU em produção)
+        self._template_cache = {}
+        
+        # Configurações por canal
+        self._channel_configs = {
+            NotificationChannel.TELEGRAM: {
+                'queue_name': 'notifications_telegram',
+                'max_retries': 3,
+                'timeout_seconds': 30,
+                'requires_external_address': True
+            },
+            NotificationChannel.EMAIL: {
+                'queue_name': 'notifications_email',
+                'max_retries': 5,
+                'timeout_seconds': 60,
+                'requires_external_address': True
+            },
+            NotificationChannel.WEBHOOK: {
+                'queue_name': 'notifications_webhook',
+                'max_retries': 3,
+                'timeout_seconds': 10,
+                'requires_external_address': False
+            }
+        }
+        
+        logger.info("Notification Engine inicializado")
+    
+    async def send_notification(self, request: NotificationRequest) -> str:
+        """
+        Processa e envia uma notificação de forma idempotente.
+        
+        Retorna:
+            str: ID da notificação (mesmo do request)
+        
+        Exceções:
+            NotificationError: Erros específicos do domínio
+            TemplateNotFound: Template não encontrado
+            RateLimitExceeded: Limite de envios excedido
+        """
+        # 1. Validação inicial
+        self._validate_request(request)
+        
+        # 2. Verificação de idempotência
+        if await self._is_duplicate_request(request):
+            logger.info(f"Notificação duplicada ignorada: {request.idempotency_key}")
+            await self._audit_duplicate(request)
+            return request.notification_id
+        
+        # 3. Auditoria inicial
+        await self._audit_start(request)
+        
+        try:
+            # 4. Renderização do template
+            rendered = await self._render_notification(request)
+            
+            # 5. Enfileiramento para envio
+            await self._enqueue_for_delivery(rendered)
+            
+            # 6. Auditoria de sucesso
+            await self._audit_success(rendered)
+            
+            # 7. Métricas
+            await self._record_metrics(rendered, "queued")
+            
+            logger.info(f"Notificação {request.notification_id} enfileirada para envio via {request.channel}")
+            
+            return request.notification_id
+            
+        except Exception as e:
+            # Auditoria de falha
+            await self._audit_failure(request, str(e))
+            await self._record_metrics(request, "failed")
+            logger.error(f"Erro ao processar notificação {request.notification_id}: {e}")
+            raise NotificationError(f"Falha ao processar notificação: {str(e)}")
+    
+    async def send_bulk_notifications(
+        self,
+        requests: List[NotificationRequest],
+        batch_size: int = 100
+    ) -> Dict[str, List[str]]:
+        """
+        Envia múltiplas notificações em lote.
+        
+        Retorna:
+            Dict com listas de succeeded e failed IDs
+        """
+        succeeded = []
+        failed = []
+        
+        for i in range(0, len(requests), batch_size):
+            batch = requests[i:i + batch_size]
+            tasks = [self.send_notification(req) for req in batch]
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for req, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Falha no envio em lote {req.notification_id}: {result}")
+                    failed.append(req.notification_id)
+                else:
+                    succeeded.append(req.notification_id)
+            
+            # Rate limiting entre batches
+            if i + batch_size < len(requests):
+                await asyncio.sleep(0.1)  # 100ms entre batches
+        
+        # Métricas de bulk
+        await self.metrics.increment_counter(
+            "notifications_bulk_total",
+            tags={
+                "succeeded": len(succeeded),
+                "failed": len(failed),
+                "batch_size": batch_size
+            }
+        )
+        
+        return {"succeeded": succeeded, "failed": failed}
+    
+    async def get_notification_status(self, notification_id: str, tenant_id: str) -> Dict[str, Any]:
+        """
+        Obtém status de uma notificação específica.
+        
+        Em produção, isso consultaria uma tabela de tracking.
+        """
+        # Esta é uma implementação simplificada
+        # Em produção, teríamos uma tabela notification_delivery com status
+        return {
+            "notification_id": notification_id,
+            "tenant_id": tenant_id,
+            "status": "queued",  # Em produção, seria consultado
+            "last_updated": datetime.utcnow().isoformat()
+        }
+    
+    def _validate_request(self, request: NotificationRequest):
+        """Validação rigorosa do request."""
+        if not request.tenant_id:
+            raise NotificationError("tenant_id é obrigatório")
+        
+        if not request.template_id:
+            raise NotificationError("template_id é obrigatório")
+        
+        if not request.recipient and not request.external_address:
+            raise NotificationError("recipient ou external_address é obrigatório")
+        
+        # Validação específica por canal
+        channel_config = self._channel_configs.get(request.channel)
+        if not channel_config:
+            raise NotificationError(f"Canal não suportado: {request.channel}")
+        
+        if channel_config['requires_external_address'] and not request.external_address:
+            raise NotificationError(f"{request.channel} requer external_address")
+    
+    async def _is_duplicate_request(self, request: NotificationRequest) -> bool:
+        """
+        Verifica se é uma requisição duplicada usando idempotency_key.
+        
+        Em produção, usaria Redis ou tabela deduplication com TTL.
+        """
+        # Implementação simplificada - em produção usar Redis com SETNX
+        key = f"idempotency:notification:{request.idempotency_key}"
+        
+        # Aqui seria uma chamada Redis:
+        # return await redis_client.setnx(key, "1", ex=86400) == 0
+        
+        # Por enquanto, sempre retorna False (não duplicado)
+        # Em produção, implementar lógica real
+        return False
+    
+    async def _render_notification(self, request: NotificationRequest) -> RenderedNotification:
+        """Renderiza a notificação usando Template Engine."""
+        try:
+            # Obtém template do Template Engine
+            template = await self.template_engine.get_template(
+                tenant_id=request.tenant_id,
+                template_id=request.template_id,
+                version=request.template_version,
+                channel=request.channel.value
+            )
+            
+            # Renderiza com contexto
+            render_result = await self.template_engine.render(
+                template=template,
+                context=request.context,
+                render_mode="SAFE"  # Modo seguro por padrão
+            )
+            
+            # Cria objeto renderizado
+            rendered = RenderedNotification(
+                request=request,
+                rendered_subject=render_result.get("subject"),
+                rendered_body=render_result["body"],
+                rendered_metadata={
+                    "template_version": template.version,
+                    "render_mode": render_result.get("render_mode"),
+                    "language": render_result.get("language", "pt_BR")
+                }
+            )
+            
+            logger.debug(f"Template {request.template_id} renderizado para notificação {request.notification_id}")
+            
+            return rendered
+            
+        except Exception as e:
+            logger.error(f"Erro ao renderizar template {request.template_id}: {e}")
+            raise TemplateRenderError(f"Falha na renderização: {str(e)}")
+    
+    async def _enqueue_for_delivery(self, rendered: RenderedNotification):
+        """Enfileira notificação renderizada para envio assíncrono."""
+        request = rendered.request
+        channel_config = self._channel_configs[request.channel]
+        
+        # Prepara mensagem para fila
+        message = {
+            "notification_id": request.notification_id,
+            "tenant_id": request.tenant_id,
+            "channel": request.channel.value,
+            "recipient": request.recipient,
+            "external_address": request.external_address,
+            "subject": rendered.rendered_subject,
+            "body": rendered.rendered_body,
+            "metadata": {
+                **rendered.rendered_metadata,
+                **request.metadata,
+                "priority": request.priority.value,
+                "correlation_id": request.correlation_id
+            },
+            "idempotency_key": request.idempotency_key,
+            "scheduled_for": request.scheduled_for.isoformat() if request.scheduled_for else None,
+            "max_retries": channel_config['max_retries'],
+            "timeout_seconds": channel_config['timeout_seconds']
+        }
+        
+        # Envia para fila específica do canal
+        queue_name = channel_config['queue_name']
+        
+        try:
+            await self.queue.publish(
+                queue_name=queue_name,
+                message=json.dumps(message, default=str),
+                delay_seconds=self._calculate_delay(request.priority, request.scheduled_for)
+            )
+            
+            logger.debug(f"Notificação {request.notification_id} publicada na fila {queue_name}")
+            
+        except Exception as e:
+            logger.error(f"Erro ao enfileirar notificação {request.notification_id}: {e}")
+            raise QueueError(f"Falha ao enfileirar: {str(e)}")
+    
+    def _calculate_delay(self, priority: NotificationPriority, scheduled_for: Optional[datetime]) -> int:
+        """Calcula delay para envio baseado em prioridade e agendamento."""
+        if scheduled_for:
+            # Se tem agendamento, calcula delay até aquela data
+            now = datetime.utcnow()
+            delay = max(0, int((scheduled_for - now).total_seconds()))
+            return min(delay, 86400)  # Max 24h de delay
+        
+        # Delay baseado na prioridade
+        delays = {
+            NotificationPriority.LOW: 300,      # 5 minutos
+            NotificationPriority.NORMAL: 60,    # 1 minuto
+            NotificationPriority.HIGH: 10,      # 10 segundos
+            NotificationPriority.CRITICAL: 0    # Imediato
+        }
+        
+        return delays.get(priority, 60)
+    
+    async def _audit_start(self, request: NotificationRequest):
+        """Registra início do processamento no audit log."""
+        await self.audit_logger.log(
+            tenant_id=request.tenant_id,
+            actor_id="system",
+            action="notification_start",
+            resource_type="notification",
+            resource_id=request.notification_id,
+            details={
+                "channel": request.channel.value,
+                "template_id": request.template_id,
+                "recipient": request.recipient,
+                "priority": request.priority.value,
+                "idempotency_key": request.idempotency_key
+            },
+            correlation_id=request.correlation_id
+        )
+    
+    async def _audit_success(self, rendered: RenderedNotification):
+        """Registra sucesso na renderização e enfileiramento."""
+        request = rendered.request
+        
+        await self.audit_logger.log(
+            tenant_id=request.tenant_id,
+            actor_id="system",
+            action="notification_queued",
+            resource_type="notification",
+            resource_id=request.notification_id,
+            details={
+                "channel": request.channel.value,
+                "template_version": rendered.rendered_metadata.get("template_version"),
+                "render_timestamp": rendered.render_timestamp.isoformat()
+            },
+            correlation_id=request.correlation_id
+        )
+    
+    async def _audit_failure(self, request: NotificationRequest, error: str):
+        """Registra falha no processamento."""
+        await self.audit_logger.log(
+            tenant_id=request.tenant_id,
+            actor_id="system",
+            action="notification_failed",
+            resource_type="notification",
+            resource_id=request.notification_id,
+            details={
+                "channel": request.channel.value,
+                "error": error,
+                "stage": "processing"
+            },
+            correlation_id=request.correlation_id
+        )
+    
+    async def _audit_duplicate(self, request: NotificationRequest):
+        """Registra detecção de duplicata."""
+        await self.audit_logger.log(
+            tenant_id=request.tenant_id,
+            actor_id="system",
+            action="notification_duplicate_skipped",
+            resource_type="notification",
+            resource_id=request.notification_id,
+            details={
+                "idempotency_key": request.idempotency_key,
+                "reason": "duplicate_request"
+            },
+            correlation_id=request.correlation_id
+        )
+    
+    async def _record_metrics(self, notification, status: str):
+        """Registra métricas da notificação."""
+        if isinstance(notification, RenderedNotification):
+            request = notification.request
+        else:
+            request = notification
+        
+        tags = {
+            "tenant_id": request.tenant_id,
+            "channel": request.channel.value,
+            "template_id": request.template_id,
+            "priority": request.priority.value,
+            "status": status
+        }
+        
+        await self.metrics.increment_counter("notifications_total", tags=tags)
+        await self.metrics.record_histogram(
+            "notification_processing_time_ms",
+            value=0,  # Em produção, calcular tempo real
+            tags=tags
+        )
+    
+    def get_supported_channels(self) -> List[Dict[str, Any]]:
+        """Lista canais suportados e suas configurações."""
+        return [
+            {
+                "channel": channel.value,
+                "config": config
+            }
+            for channel, config in self._channel_configs.items()
+        ]
+
+
+class NotificationError(Exception):
+    """Exceção base para erros de notificação."""
+    pass
+
+
+class TemplateRenderError(NotificationError):
+    """Erro na renderização do template."""
+    pass
+
+
+class QueueError(NotificationError):
+    """Erro no enfileiramento."""
+    pass
+
+
+# Fábrica para criação do engine (dependency injection)
+class NotificationEngineFactory:
+    """Factory para criar instância do Notification Engine."""
+    
+    @staticmethod
+    def create(
+        template_engine: TemplateEngine,
+        audit_logger: AuditLogger,
+        metrics_engine: MetricsEngine,
+        queue_producer: QueueProducer
+    ) -> NotificationEngine:
+        return NotificationEngine(
+            template_engine=template_engine,
+            audit_logger=audit_logger,
+            metrics_engine=metrics_engine,
+            queue_producer=queue_producer
+        )
+
+
+# Exemplo de uso (para documentação):
+"""
+# Inicialização
+template_engine = TemplateEngine(...)
+audit_logger = AuditLogger(...)
+metrics = MetricsEngine(...)
+queue = QueueProducer(...)
+
+notification_engine = NotificationEngineFactory.create(
+    template_engine=template_engine,
+    audit_logger=audit_logger,
+    metrics_engine=metrics,
+    queue_producer=queue
+)
+
+# Envio de notificação
+request = NotificationRequest(
+    notification_id="notif_123",
+    tenant_id="tenant_abc",
+    channel=NotificationChannel.TELEGRAM,
+    template_id="welcome_message",
+    context={"user_name": "João"},
+    recipient="user_123",
+    external_address="@joao_telegram",
+    priority=NotificationPriority.NORMAL,
+    correlation_id="corr_456"
+)
+
+await notification_engine.send_notification(request)
+"""

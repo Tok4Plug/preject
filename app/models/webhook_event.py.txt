@@ -1,0 +1,409 @@
+# app/models/webhook_event.py
+"""
+Modelo de WebhookEvent - Processamento idempotente de webhooks externos.
+Fonte única da verdade para eventos de providers de pagamento.
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text, Enum
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+import enum
+import hashlib
+
+from app.database import Base
+
+
+class WebhookStatus(enum.Enum):
+    """Status do processamento do webhook."""
+    PENDING = "pending"             # Recebido, aguardando processamento
+    PROCESSING = "processing"       # Em processamento
+    PROCESSED = "processed"         # Processado com sucesso
+    FAILED = "failed"               # Falha no processamento
+    DUPLICATE = "duplicate"         # Webhook duplicado
+    INVALID = "invalid"             # Webhook inválido (assinatura, formato)
+
+
+class WebhookSource(enum.Enum):
+    """Fonte/origem do webhook."""
+    PAYMENT_PROVIDER = "payment_provider"
+    TELEGRAM = "telegram"
+    STRIPE = "stripe"
+    MERCADO_PAGO = "mercadopago"
+    ASAAS = "asaas"
+    PAGARME = "pagarme"
+    PAYPAL = "paypal"
+    INTERNAL = "internal"           # Webhooks internos do sistema
+    OTHER = "other"
+
+
+class WebhookEvent(Base):
+    """
+    Evento de webhook - processamento idempotente.
+    
+    Princípios:
+    1. Idempotência: Mesmo webhook não é processado duas vezes
+    2. Imutabilidade: Dados originais nunca são alterados
+    3. Isolamento por tenant
+    4. Rastreabilidade completa
+    5. Fail-safe: Webhooks inválidos são registrados para análise
+    """
+    
+    __tablename__ = "webhook_events"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    event_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # wh_xxx
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Origem
+    source: Mapped[WebhookSource] = mapped_column(Enum(WebhookSource), nullable=False, index=True)
+    provider_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # ID específico do provider
+    
+    # Dados do webhook (imutáveis)
+    raw_body: Mapped[str] = mapped_column(Text, nullable=False)  # Body bruto do webhook
+    raw_headers: Mapped[Dict[str, str]] = mapped_column(JSONB, nullable=False, default=dict)  # Headers originais
+    received_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    
+    # Identificação única do webhook (para idempotência)
+    external_event_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)  # ID do evento no provider
+    external_signature: Mapped[Optional[str]] = mapped_column(String(512))  # Assinatura do provider
+    webhook_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)  # Hash para deduplicação
+    
+    # Processamento
+    status: Mapped[WebhookStatus] = mapped_column(Enum(WebhookStatus), nullable=False, default=WebhookStatus.PENDING)
+    processing_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    processing_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    processed_by_worker: Mapped[Optional[str]] = mapped_column(String(100))  # Worker que processou
+    
+    # Resultado do processamento
+    processing_result: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB)  # Resultado do processamento
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    error_code: Mapped[Optional[str]] = mapped_column(String(100))
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    # Dados extraídos (normalizados)
+    event_type: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # Tipo de evento (payment.succeeded, etc.)
+    extracted_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Dados normalizados
+    
+    # Relacionamento com recursos internos
+    related_resource_type: Mapped[Optional[str]] = mapped_column(String(50), index=True)  # payment_intent, subscription, etc.
+    related_resource_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # ID do recurso
+    
+    # Metadata e rastreamento
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    request_ip: Mapped[Optional[str]] = mapped_column(String(50))
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="webhook_events")
+    payment_intent: Mapped[Optional["PaymentIntent"]] = relationship(back_populates="webhook_event")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="webhook_event", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_webhook_events_tenant_source_status', 'tenant_id', 'source', 'status'),
+        Index('ix_webhook_events_external_id_source', 'external_event_id', 'source'),
+        Index('ix_webhook_events_related_resource', 'related_resource_type', 'related_resource_id'),
+        Index('ix_webhook_events_received', 'received_at'),
+        Index('ix_webhook_events_processed', 'processing_completed_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<WebhookEvent(id='{self.id}', event_id='{self.event_id}', source='{self.source.value}', status='{self.status.value}')>"
+    
+    @classmethod
+    def generate_event_id(cls) -> str:
+        """Gera um ID único para o evento."""
+        timestamp = int(datetime.utcnow().timestamp() * 1000)
+        random_str = uuid.uuid4().hex[:8]
+        return f"wh_{timestamp}_{random_str}"
+    
+    @classmethod
+    def calculate_webhook_hash(cls, source: str, external_event_id: Optional[str], raw_body: str) -> str:
+        """Calcula hash único para deduplicação de webhooks."""
+        content = f"{source}:{external_event_id or ''}:{raw_body}"
+        return hashlib.sha256(content.encode()).hexdigest()
+    
+    @classmethod
+    def create_from_request(
+        cls,
+        tenant_id: str,
+        source: WebhookSource,
+        provider_id: Optional[str],
+        raw_body: str,
+        raw_headers: Dict[str, str],
+        external_event_id: Optional[str] = None,
+        external_signature: Optional[str] = None,
+        request_ip: Optional[str] = None
+    ) -> "WebhookEvent":
+        """Cria um novo evento de webhook a partir de uma requisição."""
+        event_id = cls.generate_event_id()
+        webhook_hash = cls.calculate_webhook_hash(source.value, external_event_id, raw_body)
+        
+        return cls(
+            event_id=event_id,
+            tenant_id=tenant_id,
+            source=source,
+            provider_id=provider_id,
+            raw_body=raw_body,
+            raw_headers=raw_headers,
+            external_event_id=external_event_id,
+            external_signature=external_signature,
+            webhook_hash=webhook_hash,
+            request_ip=request_ip,
+            received_at=datetime.utcnow()
+        )
+    
+    def to_dict(self, include_raw: bool = False) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "event_id": self.event_id,
+            "tenant_id": self.tenant_id,
+            "source": self.source.value,
+            "provider_id": self.provider_id,
+            "external_event_id": self.external_event_id,
+            "external_signature": self.external_signature,
+            "webhook_hash": self.webhook_hash[:16] + "...",
+            "status": self.status.value,
+            "processing_started_at": self.processing_started_at.isoformat() if self.processing_started_at else None,
+            "processing_completed_at": self.processing_completed_at.isoformat() if self.processing_completed_at else None,
+            "processed_by_worker": self.processed_by_worker,
+            "processing_result": self.processing_result,
+            "error_message": self.error_message,
+            "error_code": self.error_code,
+            "retry_count": self.retry_count,
+            "event_type": self.event_type,
+            "extracted_data": self.extracted_data,
+            "related_resource_type": self.related_resource_type,
+            "related_resource_id": self.related_resource_id,
+            "metadata": self.metadata,
+            "correlation_id": self.correlation_id,
+            "request_ip": self.request_ip,
+            "received_at": self.received_at.isoformat() if self.received_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "processing_time_ms": self.processing_time_ms,
+            "is_processed": self.is_processed,
+            "is_failed": self.is_failed,
+            "is_duplicate": self.is_duplicate,
+            "can_retry": self.can_retry
+        }
+        
+        if include_raw:
+            data["raw_body"] = self.raw_body
+            data["raw_headers"] = self.raw_headers
+        
+        return data
+    
+    @property
+    def processing_time_ms(self) -> Optional[int]:
+        """Retorna tempo de processamento em milissegundos."""
+        if not self.processing_started_at or not self.processing_completed_at:
+            return None
+        
+        delta = self.processing_completed_at - self.processing_started_at
+        return int(delta.total_seconds() * 1000)
+    
+    @property
+    def is_processed(self) -> bool:
+        """Verifica se o webhook foi processado."""
+        return self.status in [WebhookStatus.PROCESSED, WebhookStatus.DUPLICATE, WebhookStatus.INVALID]
+    
+    @property
+    def is_failed(self) -> bool:
+        """Verifica se o webhook falhou."""
+        return self.status == WebhookStatus.FAILED
+    
+    @property
+    def is_duplicate(self) -> bool:
+        """Verifica se é um webhook duplicado."""
+        return self.status == WebhookStatus.DUPLICATE
+    
+    @property
+    def can_retry(self) -> bool:
+        """Verifica se o webhook pode ser retentado."""
+        return (
+            self.status == WebhookStatus.FAILED and 
+            self.retry_count < 3 and  # Máximo de 3 retentativas
+            (datetime.utcnow() - (self.processing_completed_at or self.received_at)).seconds > 60  # Espera 1 minuto
+        )
+    
+    def mark_as_processing(self, worker_id: str):
+        """Marca o webhook como em processamento."""
+        if self.status != WebhookStatus.PENDING:
+            raise ValueError(f"Cannot mark as processing from status {self.status}")
+        
+        self.status = WebhookStatus.PROCESSING
+        self.processing_started_at = datetime.utcnow()
+        self.processed_by_worker = worker_id
+        self.updated_at = datetime.utcnow()
+    
+    def mark_as_processed(
+        self,
+        processing_result: Dict[str, Any],
+        event_type: Optional[str] = None,
+        extracted_data: Optional[Dict[str, Any]] = None,
+        related_resource_type: Optional[str] = None,
+        related_resource_id: Optional[str] = None
+    ):
+        """Marca o webhook como processado com sucesso."""
+        if self.status != WebhookStatus.PROCESSING:
+            raise ValueError(f"Cannot mark as processed from status {self.status}")
+        
+        self.status = WebhookStatus.PROCESSED
+        self.processing_completed_at = datetime.utcnow()
+        self.processing_result = processing_result
+        self.event_type = event_type
+        self.extracted_data = extracted_data or {}
+        self.related_resource_type = related_resource_type
+        self.related_resource_id = related_resource_id
+        self.updated_at = datetime.utcnow()
+    
+    def mark_as_failed(self, error_message: str, error_code: Optional[str] = None):
+        """Marca o webhook como falhado."""
+        if self.status != WebhookStatus.PROCESSING:
+            raise ValueError(f"Cannot mark as failed from status {self.status}")
+        
+        self.status = WebhookStatus.FAILED
+        self.processing_completed_at = datetime.utcnow()
+        self.error_message = error_message
+        self.error_code = error_code
+        self.retry_count += 1
+        self.updated_at = datetime.utcnow()
+    
+    def mark_as_duplicate(self, original_event_id: str):
+        """Marca o webhook como duplicado."""
+        if self.status != WebhookStatus.PENDING:
+            raise ValueError(f"Cannot mark as duplicate from status {self.status}")
+        
+        self.status = WebhookStatus.DUPLICATE
+        self.processing_completed_at = datetime.utcnow()
+        self.error_message = f"Duplicate of {original_event_id}"
+        self.error_code = "DUPLICATE_WEBHOOK"
+        self.updated_at = datetime.utcnow()
+        
+        # Registra evento original no metadata
+        self.metadata["duplicate_of"] = original_event_id
+        self.metadata["marked_duplicate_at"] = datetime.utcnow().isoformat()
+    
+    def mark_as_invalid(self, reason: str, error_code: str = "INVALID_WEBHOOK"):
+        """Marca o webhook como inválido."""
+        if self.status != WebhookStatus.PENDING:
+            raise ValueError(f"Cannot mark as invalid from status {self.status}")
+        
+        self.status = WebhookStatus.INVALID
+        self.processing_completed_at = datetime.utcnow()
+        self.error_message = reason
+        self.error_code = error_code
+        self.updated_at = datetime.utcnow()
+    
+    def retry(self, worker_id: str):
+        """Reinicia o processamento do webhook."""
+        if not self.can_retry:
+            raise ValueError("Webhook cannot be retried")
+        
+        self.status = WebhookStatus.PENDING
+        self.processing_started_at = None
+        self.processing_completed_at = None
+        self.processed_by_worker = None
+        self.error_message = None
+        self.error_code = None
+        self.updated_at = datetime.utcnow()
+        
+        # Adiciona ao histórico de retentativas
+        if "retry_history" not in self.metadata:
+            self.metadata["retry_history"] = []
+        
+        self.metadata["retry_history"].append({
+            "retry_attempt": self.retry_count,
+            "retried_at": datetime.utcnow().isoformat(),
+            "worker_id": worker_id
+        })
+    
+    def extract_payment_data(self) -> Optional[Dict[str, Any]]:
+        """Extrai dados de pagamento do webhook (para providers de pagamento)."""
+        if self.source != WebhookSource.PAYMENT_PROVIDER:
+            return None
+        
+        # Implementação específica por provider
+        # Esta é uma implementação genérica
+        if self.extracted_data:
+            return self.extracted_data.get("payment_data")
+        
+        return None
+    
+    def get_related_payment_intent(self) -> Optional[str]:
+        """Obtém o ID do payment intent relacionado, se existir."""
+        if self.related_resource_type == "payment_intent":
+            return self.related_resource_id
+        
+        # Tenta extrair do extracted_data
+        payment_data = self.extract_payment_data()
+        if payment_data and payment_data.get("payment_intent_id"):
+            return payment_data.get("payment_intent_id")
+        
+        return None
+
+
+class WebhookProcessorLock(Base):
+    """
+    Lock para processamento concorrente de webhooks.
+    Previne que o mesmo webhook seja processado por múltiplos workers.
+    """
+    
+    __tablename__ = "webhook_processor_locks"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    webhook_event_id: Mapped[str] = mapped_column(String(50), ForeignKey("saas.webhook_events.event_id"), nullable=False, unique=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Lock
+    lock_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # ID do worker que adquiriu o lock
+    locked_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)  # Expiração do lock
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Relacionamentos
+    webhook_event: Mapped["WebhookEvent"] = relationship()
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_webhook_processor_locks_expires', 'expires_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<WebhookProcessorLock(webhook_event_id='{self.webhook_event_id}', lock_id='{self.lock_id}', expires_at='{self.expires_at}')>"
+    
+    @property
+    def is_expired(self) -> bool:
+        """Verifica se o lock expirou."""
+        return datetime.utcnow() > self.expires_at
+    
+    @property
+    def time_until_expiration_seconds(self) -> int:
+        """Retorna segundos até a expiração."""
+        now = datetime.utcnow()
+        if now > self.expires_at:
+            return 0
+        
+        return int((self.expires_at - now).total_seconds())
+
+
+# Adiciona a relação de volta no PaymentIntent
+PaymentIntent.webhook_event = relationship("WebhookEvent", back_populates="payment_intent")
+PaymentIntent.webhook_event_id: Mapped[Optional[str]] = mapped_column(String(50), ForeignKey("saas.webhook_events.event_id"), index=True)

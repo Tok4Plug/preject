@@ -1,0 +1,452 @@
+"""
+Implementação de fila em memória para desenvolvimento e testes.
+NÃO usar em produção.
+"""
+
+import asyncio
+import json
+import threading
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Callable
+import heapq
+
+from ...queue.base import (
+    BaseQueue, QueueMessage, QueueMetadata, DeadLetterQueue,
+    QueueError, IdempotencyViolationError
+)
+from ...queue.queue_metrics import QueueMetricsCollector
+
+
+class InMemoryMessage:
+    """Representação interna de mensagem em memória"""
+    
+    def __init__(self, queue_message: QueueMessage, visible_at: datetime):
+        self.queue_message = queue_message
+        self.visible_at = visible_at
+        self.delivery_count = 0
+        self.is_processing = False
+
+
+class InMemoryQueue(BaseQueue):
+    """
+    Implementação de fila em memória.
+    Útil para desenvolvimento e testes.
+    """
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+        # Estruturas de dados
+        self._queues: Dict[str, deque] = defaultdict(deque)  # Fila principal
+        self._delayed_messages: List[tuple] = []  # Min-heap para mensagens atrasadas
+        self._processing_messages: Dict[str, InMemoryMessage] = {}  # Mensagens sendo processadas
+        self._message_store: Dict[str, InMemoryMessage] = {}  # Todas as mensagens
+        self._idempotency_keys: Dict[str, datetime] = {}  # Cache de idempotência
+        
+        # Controle de concorrência
+        self._lock = threading.RLock()
+        self._delayed_lock = threading.RLock()
+        
+        # Métricas
+        self.metrics_collector = QueueMetricsCollector(self.metrics) if self.metrics else None
+        
+        # Limpeza periódica
+        self._cleanup_task = None
+        self._start_cleanup_task()
+    
+    async def publish(
+        self,
+        queue_name: str,
+        payload: Any,
+        tenant_id: str,
+        delay_seconds: int = 0,
+        idempotency_key: Optional[str] = None,
+        source: str = "unknown"
+    ) -> QueueMessage:
+        """Publica mensagem na fila em memória"""
+        
+        # Verifica idempotência
+        if idempotency_key:
+            with self._lock:
+                existing_time = self._idempotency_keys.get(idempotency_key)
+                if existing_time and (datetime.utcnow() - existing_time).seconds < 3600:
+                    raise IdempotencyViolationError(
+                        f"Idempotency key already used: {idempotency_key}",
+                        tenant_id=tenant_id,
+                        queue_name=queue_name
+                    )
+        
+        # Cria metadados
+        metadata = QueueMetadata(
+            tenant_id=tenant_id,
+            source=source
+        )
+        
+        # Cria mensagem
+        queue_message = QueueMessage(
+            metadata=metadata,
+            payload=payload,
+            queue_name=queue_name,
+            visibility_timeout=300
+        )
+        
+        # Armazena em memória
+        in_memory_msg = InMemoryMessage(
+            queue_message=queue_message,
+            visible_at=datetime.utcnow() + timedelta(seconds=delay_seconds)
+        )
+        
+        message_id = queue_message.metadata.message_id
+        
+        with self._lock:
+            self._message_store[message_id] = in_memory_msg
+            
+            if idempotency_key:
+                self._idempotency_keys[idempotency_key] = datetime.utcnow()
+        
+        # Agenda mensagem
+        if delay_seconds > 0:
+            with self._delayed_lock:
+                heapq.heappush(
+                    self._delayed_messages,
+                    (in_memory_msg.visible_at, message_id)
+                )
+        else:
+            with self._lock:
+                self._queues[queue_name].append(message_id)
+        
+        # Registra métricas
+        if self.metrics_collector:
+            await self.metrics_collector.record_message_published(
+                queue_name, tenant_id
+            )
+        
+        logger.debug(f"Published message {message_id} to queue {queue_name}")
+        
+        return queue_message
+    
+    async def receive_message(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None,
+        visibility_timeout: int = 300
+    ) -> Optional[QueueMessage]:
+        """Recebe mensagem da fila em memória"""
+        
+        # Processa mensagens atrasadas
+        await self._process_delayed_messages()
+        
+        with self._lock:
+            # Busca próxima mensagem válida
+            while self._queues[queue_name]:
+                message_id = self._queues[queue_name].popleft()
+                
+                # Verifica se mensagem ainda existe
+                if message_id not in self._message_store:
+                    continue
+                
+                in_memory_msg = self._message_store[message_id]
+                queue_message = in_memory_msg.queue_message
+                
+                # Filtra por tenant se especificado
+                if tenant_id and queue_message.metadata.tenant_id != tenant_id:
+                    self._queues[queue_name].append(message_id)  # Devolve para fila
+                    continue
+                
+                # Verifica visibilidade
+                if in_memory_msg.visible_at > datetime.utcnow():
+                    # Ainda não visível, devolve para fila
+                    self._queues[queue_name].append(message_id)
+                    continue
+                
+                # Marca como processando
+                in_memory_msg.is_processing = True
+                in_memory_msg.delivery_count += 1
+                in_memory_msg.visible_at = datetime.utcnow() + timedelta(
+                    seconds=visibility_timeout
+                )
+                
+                self._processing_messages[message_id] = in_memory_msg
+                
+                # Registra métricas
+                if self.metrics_collector:
+                    queue_depth = len(self._queues[queue_name])
+                    await self.metrics_collector.record_queue_depth(
+                        queue_name, queue_message.metadata.tenant_id, queue_depth
+                    )
+                
+                return queue_message
+        
+        return None
+    
+    async def acknowledge(self, message: QueueMessage) -> None:
+        """Confirma processamento de mensagem"""
+        message_id = message.metadata.message_id
+        
+        with self._lock:
+            if message_id in self._processing_messages:
+                del self._processing_messages[message_id]
+            
+            if message_id in self._message_store:
+                del self._message_store[message_id]
+        
+        logger.debug(f"Acknowledged message {message_id}")
+    
+    async def nack(
+        self,
+        message: QueueMessage,
+        error: Optional[str] = None,
+        retry_after: Optional[int] = None
+    ) -> None:
+        """Nega confirmação de mensagem"""
+        message_id = message.metadata.message_id
+        
+        with self._lock:
+            if message_id in self._processing_messages:
+                in_memory_msg = self._processing_messages[message_id]
+                in_memory_msg.is_processing = False
+                
+                # Decide destino da mensagem
+                if retry_after is not None:
+                    # Agenda retentativa
+                    in_memory_msg.visible_at = datetime.utcnow() + timedelta(
+                        seconds=retry_after
+                    )
+                    
+                    with self._delayed_lock:
+                        heapq.heappush(
+                            self._delayed_messages,
+                            (in_memory_msg.visible_at, message_id)
+                        )
+                else:
+                    # Envia para DLQ
+                    if self.dead_letter_queue:
+                        await self.dead_letter_queue.store_failed_message(
+                            message, error or "Unknown error", error
+                        )
+                
+                # Remove do processamento
+                del self._processing_messages[message_id]
+        
+        logger.debug(f"Nacked message {message_id}, error: {error}")
+    
+    async def consume(
+        self,
+        queue_name: str,
+        callback: Callable[[QueueMessage], Any],
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1,
+        visibility_timeout: int = 300
+    ) -> None:
+        """Consome mensagens continuamente"""
+        
+        while not self._shutting_down:
+            try:
+                # Recebe mensagem
+                message = await self.receive_message(
+                    queue_name, tenant_id, visibility_timeout
+                )
+                
+                if not message:
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Processa mensagem
+                try:
+                    start_time = time.time()
+                    
+                    # Executa callback
+                    if asyncio.iscoroutinefunction(callback):
+                        result = await callback(message)
+                    else:
+                        result = callback(message)
+                    
+                    processing_time = (time.time() - start_time) * 1000
+                    
+                    # Registra métricas de sucesso
+                    if self.metrics_collector:
+                        await self.metrics_collector.record_message_consumed(
+                            queue_name,
+                            message.metadata.tenant_id,
+                            processing_time,
+                            success=True
+                        )
+                    
+                    # Confirma mensagem
+                    await self.acknowledge(message)
+                    
+                except Exception as e:
+                    # Registra métricas de falha
+                    if self.metrics_collector:
+                        await self.metrics_collector.record_message_consumed(
+                            queue_name,
+                            message.metadata.tenant_id,
+                            0,
+                            success=False
+                        )
+                    
+                    # Nega confirmação
+                    await self.nack(message, str(e))
+                
+            except Exception as e:
+                logger.error(f"Error in consumer: {str(e)}")
+                await asyncio.sleep(1)
+    
+    async def get_queue_stats(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Obtém estatísticas da fila"""
+        with self._lock:
+            total_count = 0
+            tenant_counts = defaultdict(int)
+            
+            for msg_id in list(self._queues[queue_name]):
+                if msg_id in self._message_store:
+                    msg = self._message_store[msg_id]
+                    total_count += 1
+                    tenant_counts[msg.queue_message.metadata.tenant_id] += 1
+            
+            processing_count = len([
+                m for m in self._processing_messages.values()
+                if m.queue_message.queue_name == queue_name
+            ])
+        
+        return {
+            "queue_name": queue_name,
+            "total_messages": total_count,
+            "processing_messages": processing_count,
+            "tenant_distribution": dict(tenant_counts),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    async def purge_queue(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> None:
+        """Limpa fila inteira"""
+        with self._lock:
+            if tenant_id:
+                # Remove apenas mensagens do tenant específico
+                new_queue = deque()
+                for msg_id in self._queues[queue_name]:
+                    if msg_id in self._message_store:
+                        msg = self._message_store[msg_id]
+                        if msg.queue_message.metadata.tenant_id != tenant_id:
+                            new_queue.append(msg_id)
+                        else:
+                            del self._message_store[msg_id]
+                self._queues[queue_name] = new_queue
+            else:
+                # Remove todas as mensagens
+                for msg_id in self._queues[queue_name]:
+                    if msg_id in self._message_store:
+                        del self._message_store[msg_id]
+                self._queues[queue_name].clear()
+        
+        logger.info(f"Purged queue {queue_name}")
+    
+    async def _process_delayed_messages(self):
+        """Processa mensagens atrasadas que já estão prontas"""
+        now = datetime.utcnow()
+        
+        with self._delayed_lock:
+            while self._delayed_messages and self._delayed_messages[0][0] <= now:
+                _, message_id = heapq.heappop(self._delayed_messages)
+                
+                with self._lock:
+                    if message_id in self._message_store:
+                        msg = self._message_store[message_id]
+                        self._queues[msg.queue_message.queue_name].append(message_id)
+    
+    def _start_cleanup_task(self):
+        """Inicia tarefa de limpeza periódica"""
+        
+        async def cleanup_task():
+            while not self._shutting_down:
+                try:
+                    await self._cleanup_expired_messages()
+                    await self._cleanup_old_idempotency_keys()
+                    await asyncio.sleep(60)  # Limpa a cada minuto
+                except Exception as e:
+                    logger.error(f"Error in cleanup task: {str(e)}")
+                    await asyncio.sleep(10)
+        
+        self._cleanup_task = asyncio.create_task(cleanup_task())
+    
+    async def _cleanup_expired_messages(self):
+        """Remove mensagens expiradas"""
+        now = datetime.utcnow()
+        expired_count = 0
+        
+        with self._lock:
+            expired_ids = []
+            
+            for msg_id, msg in list(self._message_store.items()):
+                # Mensagens expiradas há mais de 24 horas
+                if (now - msg.queue_message.metadata.created_at).total_seconds() > 86400:
+                    expired_ids.append(msg_id)
+            
+            for msg_id in expired_ids:
+                del self._message_store[msg_id]
+                expired_count += 1
+            
+            # Limpa referências nas filas
+            for queue_name, message_ids in self._queues.items():
+                new_ids = [mid for mid in message_ids if mid in self._message_store]
+                self._queues[queue_name] = deque(new_ids)
+        
+        if expired_count > 0:
+            logger.debug(f"Cleaned up {expired_count} expired messages")
+    
+    async def _cleanup_old_idempotency_keys(self):
+        """Remove chaves de idempotência antigas"""
+        now = datetime.utcnow()
+        cutoff_time = now - timedelta(hours=1)
+        
+        with self._lock:
+            expired_keys = [
+                key for key, timestamp in list(self._idempotency_keys.items())
+                if timestamp < cutoff_time
+            ]
+            
+            for key in expired_keys:
+                del self._idempotency_keys[key]
+    
+    async def shutdown(self):
+        """Desliga a fila de forma segura"""
+        await super().shutdown()
+        
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Limpa todas as estruturas
+        with self._lock:
+            self._queues.clear()
+            self._message_store.clear()
+            self._processing_messages.clear()
+            self._idempotency_keys.clear()
+        
+        with self._delayed_lock:
+            self._delayed_messages.clear()
+        
+        logger.info("InMemoryQueue shut down successfully")
+
+
+# Singleton para uso global
+_in_memory_queue_instance: Optional[InMemoryQueue] = None
+
+def get_in_memory_queue(**kwargs) -> InMemoryQueue:
+    """Retorna instância singleton da fila em memória"""
+    global _in_memory_queue_instance
+    if _in_memory_queue_instance is None:
+        _in_memory_queue_instance = InMemoryQueue(**kwargs)
+    return _in_memory_queue_instance

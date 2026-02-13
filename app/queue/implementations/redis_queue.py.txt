@@ -1,0 +1,635 @@
+"""
+Implementação de fila usando Redis.
+Escalável, persistente e adequada para produção.
+"""
+
+import asyncio
+import json
+import uuid
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Callable, Tuple
+import logging
+
+import redis.asyncio as redis
+from redis.asyncio import Redis, ConnectionPool
+
+from ...queue.base import (
+    BaseQueue, QueueMessage, QueueMetadata, DeadLetterQueue,
+    QueueError, QueuePublishError, IdempotencyViolationError
+)
+from ...queue.queue_metrics import QueueMetricsCollector
+from ...queue.config import QueueConfig
+
+logger = logging.getLogger(__name__)
+
+
+class RedisQueue(BaseQueue):
+    """
+    Implementação de fila usando Redis.
+    Suporta múltiplas filas, DLQ, idempotência e prioridades.
+    """
+    
+    def __init__(
+        self,
+        redis_url: str = "redis://localhost:6379/0",
+        max_connections: int = 50,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        
+        # Conexão Redis
+        self.redis_url = redis_url
+        self.connection_pool = ConnectionPool.from_url(
+            redis_url,
+            max_connections=max_connections,
+            decode_responses=False  # Mantém bytes para serialização
+        )
+        self.redis: Optional[Redis] = None
+        
+        # Configurações
+        self.idempotency_ttl = 3600  # 1 hora para chaves de idempotência
+        self.max_message_size = 1024 * 1024  # 1MB máximo por mensagem
+        
+        # Métricas
+        self.metrics_collector = QueueMetricsCollector(self.metrics) if self.metrics else None
+        
+        # Controle de workers
+        self._consumers: Dict[str, asyncio.Task] = {}
+        
+        logger.info(f"RedisQueue initialized with URL: {redis_url}")
+    
+    async def connect(self):
+        """Conecta ao Redis"""
+        if not self.redis:
+            self.redis = redis.Redis(connection_pool=self.connection_pool)
+            await self.redis.ping()
+            logger.info("Connected to Redis")
+    
+    async def disconnect(self):
+        """Desconecta do Redis"""
+        if self.redis:
+            await self.redis.close()
+            await self.connection_pool.disconnect()
+            self.redis = None
+            logger.info("Disconnected from Redis")
+    
+    async def publish(
+        self,
+        queue_name: str,
+        payload: Any,
+        tenant_id: str,
+        delay_seconds: int = 0,
+        idempotency_key: Optional[str] = None,
+        source: str = "unknown"
+    ) -> QueueMessage:
+        """Publica mensagem na fila Redis"""
+        
+        # Garante conexão
+        if not self.redis:
+            await self.connect()
+        
+        # Verifica idempotência
+        if idempotency_key:
+            redis_key = f"idempotency:{tenant_id}:{queue_name}:{idempotency_key}"
+            
+            # Usa SET com NX (not exists) para atomicidade
+            set_result = await self.redis.set(
+                redis_key,
+                b"1",
+                nx=True,
+                ex=self.idempotency_ttl
+            )
+            
+            if not set_result:
+                raise IdempotencyViolationError(
+                    f"Idempotency key already used: {idempotency_key}",
+                    tenant_id=tenant_id,
+                    queue_name=queue_name
+                )
+        
+        # Cria metadados
+        metadata = QueueMetadata(
+            tenant_id=tenant_id,
+            source=source
+        )
+        
+        # Cria mensagem
+        queue_message = QueueMessage(
+            metadata=metadata,
+            payload=payload,
+            queue_name=queue_name
+        )
+        
+        # Serializa mensagem
+        message_data = queue_message.serialize()
+        
+        # Verifica tamanho
+        if len(message_data) > self.max_message_size:
+            raise QueuePublishError(
+                f"Message too large: {len(message_data)} bytes",
+                tenant_id=tenant_id,
+                queue_name=queue_name
+            )
+        
+        # Prepara chaves Redis
+        tenant_queue = f"queue:{tenant_id}:{queue_name}"
+        delayed_queue = f"delayed:{tenant_id}:{queue_name}"
+        processing_queue = f"processing:{tenant_id}:{queue_name}"
+        message_key = f"message:{queue_message.metadata.message_id}"
+        
+        try:
+            # Pipeline para atomicidade
+            async with self.redis.pipeline(transaction=True) as pipe:
+                # Armazena mensagem
+                pipe.setex(
+                    message_key,
+                    86400,  # 24 horas de TTL
+                    message_data
+                )
+                
+                if delay_seconds > 0:
+                    # Agenda mensagem atrasada (usando sorted set)
+                    score = time.time() + delay_seconds
+                    pipe.zadd(delayed_queue, {queue_message.metadata.message_id: score})
+                else:
+                    # Publica na fila imediatamente (usando list)
+                    pipe.lpush(tenant_queue, queue_message.metadata.message_id)
+                
+                # Executa pipeline
+                await pipe.execute()
+            
+            # Registra métricas
+            if self.metrics_collector:
+                await self.metrics_collector.record_message_published(
+                    queue_name, tenant_id, len(message_data)
+                )
+            
+            logger.debug(
+                f"Published message {queue_message.metadata.message_id} "
+                f"to queue {queue_name} (tenant: {tenant_id})"
+            )
+            
+            return queue_message
+            
+        except redis.RedisError as e:
+            raise QueuePublishError(
+                f"Redis error: {str(e)}",
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                original_error=e
+            )
+    
+    async def receive_message(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None,
+        visibility_timeout: int = 300
+    ) -> Optional[QueueMessage]:
+        """Recebe mensagem da fila Redis"""
+        
+        if not self.redis:
+            await self.connect()
+        
+        # Processa mensagens atrasadas primeiro
+        await self._process_delayed_messages(queue_name, tenant_id)
+        
+        try:
+            # Busca em todos os tenants ou tenant específico
+            if tenant_id:
+                tenant_queues = [f"queue:{tenant_id}:{queue_name}"]
+            else:
+                # Obtém todos os tenants com mensagens nesta fila
+                pattern = f"queue:*:{queue_name}"
+                keys = await self.redis.keys(pattern)
+                tenant_queues = keys if keys else []
+            
+            for tenant_queue in tenant_queues:
+                # Move mensagem para processing queue (BRPOPLPUSH)
+                message_id = await self.redis.brpoplpush(
+                    tenant_queue,
+                    f"processing:{tenant_queue.split(':')[1]}:{queue_name}",
+                    timeout=1  # Timeout curto para não bloquear muito
+                )
+                
+                if message_id:
+                    # Obtém dados da mensagem
+                    message_key = f"message:{message_id.decode()}"
+                    message_data = await self.redis.get(message_key)
+                    
+                    if not message_data:
+                        logger.warning(f"Message {message_id} not found, skipping")
+                        continue
+                    
+                    # Desserializa mensagem
+                    queue_message = QueueMessage.deserialize(message_data.decode())
+                    
+                    # Atualiza TTL da mensagem
+                    await self.redis.expire(message_key, visibility_timeout + 300)
+                    
+                    # Agenda retorno para fila principal se não for confirmada
+                    return_queue = f"queue:{queue_message.metadata.tenant_id}:{queue_name}"
+                    processing_queue = f"processing:{queue_message.metadata.tenant_id}:{queue_name}"
+                    
+                    # Usa um script Lua para atomicidade
+                    lua_script = """
+                    local message_id = ARGV[1]
+                    local return_queue = ARGV[2]
+                    local processing_queue = ARGV[3]
+                    local visibility_timeout = tonumber(ARGV[4])
+                    
+                    -- Remove da processing queue
+                    redis.call('LREM', processing_queue, 0, message_id)
+                    
+                    -- Agenda retorno para fila principal
+                    redis.call('ZADD', return_queue, 
+                               tonumber(redis.call('TIME')[1]) + visibility_timeout, 
+                               message_id)
+                    
+                    return 1
+                    """
+                    
+                    await self.redis.eval(
+                        lua_script,
+                        0,
+                        message_id.decode(),
+                        return_queue,
+                        processing_queue,
+                        visibility_timeout
+                    )
+                    
+                    # Registra métricas
+                    if self.metrics_collector:
+                        queue_depth = await self.redis.llen(tenant_queue)
+                        await self.metrics_collector.record_queue_depth(
+                            queue_name,
+                            queue_message.metadata.tenant_id,
+                            queue_depth
+                        )
+                    
+                    return queue_message
+            
+            return None
+            
+        except redis.RedisError as e:
+            logger.error(f"Redis error in receive_message: {str(e)}")
+            return None
+    
+    async def acknowledge(self, message: QueueMessage) -> None:
+        """Confirma processamento de mensagem"""
+        if not self.redis:
+            await self.connect()
+        
+        message_id = message.metadata.message_id
+        queue_name = message.queue_name
+        tenant_id = message.metadata.tenant_id
+        
+        try:
+            # Pipeline para limpeza atômica
+            async with self.redis.pipeline(transaction=True) as pipe:
+                # Remove da processing queue
+                processing_queue = f"processing:{tenant_id}:{queue_name}"
+                pipe.lrem(processing_queue, 0, message_id)
+                
+                # Remove mensagem
+                message_key = f"message:{message_id}"
+                pipe.delete(message_key)
+                
+                # Remove de delayed queue se estiver lá
+                delayed_queue = f"delayed:{tenant_id}:{queue_name}"
+                pipe.zrem(delayed_queue, message_id)
+                
+                await pipe.execute()
+            
+            logger.debug(f"Acknowledged message {message_id}")
+            
+        except redis.RedisError as e:
+            logger.error(f"Redis error in acknowledge: {str(e)}")
+            raise QueueError(
+                f"Failed to acknowledge message: {str(e)}",
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                original_error=e
+            )
+    
+    async def nack(
+        self,
+        message: QueueMessage,
+        error: Optional[str] = None,
+        retry_after: Optional[int] = None
+    ) -> None:
+        """Nega confirmação de mensagem"""
+        if not self.redis:
+            await self.connect()
+        
+        message_id = message.metadata.message_id
+        queue_name = message.queue_name
+        tenant_id = message.metadata.tenant_id
+        
+        try:
+            if retry_after is not None:
+                # Agenda retentativa
+                delayed_queue = f"delayed:{tenant_id}:{queue_name}"
+                score = time.time() + retry_after
+                
+                await self.redis.zadd(delayed_queue, {message_id: score})
+            else:
+                # Envia para DLQ
+                if self.dead_letter_queue:
+                    await self.dead_letter_queue.store_failed_message(
+                        message, error or "Unknown error", error
+                    )
+            
+            # Remove da processing queue
+            processing_queue = f"processing:{tenant_id}:{queue_name}"
+            await self.redis.lrem(processing_queue, 0, message_id)
+            
+            logger.debug(f"Nacked message {message_id}, error: {error}")
+            
+        except redis.RedisError as e:
+            logger.error(f"Redis error in nack: {str(e)}")
+            raise QueueError(
+                f"Failed to nack message: {str(e)}",
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                original_error=e
+            )
+    
+    async def consume(
+        self,
+        queue_name: str,
+        callback: Callable[[QueueMessage], Any],
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1,
+        visibility_timeout: int = 300
+    ) -> None:
+        """Consome mensagens continuamente"""
+        
+        consumer_id = f"consumer_{uuid.uuid4().hex[:8]}"
+        logger.info(f"Starting consumer {consumer_id} for queue {queue_name}")
+        
+        # Registra worker ativo
+        if self.metrics_collector:
+            await self.metrics_collector.record_worker_status(
+                consumer_id, tenant_id or "all", True
+            )
+        
+        while not self._shutting_down:
+            try:
+                # Recebe mensagem
+                message = await self.receive_message(
+                    queue_name, tenant_id, visibility_timeout
+                )
+                
+                if not message:
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Processa mensagem
+                try:
+                    start_time = time.time()
+                    
+                    # Executa callback
+                    if asyncio.iscoroutinefunction(callback):
+                        result = await callback(message)
+                    else:
+                        result = callback(message)
+                    
+                    processing_time = (time.time() - start_time) * 1000
+                    
+                    # Registra métricas de sucesso
+                    if self.metrics_collector:
+                        await self.metrics_collector.record_message_consumed(
+                            queue_name,
+                            message.metadata.tenant_id,
+                            processing_time,
+                            success=True
+                        )
+                    
+                    # Confirma mensagem
+                    await self.acknowledge(message)
+                    
+                except Exception as e:
+                    # Registra métricas de falha
+                    if self.metrics_collector:
+                        await self.metrics_collector.record_message_consumed(
+                            queue_name,
+                            message.metadata.tenant_id,
+                            0,
+                            success=False
+                        )
+                    
+                    # Nega confirmação
+                    await self.nack(message, str(e))
+                
+            except Exception as e:
+                logger.error(f"Error in consumer {consumer_id}: {str(e)}")
+                await asyncio.sleep(1)
+        
+        # Registra worker inativo
+        if self.metrics_collector:
+            await self.metrics_collector.record_worker_status(
+                consumer_id, tenant_id or "all", False
+            )
+        
+        logger.info(f"Consumer {consumer_id} stopped")
+    
+    async def get_queue_stats(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Obtém estatísticas da fila"""
+        if not self.redis:
+            await self.connect()
+        
+        stats = {
+            "queue_name": queue_name,
+            "timestamp": datetime.utcnow().isoformat(),
+            "total_messages": 0,
+            "processing_messages": 0,
+            "delayed_messages": 0,
+            "tenant_distribution": {}
+        }
+        
+        try:
+            # Busca tenants
+            if tenant_id:
+                tenants = [tenant_id]
+            else:
+                pattern = f"queue:*:{queue_name}"
+                keys = await self.redis.keys(pattern)
+                tenants = [k.split(':')[1] for k in keys] if keys else []
+            
+            for t_id in tenants:
+                # Conta mensagens em cada fila
+                main_queue = f"queue:{t_id}:{queue_name}"
+                processing_queue = f"processing:{t_id}:{queue_name}"
+                delayed_queue = f"delayed:{t_id}:{queue_name}"
+                
+                main_count = await self.redis.llen(main_queue)
+                processing_count = await self.redis.llen(processing_queue)
+                delayed_count = await self.redis.zcard(delayed_queue)
+                
+                stats["total_messages"] += main_count + processing_count + delayed_count
+                stats["processing_messages"] += processing_count
+                stats["delayed_messages"] += delayed_count
+                stats["tenant_distribution"][t_id] = {
+                    "main": main_count,
+                    "processing": processing_count,
+                    "delayed": delayed_count
+                }
+            
+            return stats
+            
+        except redis.RedisError as e:
+            logger.error(f"Redis error in get_queue_stats: {str(e)}")
+            return stats
+    
+    async def purge_queue(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> None:
+        """Limpa fila inteira"""
+        if not self.redis:
+            await self.connect()
+        
+        try:
+            # Busca tenants
+            if tenant_id:
+                tenants = [tenant_id]
+            else:
+                pattern = f"queue:*:{queue_name}"
+                keys = await self.redis.keys(pattern)
+                tenants = [k.split(':')[1] for k in keys] if keys else []
+            
+            for t_id in tenants:
+                # Remove todas as chaves relacionadas à fila
+                keys_to_delete = [
+                    f"queue:{t_id}:{queue_name}",
+                    f"processing:{t_id}:{queue_name}",
+                    f"delayed:{t_id}:{queue_name}"
+                ]
+                
+                # Encontra e remove mensagens
+                message_pattern = f"message:*"
+                all_messages = await self.redis.keys(message_pattern)
+                
+                for key in keys_to_delete:
+                    await self.redis.delete(key)
+                
+                # Remove chaves de idempotência relacionadas
+                idempotency_pattern = f"idempotency:{t_id}:{queue_name}:*"
+                idempotency_keys = await self.redis.keys(idempotency_pattern)
+                if idempotency_keys:
+                    await self.redis.delete(*idempotency_keys)
+            
+            logger.info(f"Purged queue {queue_name}")
+            
+        except redis.RedisError as e:
+            logger.error(f"Redis error in purge_queue: {str(e)}")
+            raise QueueError(
+                f"Failed to purge queue: {str(e)}",
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                original_error=e
+            )
+    
+    async def _process_delayed_messages(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> None:
+        """Move mensagens atrasadas para a fila principal"""
+        if not self.redis:
+            await self.connect()
+        
+        try:
+            # Busca tenants
+            if tenant_id:
+                tenants = [tenant_id]
+            else:
+                pattern = f"delayed:*:{queue_name}"
+                keys = await self.redis.keys(pattern)
+                tenants = [k.split(':')[1] for k in keys] if keys else []
+            
+            now = time.time()
+            
+            for t_id in tenants:
+                delayed_queue = f"delayed:{t_id}:{queue_name}"
+                main_queue = f"queue:{t_id}:{queue_name}"
+                
+                # Busca mensagens prontas (score <= now)
+                ready_messages = await self.redis.zrangebyscore(
+                    delayed_queue, 0, now
+                )
+                
+                if ready_messages:
+                    # Move para fila principal
+                    for message_id in ready_messages:
+                        await self.redis.lpush(main_queue, message_id)
+                    
+                    # Remove do delayed
+                    await self.redis.zremrangebyscore(delayed_queue, 0, now)
+                    
+                    logger.debug(
+                        f"Moved {len(ready_messages)} delayed messages "
+                        f"to queue {queue_name} (tenant: {t_id})"
+                    )
+                    
+        except redis.RedisError as e:
+            logger.error(f"Redis error in _process_delayed_messages: {str(e)}")
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Verifica saúde do Redis e das filas"""
+        if not self.redis:
+            try:
+                await self.connect()
+                redis_healthy = True
+            except Exception as e:
+                redis_healthy = False
+                error = str(e)
+        else:
+            try:
+                await self.redis.ping()
+                redis_healthy = True
+            except Exception as e:
+                redis_healthy = False
+                error = str(e)
+        
+        return {
+            "redis_healthy": redis_healthy,
+            "error": error if not redis_healthy else None,
+            "connected": self.redis is not None,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    async def shutdown(self):
+        """Desliga a fila de forma segura"""
+        await super().shutdown()
+        
+        # Para todos os consumers
+        for task in self._consumers.values():
+            task.cancel()
+        
+        if self._consumers:
+            await asyncio.gather(*self._consumers.values(), return_exceptions=True)
+        
+        # Desconecta do Redis
+        await self.disconnect()
+        
+        logger.info("RedisQueue shut down successfully")
+
+
+def create_redis_queue(
+    redis_url: Optional[str] = None,
+    **kwargs
+) -> RedisQueue:
+    """Cria instância de fila Redis"""
+    if not redis_url:
+        from ...queue.config import get_queue_settings
+        settings = get_queue_settings()
+        redis_url = settings.redis_url
+    
+    return RedisQueue(redis_url=redis_url, **kwargs)

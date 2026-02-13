@@ -1,0 +1,729 @@
+"""
+Implementação de fila usando RabbitMQ.
+Adequada para sistemas distribuídos complexos com exchanges e routing.
+"""
+
+import asyncio
+import json
+import uuid
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Callable, Tuple
+import logging
+
+import aio_pika
+from aio_pika import connect_robust, Message, ExchangeType
+from aio_pika.abc import AbstractRobustConnection, AbstractRobustChannel, DeliveryMode
+
+from ...queue.base import (
+    BaseQueue, QueueMessage, QueueMetadata, DeadLetterQueue,
+    QueueError, QueuePublishError, IdempotencyViolationError
+)
+from ...queue.queue_metrics import QueueMetricsCollector
+
+logger = logging.getLogger(__name__)
+
+
+class RabbitMQQueue(BaseQueue):
+    """
+    Implementação de fila usando RabbitMQ.
+    Suporta exchanges, bindings, DLX e roteamento avançado.
+    """
+    
+    def __init__(
+        self,
+        connection_string: str = "amqp://guest:guest@localhost:5672/",
+        max_connections: int = 10,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        
+        self.connection_string = connection_string
+        self.max_connections = max_connections
+        
+        # Conexão e canal
+        self.connection: Optional[AbstractRobustConnection] = None
+        self.channel: Optional[AbstractRobustChannel] = None
+        
+        # Exchanges
+        self.main_exchange_name = "saas_platform.main"
+        self.delayed_exchange_name = "saas_platform.delayed"
+        self.dlx_exchange_name = "saas_platform.dlx"
+        
+        # Cache de queues declaradas
+        self._declared_queues: Dict[str, aio_pika.abc.AbstractRobustQueue] = {}
+        self._declared_exchanges: Dict[str, aio_pika.abc.AbstractRobustExchange] = {}
+        
+        # Controle de consumidores
+        self._consumers: Dict[str, asyncio.Task] = {}
+        self._consumer_tags: Dict[str, str] = {}
+        
+        # Idempotência (usamos Redis ou banco para distribuição)
+        # Aqui usamos cache local para simplificação
+        self._idempotency_cache: Dict[str, datetime] = {}
+        
+        # Métricas
+        self.metrics_collector = QueueMetricsCollector(self.metrics) if self.metrics else None
+        
+        logger.info(f"RabbitMQQueue initialized with connection: {connection_string}")
+    
+    async def connect(self) -> None:
+        """Estabelece conexão com RabbitMQ"""
+        if self.connection and not self.connection.is_closed:
+            return
+        
+        try:
+            # Conecta ao RabbitMQ
+            self.connection = await connect_robust(
+                self.connection_string,
+                client_properties={
+                    "connection_name": f"saas-platform-{uuid.uuid4().hex[:8]}",
+                    "platform": "SaaS Platform"
+                }
+            )
+            
+            # Cria canal
+            self.channel = await self.connection.channel()
+            await self.channel.set_qos(prefetch_count=10)
+            
+            # Declara exchanges
+            await self._declare_exchanges()
+            
+            logger.info("Connected to RabbitMQ successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to RabbitMQ: {str(e)}")
+            raise QueueError(f"Connection failed: {str(e)}")
+    
+    async def _declare_exchanges(self) -> None:
+        """Declara todas as exchanges necessárias"""
+        if not self.channel:
+            return
+        
+        # Exchange principal (topic)
+        self._declared_exchanges[self.main_exchange_name] = (
+            await self.channel.declare_exchange(
+                self.main_exchange_name,
+                ExchangeType.TOPIC,
+                durable=True,
+                auto_delete=False
+            )
+        )
+        
+        # Exchange para mensagens atrasadas (headers)
+        self._declared_exchanges[self.delayed_exchange_name] = (
+            await self.channel.declare_exchange(
+                self.delayed_exchange_name,
+                ExchangeType.HEADERS,
+                durable=True,
+                auto_delete=False
+            )
+        )
+        
+        # Dead Letter Exchange (direct)
+        self._declared_exchanges[self.dlx_exchange_name] = (
+            await self.channel.declare_exchange(
+                self.dlx_exchange_name,
+                ExchangeType.DIRECT,
+                durable=True,
+                auto_delete=False
+            )
+        )
+    
+    async def _get_queue(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None,
+        dead_letter: bool = False
+    ) -> Tuple[str, aio_pika.abc.AbstractRobustQueue]:
+        """Obtém ou cria uma queue no RabbitMQ"""
+        
+        if not self.channel:
+            await self.connect()
+        
+        # Nome da queue com isolamento de tenant
+        if tenant_id:
+            full_queue_name = f"{tenant_id}.{queue_name}"
+        else:
+            full_queue_name = queue_name
+        
+        if dead_letter:
+            full_queue_name = f"dlx.{full_queue_name}"
+        
+        cache_key = f"{full_queue_name}.{str(dead_letter)}"
+        
+        if cache_key in self._declared_queues:
+            return full_queue_name, self._declared_queues[cache_key]
+        
+        # Argumentos da queue
+        args = {
+            "x-max-length": 10000,
+            "x-message-ttl": 86400000,  # 24 horas em ms
+            "x-dead-letter-exchange": self.dlx_exchange_name,
+            "x-dead-letter-routing-key": full_queue_name
+        }
+        
+        # Cria queue
+        queue = await self.channel.declare_queue(
+            name=full_queue_name,
+            durable=True,
+            exclusive=False,
+            auto_delete=False,
+            arguments=args if not dead_letter else {}
+        )
+        
+        # Bind para exchange apropriado
+        if dead_letter:
+            await queue.bind(self.dlx_exchange_name, full_queue_name)
+        else:
+            # Bind baseado no tenant
+            routing_key = f"{tenant_id}.*" if tenant_id else "#"
+            await queue.bind(self.main_exchange_name, routing_key)
+        
+        self._declared_queues[cache_key] = queue
+        logger.debug(f"Declared queue: {full_queue_name}")
+        
+        return full_queue_name, queue
+    
+    async def publish(
+        self,
+        queue_name: str,
+        payload: Any,
+        tenant_id: str,
+        delay_seconds: int = 0,
+        idempotency_key: Optional[str] = None,
+        source: str = "unknown"
+    ) -> QueueMessage:
+        """Publica mensagem no RabbitMQ"""
+        
+        await self.connect()
+        
+        # Verifica idempotência
+        cache_key = f"idempotency:{tenant_id}:{queue_name}:{idempotency_key}"
+        if idempotency_key and cache_key in self._idempotency_cache:
+            cached_time = self._idempotency_cache[cache_key]
+            if (datetime.utcnow() - cached_time).total_seconds() < 3600:
+                raise IdempotencyViolationError(
+                    f"Idempotency key already used: {idempotency_key}",
+                    tenant_id=tenant_id,
+                    queue_name=queue_name
+                )
+        
+        # Cria metadados
+        metadata = QueueMetadata(
+            tenant_id=tenant_id,
+            source=source
+        )
+        
+        # Cria mensagem
+        queue_message = QueueMessage(
+            metadata=metadata,
+            payload=payload,
+            queue_name=queue_name
+        )
+        
+        # Serializa mensagem
+        message_data = queue_message.serialize()
+        
+        # Prepara headers
+        headers = {
+            "tenant_id": tenant_id,
+            "message_id": queue_message.metadata.message_id,
+            "correlation_id": queue_message.metadata.correlation_id,
+            "source": source,
+            "created_at": queue_message.metadata.created_at.isoformat(),
+            "queue_name": queue_name
+        }
+        
+        if idempotency_key:
+            headers["idempotency_key"] = idempotency_key
+        
+        if delay_seconds > 0:
+            headers["x-delay"] = delay_seconds * 1000
+        
+        # Cria mensagem RabbitMQ
+        message = Message(
+            body=message_data.encode('utf-8'),
+            content_type="application/json",
+            content_encoding="utf-8",
+            headers=headers,
+            delivery_mode=DeliveryMode.PERSISTENT,
+            priority=0,
+            timestamp=int(time.time()),
+            message_id=queue_message.metadata.message_id,
+            correlation_id=queue_message.metadata.correlation_id
+        )
+        
+        try:
+            # Determina exchange e routing key
+            if delay_seconds > 0:
+                exchange = self._declared_exchanges[self.delayed_exchange_name]
+                # Para mensagens atrasadas, usamos headers matching
+                message.headers["x-match"] = "all"
+                message.headers["x-delayed-type"] = "topic"
+                
+                # Publica no exchange de delay
+                await exchange.publish(
+                    message,
+                    routing_key="",
+                    mandatory=True
+                )
+            else:
+                exchange = self._declared_exchanges[self.main_exchange_name]
+                routing_key = f"{tenant_id}.{queue_name}"
+                
+                # Publica no exchange principal
+                await exchange.publish(
+                    message,
+                    routing_key=routing_key,
+                    mandatory=True
+                )
+            
+            # Cache de idempotência
+            if idempotency_key:
+                self._idempotency_cache[cache_key] = datetime.utcnow()
+            
+            # Registra métricas
+            if self.metrics_collector:
+                await self.metrics_collector.record_message_published(
+                    queue_name, tenant_id, len(message_data)
+                )
+            
+            logger.debug(
+                f"Published message {queue_message.metadata.message_id} "
+                f"to queue {queue_name} (tenant: {tenant_id})"
+            )
+            
+            return queue_message
+            
+        except Exception as e:
+            logger.error(f"Failed to publish message: {str(e)}")
+            raise QueuePublishError(
+                f"RabbitMQ publish error: {str(e)}",
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                original_error=e
+            )
+    
+    async def receive_message(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None,
+        visibility_timeout: int = 300
+    ) -> Optional[QueueMessage]:
+        """Recebe mensagem do RabbitMQ"""
+        
+        await self.connect()
+        
+        try:
+            # Obtém queue
+            _, queue = await self._get_queue(queue_name, tenant_id)
+            
+            # Tenta receber mensagem
+            incoming_message = await queue.get(no_ack=False, fail=False)
+            
+            if not incoming_message:
+                return None
+            
+            # Processa mensagem
+            try:
+                message_data = incoming_message.body.decode('utf-8')
+                queue_message = QueueMessage.deserialize(message_data)
+                
+                # Armazena referência para acknowledgment
+                queue_message._rabbitmq_message = incoming_message
+                queue_message._rabbitmq_queue = queue
+                
+                # Atualiza headers com timestamp de processamento
+                headers = dict(incoming_message.headers) if incoming_message.headers else {}
+                headers["processing_started_at"] = datetime.utcnow().isoformat()
+                
+                # Registra métricas
+                if self.metrics_collector:
+                    # Obtém estatísticas da queue
+                    queue_declare = await queue.declare(passive=True)
+                    await self.metrics_collector.record_queue_depth(
+                        queue_name,
+                        queue_message.metadata.tenant_id,
+                        queue_declare.message_count
+                    )
+                
+                logger.debug(f"Received message {queue_message.metadata.message_id}")
+                return queue_message
+                
+            except Exception as e:
+                # Erro ao processar mensagem, rejeita
+                await incoming_message.reject(requeue=True)
+                logger.error(f"Error processing received message: {str(e)}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error receiving message: {str(e)}")
+            return None
+    
+    async def acknowledge(self, message: QueueMessage) -> None:
+        """Confirma processamento de mensagem"""
+        if hasattr(message, '_rabbitmq_message'):
+            await message._rabbitmq_message.ack()
+            logger.debug(f"Acknowledged message {message.metadata.message_id}")
+        else:
+            logger.warning(f"No RabbitMQ message to acknowledge: {message.metadata.message_id}")
+    
+    async def nack(
+        self,
+        message: QueueMessage,
+        error: Optional[str] = None,
+        retry_after: Optional[int] = None
+    ) -> None:
+        """Nega confirmação de mensagem"""
+        
+        if not hasattr(message, '_rabbitmq_message'):
+            logger.warning(f"No RabbitMQ message to nack: {message.metadata.message_id}")
+            return
+        
+        try:
+            if retry_after is not None:
+                # Reenfileira com delay
+                headers = dict(message._rabbitmq_message.headers) if message._rabbitmq_message.headers else {}
+                headers["x-delay"] = retry_after * 1000
+                headers["retry_count"] = headers.get("retry_count", 0) + 1
+                
+                # Cria nova mensagem
+                new_message = Message(
+                    body=message._rabbitmq_message.body,
+                    content_type=message._rabbitmq_message.content_type,
+                    headers=headers,
+                    delivery_mode=message._rabbitmq_message.delivery_mode,
+                    priority=message._rabbitmq_message.priority,
+                    timestamp=int(time.time()),
+                    message_id=f"{message.metadata.message_id}.retry.{headers['retry_count']}",
+                    correlation_id=message.metadata.correlation_id
+                )
+                
+                # Publica com delay
+                exchange = self._declared_exchanges[self.delayed_exchange_name]
+                await exchange.publish(
+                    new_message,
+                    routing_key="",
+                    mandatory=True
+                )
+                
+                # Ack da mensagem original
+                await message._rabbitmq_message.ack()
+                
+                logger.debug(f"Requeued message {message.metadata.message_id} with delay {retry_after}s")
+                
+            else:
+                # Rejeita e envia para DLX
+                await message._rabbitmq_message.reject(requeue=False)
+                
+                # Registra no DLQ customizado
+                if self.dead_letter_queue:
+                    await self.dead_letter_queue.store_failed_message(
+                        message, error or "Unknown error", error
+                    )
+                
+                logger.debug(f"Nacked message {message.metadata.message_id}, error: {error}")
+                
+        except Exception as e:
+            logger.error(f"Error in nack: {str(e)}")
+            raise QueueError(
+                f"Failed to nack message: {str(e)}",
+                tenant_id=message.metadata.tenant_id,
+                queue_name=message.queue_name,
+                original_error=e
+            )
+    
+    async def consume(
+        self,
+        queue_name: str,
+        callback: Callable[[QueueMessage], Any],
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1,
+        visibility_timeout: int = 300
+    ) -> None:
+        """Consome mensagens continuamente do RabbitMQ"""
+        
+        await self.connect()
+        
+        consumer_id = f"consumer_{uuid.uuid4().hex[:8]}"
+        logger.info(f"Starting RabbitMQ consumer {consumer_id} for queue {queue_name}")
+        
+        # Registra worker ativo
+        if self.metrics_collector:
+            await self.metrics_collector.record_worker_status(
+                consumer_id, tenant_id or "all", True
+            )
+        
+        try:
+            # Obtém queue
+            full_queue_name, queue = await self._get_queue(queue_name, tenant_id)
+            
+            # Callback wrapper
+            async def process_message(
+                message: aio_pika.abc.AbstractIncomingMessage
+            ) -> None:
+                """Processa uma mensagem recebida"""
+                
+                if self._shutting_down:
+                    await message.reject(requeue=True)
+                    return
+                
+                start_time = time.time()
+                
+                try:
+                    # Desserializa mensagem
+                    message_data = message.body.decode('utf-8')
+                    queue_message = QueueMessage.deserialize(message_data)
+                    queue_message._rabbitmq_message = message
+                    queue_message._rabbitmq_queue = queue
+                    
+                    # Executa callback
+                    if asyncio.iscoroutinefunction(callback):
+                        result = await callback(queue_message)
+                    else:
+                        result = callback(queue_message)
+                    
+                    processing_time = (time.time() - start_time) * 1000
+                    
+                    # Registra métricas de sucesso
+                    if self.metrics_collector:
+                        await self.metrics_collector.record_message_consumed(
+                            queue_name,
+                            queue_message.metadata.tenant_id,
+                            processing_time,
+                            success=True
+                        )
+                    
+                    # Confirma mensagem
+                    await message.ack()
+                    
+                    logger.debug(
+                        f"Processed message {queue_message.metadata.message_id} "
+                        f"in {processing_time:.2f}ms"
+                    )
+                    
+                except Exception as e:
+                    # Registra métricas de falha
+                    tenant = "unknown"
+                    if 'queue_message' in locals():
+                        tenant = queue_message.metadata.tenant_id
+                    
+                    if self.metrics_collector:
+                        await self.metrics_collector.record_message_consumed(
+                            queue_name,
+                            tenant,
+                            0,
+                            success=False
+                        )
+                    
+                    logger.error(f"Error processing message: {str(e)}")
+                    
+                    # Nega confirmação
+                    if 'queue_message' in locals():
+                        await self.nack(queue_message, str(e))
+                    else:
+                        await message.reject(requeue=True)
+            
+            # Inicia consumo
+            consumer_tag = await queue.consume(
+                process_message,
+                no_ack=False
+            )
+            
+            self._consumer_tags[consumer_id] = consumer_tag
+            
+            logger.info(f"RabbitMQ consumer {consumer_id} started with tag {consumer_tag}")
+            
+            # Mantém o consumer ativo
+            while not self._shutting_down:
+                await asyncio.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"Error in RabbitMQ consumer {consumer_id}: {str(e)}")
+        
+        finally:
+            # Cancela consumo
+            if consumer_id in self._consumer_tags:
+                try:
+                    await queue.cancel(self._consumer_tags[consumer_id])
+                except:
+                    pass
+                del self._consumer_tags[consumer_id]
+            
+            # Registra worker inativo
+            if self.metrics_collector:
+                await self.metrics_collector.record_worker_status(
+                    consumer_id, tenant_id or "all", False
+                )
+            
+            logger.info(f"RabbitMQ consumer {consumer_id} stopped")
+    
+    async def get_queue_stats(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Obtém estatísticas da fila no RabbitMQ"""
+        
+        await self.connect()
+        
+        stats = {
+            "queue_name": queue_name,
+            "timestamp": datetime.utcnow().isoformat(),
+            "total_messages": 0,
+            "consumer_count": 0,
+            "tenant_distribution": {}
+        }
+        
+        try:
+            # Para cada tenant (ou todos)
+            if tenant_id:
+                tenants = [tenant_id]
+            else:
+                # Lista todas as filas com este padrão
+                tenants = []
+                for queue_key in self._declared_queues.keys():
+                    if queue_name in queue_key and not queue_key.startswith("dlx."):
+                        parts = queue_key.split(".")
+                        if len(parts) > 1:
+                            tenants.append(parts[0])
+            
+            for t_id in tenants:
+                try:
+                    full_queue_name, queue = await self._get_queue(queue_name, t_id)
+                    queue_declare = await queue.declare(passive=True)
+                    
+                    stats["tenant_distribution"][t_id] = {
+                        "messages": queue_declare.message_count,
+                        "consumers": queue_declare.consumer_count
+                    }
+                    stats["total_messages"] += queue_declare.message_count
+                    stats["consumer_count"] += queue_declare.consumer_count
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to get stats for tenant {t_id}: {str(e)}")
+                    stats["tenant_distribution"][t_id] = {
+                        "messages": 0,
+                        "consumers": 0
+                    }
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting queue stats: {str(e)}")
+            return stats
+    
+    async def purge_queue(
+        self,
+        queue_name: str,
+        tenant_id: Optional[str] = None
+    ) -> None:
+        """Limpa fila inteira no RabbitMQ"""
+        
+        await self.connect()
+        
+        try:
+            full_queue_name, queue = await self._get_queue(queue_name, tenant_id)
+            await queue.purge()
+            
+            logger.info(f"Purged RabbitMQ queue {full_queue_name}")
+            
+        except Exception as e:
+            logger.error(f"Error purging queue: {str(e)}")
+            raise QueueError(
+                f"Failed to purge queue: {str(e)}",
+                tenant_id=tenant_id,
+                queue_name=queue_name,
+                original_error=e
+            )
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Verifica saúde do RabbitMQ"""
+        
+        try:
+            await self.connect()
+            
+            # Verifica conexão
+            if not self.connection or self.connection.is_closed:
+                return {
+                    "rabbitmq_healthy": False,
+                    "error": "Connection closed",
+                    "connected": False,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            
+            # Verifica canal
+            if not self.channel or self.channel.is_closed:
+                return {
+                    "rabbitmq_healthy": False,
+                    "error": "Channel closed",
+                    "connected": False,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            
+            # Testa comunicação
+            await self.channel.connection.connection.reader.read(0)
+            
+            return {
+                "rabbitmq_healthy": True,
+                "connected": True,
+                "consumers": len(self._consumer_tags),
+                "declared_queues": len(self._declared_queues),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            return {
+                "rabbitmq_healthy": False,
+                "error": str(e),
+                "connected": False,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+    
+    async def shutdown(self):
+        """Desliga a fila de forma segura"""
+        await super().shutdown()
+        
+        # Cancela todos os consumers
+        for consumer_id, consumer_tag in list(self._consumer_tags.items()):
+            try:
+                # Encontra a queue correspondente
+                for queue in self._declared_queues.values():
+                    try:
+                        await queue.cancel(consumer_tag)
+                        break
+                    except:
+                        continue
+            except:
+                pass
+        
+        self._consumer_tags.clear()
+        
+        # Fecha canal
+        if self.channel and not self.channel.is_closed:
+            await self.channel.close()
+        
+        # Fecha conexão
+        if self.connection and not self.connection.is_closed:
+            await self.connection.close()
+        
+        # Limpa caches
+        self._declared_queues.clear()
+        self._declared_exchanges.clear()
+        self._idempotency_cache.clear()
+        
+        logger.info("RabbitMQQueue shut down successfully")
+
+
+def create_rabbitmq_queue(
+    connection_string: Optional[str] = None,
+    **kwargs
+) -> RabbitMQQueue:
+    """Cria instância de fila RabbitMQ"""
+    if not connection_string:
+        from ...queue.config import get_queue_settings
+        settings = get_queue_settings()
+        connection_string = settings.rabbitmq_url
+    
+    return RabbitMQQueue(connection_string=connection_string, **kwargs)

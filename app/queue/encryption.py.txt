@@ -1,0 +1,449 @@
+"""
+Criptografia para mensagens em filas.
+Garante confidencialidade e integridade das mensagens em trânsito e armazenamento.
+"""
+
+import logging
+import json
+from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import base64
+import os
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EncryptionConfig:
+    """Configuração de criptografia"""
+    
+    # Algoritmo
+    algorithm: str = "AES-GCM"  # AES-GCM ou ChaCha20-Poly1305
+    
+    # Chaves
+    key_rotation_days: int = 30
+    max_key_versions: int = 3
+    
+    # AES-GCM específico
+    aes_key_size: int = 256  # 128, 192 ou 256 bits
+    nonce_size: int = 12     # 12 bytes para GCM
+    
+    # Derivação de chave
+    kdf_iterations: int = 100000
+    salt_size: int = 16
+    
+    def __post_init__(self):
+        """Validação pós-inicialização"""
+        if self.algorithm not in ["AES-GCM", "ChaCha20-Poly1305"]:
+            raise ValueError(f"Algoritmo não suportado: {self.algorithm}")
+        
+        if self.aes_key_size not in [128, 192, 256]:
+            raise ValueError(f"Tamanho de chave AES inválido: {self.aes_key_size}")
+        
+        if self.nonce_size < 12:
+            raise ValueError(f"Nonce muito pequeno: {self.nonce_size}")
+
+
+class MessageEncryptor:
+    """
+    Criptografador de mensagens para filas.
+    Suporta múltiplos algoritmos e rotação de chaves.
+    """
+    
+    def __init__(
+        self,
+        config: Optional[EncryptionConfig] = None,
+        master_key: Optional[bytes] = None
+    ):
+        self.config = config or EncryptionConfig()
+        
+        # Chave mestra (deve vir de KMS ou secrets manager em produção)
+        self.master_key = master_key or self._generate_master_key()
+        
+        # Cache de chaves derivadas
+        self._derived_keys: Dict[str, bytes] = {}
+        
+        # Versões de chaves
+        self._key_versions: Dict[str, str] = {}
+        
+        logger.info(f"MessageEncryptor inicializado com algoritmo {self.config.algorithm}")
+    
+    def _generate_master_key(self) -> bytes:
+        """Gera chave mestra (apenas para desenvolvimento)"""
+        # EM PRODUÇÃO: Use KMS, HashiCorp Vault, AWS Secrets Manager, etc.
+        key = Fernet.generate_key()
+        logger.warning("GERANDO CHAVE MESTRA EM MEMÓRIA - NÃO USAR EM PRODUÇÃO")
+        return key
+    
+    def _derive_key(
+        self,
+        context: str,
+        key_version: str = "v1"
+    ) -> bytes:
+        """Deriva chave específica do contexto"""
+        
+        cache_key = f"{context}:{key_version}"
+        
+        if cache_key in self._derived_keys:
+            return self._derived_keys[cache_key]
+        
+        # Deriva chave usando PBKDF2
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=self.config.aes_key_size // 8,
+            salt=self._get_salt(context, key_version),
+            iterations=self.config.kdf_iterations
+        )
+        
+        key = kdf.derive(self.master_key + context.encode())
+        self._derived_keys[cache_key] = key
+        
+        return key
+    
+    def _get_salt(self, context: str, key_version: str) -> bytes:
+        """Gera salt determinístico para contexto"""
+        
+        # Em produção, armazenaria salts em banco seguro
+        salt_input = f"{context}:{key_version}:{self.config.salt_size}"
+        salt = hashes.Hash(hashes.SHA256())
+        salt.update(salt_input.encode())
+        return salt.finalize()[:self.config.salt_size]
+    
+    def encrypt_message(
+        self,
+        message_data: Dict[str, Any],
+        context: str,
+        tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Criptografa uma mensagem.
+        
+        Args:
+            message_data: Dados da mensagem a criptografar
+            context: Contexto para derivação de chave (ex: "payment_webhook")
+            tenant_id: ID do tenant (opcional, para isolamento)
+            
+        Returns:
+            Dicionário com mensagem criptografada e metadados
+        """
+        
+        try:
+            # Serializa mensagem
+            plaintext = json.dumps(message_data).encode('utf-8')
+            
+            # Determina chave a usar
+            key_version = self._get_current_key_version(context)
+            key = self._derive_key(context, key_version)
+            
+            # Gera nonce aleatório
+            nonce = os.urandom(self.config.nonce_size)
+            
+            # Criptografa
+            if self.config.algorithm == "AES-GCM":
+                aesgcm = AESGCM(key)
+                ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+            else:
+                raise ValueError(f"Algoritmo não implementado: {self.config.algorithm}")
+            
+            # Monta payload criptografado
+            encrypted_payload = {
+                "version": 1,
+                "algorithm": self.config.algorithm,
+                "key_version": key_version,
+                "context": context,
+                "nonce": base64.b64encode(nonce).decode('utf-8'),
+                "ciphertext": base64.b64encode(ciphertext).decode('utf-8'),
+                "tenant_id": tenant_id,
+                "timestamp": self._get_timestamp()
+            }
+            
+            # Adiciona HMAC para integridade
+            encrypted_payload["hmac"] = self._calculate_hmac(encrypted_payload, key)
+            
+            logger.debug(
+                f"Mensagem criptografada para contexto '{context}' "
+                f"(tamanho: {len(ciphertext)} bytes)"
+            )
+            
+            return encrypted_payload
+            
+        except Exception as e:
+            logger.error(f"Erro ao criptografar mensagem: {str(e)}")
+            raise EncryptionError(f"Falha na criptografia: {str(e)}")
+    
+    def decrypt_message(
+        self,
+        encrypted_payload: Dict[str, Any],
+        context: str
+    ) -> Dict[str, Any]:
+        """
+        Descriptografa uma mensagem.
+        
+        Args:
+            encrypted_payload: Payload criptografado
+            context: Contexto esperado (para validação)
+            
+        Returns:
+            Dados originais da mensagem
+            
+        Raises:
+            DecryptionError: Se a descriptografia falhar
+            IntegrityError: Se o HMAC não corresponder
+        """
+        
+        try:
+            # Valida versão
+            if encrypted_payload.get("version") != 1:
+                raise DecryptionError(f"Versão não suportada: {encrypted_payload.get('version')}")
+            
+            # Valida contexto
+            payload_context = encrypted_payload.get("context")
+            if payload_context != context:
+                raise DecryptionError(
+                    f"Contexto inválido: esperado '{context}', recebido '{payload_context}'"
+                )
+            
+            # Obtém chave
+            key_version = encrypted_payload.get("key_version", "v1")
+            key = self._derive_key(context, key_version)
+            
+            # Verifica integridade
+            if not self._verify_hmac(encrypted_payload, key):
+                raise IntegrityError("HMAC inválido - possível tampering")
+            
+            # Decodifica componentes
+            nonce = base64.b64decode(encrypted_payload["nonce"])
+            ciphertext = base64.b64decode(encrypted_payload["ciphertext"])
+            
+            # Descriptografa
+            if encrypted_payload["algorithm"] == "AES-GCM":
+                aesgcm = AESGCM(key)
+                plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+            else:
+                raise DecryptionError(
+                    f"Algoritmo não suportado: {encrypted_payload['algorithm']}"
+                )
+            
+            # Desserializa
+            message_data = json.loads(plaintext.decode('utf-8'))
+            
+            logger.debug(
+                f"Mensagem descriptografada do contexto '{context}' "
+                f"(tamanho original: {len(plaintext)} bytes)"
+            )
+            
+            return message_data
+            
+        except IntegrityError:
+            # Log de segurança
+            logger.warning(
+                f"Tentativa de tampering detectada no contexto '{context}'"
+            )
+            raise
+            
+        except Exception as e:
+            logger.error(f"Erro ao descriptografar mensagem: {str(e)}")
+            raise DecryptionError(f"Falha na descriptografia: {str(e)}")
+    
+    def _calculate_hmac(self, payload: Dict[str, Any], key: bytes) -> str:
+        """Calcula HMAC para verificação de integridade"""
+        
+        import hmac
+        
+        # Remove HMAC existente se houver
+        payload_copy = payload.copy()
+        payload_copy.pop("hmac", None)
+        
+        # Serializa deterministicamente
+        data = json.dumps(payload_copy, sort_keys=True).encode('utf-8')
+        
+        # Calcula HMAC
+        h = hmac.new(key, data, hashes.SHA256())
+        return base64.b64encode(h.digest()).decode('utf-8')
+    
+    def _verify_hmac(self, payload: Dict[str, Any], key: bytes) -> bool:
+        """Verifica HMAC do payload"""
+        
+        if "hmac" not in payload:
+            return False
+        
+        expected_hmac = payload["hmac"]
+        calculated_hmac = self._calculate_hmac(payload, key)
+        
+        # Comparação segura contra timing attacks
+        return hmac.compare_digest(expected_hmac, calculated_hmac)
+    
+    def _get_current_key_version(self, context: str) -> str:
+        """Retorna versão atual da chave para um contexto"""
+        # Em produção, consultaria um key management service
+        return self._key_versions.get(context, "v1")
+    
+    def _get_timestamp(self) -> str:
+        """Retorna timestamp em formato padronizado"""
+        from datetime import datetime
+        return datetime.utcnow().isoformat() + "Z"
+    
+    def rotate_key(self, context: str) -> str:
+        """Rota a chave para um contexto específico"""
+        
+        # Gera nova versão
+        current_version = self._get_current_key_version(context)
+        version_num = int(current_version[1:]) if current_version.startswith("v") else 1
+        new_version = f"v{version_num + 1}"
+        
+        # Atualiza versão
+        self._key_versions[context] = new_version
+        
+        # Limita número de versões mantidas
+        self._cleanup_old_keys(context)
+        
+        logger.info(f"Chave rotacionada para contexto '{context}': {new_version}")
+        
+        return new_version
+    
+    def _cleanup_old_keys(self, context: str):
+        """Remove chaves antigas do cache"""
+        
+        current_version = self._key_versions.get(context, "v1")
+        version_num = int(current_version[1:]) if current_version.startswith("v") else 1
+        
+        keys_to_remove = []
+        for cache_key in list(self._derived_keys.keys()):
+            if cache_key.startswith(f"{context}:"):
+                key_version = cache_key.split(":")[1]
+                if key_version.startswith("v"):
+                    key_version_num = int(key_version[1:])
+                    if key_version_num < version_num - self.config.max_key_versions:
+                        keys_to_remove.append(cache_key)
+        
+        for key in keys_to_remove:
+            del self._derived_keys[key]
+    
+    def get_key_status(self, context: str) -> Dict[str, Any]:
+        """Retorna status das chaves para um contexto"""
+        
+        current_version = self._get_current_key_version(context)
+        
+        return {
+            "context": context,
+            "current_version": current_version,
+            "cached_versions": [
+                k.split(":")[1] for k in self._derived_keys.keys()
+                if k.startswith(f"{context}:")
+            ],
+            "algorithm": self.config.algorithm,
+            "key_rotation_days": self.config.key_rotation_days,
+            "timestamp": self._get_timestamp()
+        }
+
+
+class TransportEncryption:
+    """
+    Criptografia para transporte (TLS/SSL).
+    Configura conexões seguras para backends de fila.
+    """
+    
+    @staticmethod
+    def configure_redis_tls(
+        redis_url: str,
+        ca_cert_path: Optional[str] = None,
+        client_cert_path: Optional[str] = None,
+        client_key_path: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Configura TLS para conexão Redis"""
+        
+        import ssl
+        
+        ssl_context = ssl.create_default_context(
+            purpose=ssl.Purpose.SERVER_AUTH,
+            cafile=ca_cert_path
+        )
+        
+        if client_cert_path and client_key_path:
+            ssl_context.load_cert_chain(
+                certfile=client_cert_path,
+                keyfile=client_key_path
+            )
+        
+        # Configurações de segurança
+        ssl_context.check_hostname = True
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+        
+        return {
+            "ssl": True,
+            "ssl_cert_reqs": ssl.CERT_REQUIRED,
+            "ssl_ca_certs": ca_cert_path,
+            "ssl_certfile": client_cert_path,
+            "ssl_keyfile": client_key_path,
+            "ssl_context": ssl_context
+        }
+    
+    @staticmethod
+    def configure_rabbitmq_tls(
+        amqp_url: str,
+        ca_cert_path: Optional[str] = None,
+        client_cert_path: Optional[str] = None,
+        client_key_path: Optional[str] = None
+    ) -> str:
+        """Configura TLS para conexão RabbitMQ"""
+        
+        import ssl
+        
+        # Converte URL para usar AMQPS
+        if amqp_url.startswith("amqp://"):
+            amqp_url = amqp_url.replace("amqp://", "amqps://")
+        
+        # Adiciona parâmetros TLS
+        if ca_cert_path:
+            amqp_url += f"?cacertfile={ca_cert_path}"
+        
+        if client_cert_path:
+            amqp_url += f"&certfile={client_cert_path}"
+        
+        if client_key_path:
+            amqp_url += f"&keyfile={client_key_path}"
+        
+        return amqp_url
+    
+    @staticmethod
+    def configure_sqs_tls() -> Dict[str, Any]:
+        """Configura TLS para AWS SQS (já usa HTTPS por padrão)"""
+        
+        # SQS já usa HTTPS por padrão
+        # Aqui poderíamos configurar opções de SSL específicas
+        
+        return {
+            "use_ssl": True,
+            "verify": True  # Verifica certificados SSL
+        }
+
+
+# Exceções
+class EncryptionError(Exception):
+    """Erro na criptografia"""
+    pass
+
+class DecryptionError(EncryptionError):
+    """Erro na descriptografia"""
+    pass
+
+class IntegrityError(EncryptionError):
+    """Erro na verificação de integridade"""
+    pass
+
+
+# Singleton global
+_encryptor_instance: Optional[MessageEncryptor] = None
+
+def get_encryptor() -> MessageEncryptor:
+    """Retorna instância singleton do encryptor"""
+    global _encryptor_instance
+    
+    if _encryptor_instance is None:
+        _encryptor_instance = MessageEncryptor()
+    
+    return _encryptor_instance

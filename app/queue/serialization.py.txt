@@ -1,0 +1,633 @@
+"""
+Sistema de serialização versionada para mensagens de fila.
+Garante compatibilidade retroativa e evolução de schemas.
+"""
+
+import logging
+import json
+import inspect
+from typing import Dict, Any, Optional, Type, TypeVar, get_type_hints
+from dataclasses import dataclass, field, asdict, fields
+from datetime import datetime, date
+from enum import Enum
+import hashlib
+from abc import ABC, abstractmethod
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar('T')
+
+
+class SchemaVersion(str, Enum):
+    """Versões de schema suportadas"""
+    V1 = "v1"
+    V2 = "v2"
+    V3 = "v3"
+
+
+@dataclass
+class SerializationMetadata:
+    """Metadados de serialização"""
+    schema_version: SchemaVersion
+    object_type: str
+    serialized_at: datetime = field(default_factory=datetime.utcnow)
+    checksum: Optional[str] = None
+    transformer_version: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "schema_version": self.schema_version.value,
+            "object_type": self.object_type,
+            "serialized_at": self.serialized_at.isoformat(),
+            "checksum": self.checksum,
+            "transformer_version": self.transformer_version
+        }
+
+
+class SchemaTransformer(ABC):
+    """Transformador entre versões de schema"""
+    
+    @abstractmethod
+    def can_transform(self, from_version: SchemaVersion, to_version: SchemaVersion) -> bool:
+        """Verifica se pode transformar entre versões"""
+        pass
+    
+    @abstractmethod
+    def transform(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Transforma dados entre versões"""
+        pass
+
+
+class SchemaRegistry:
+    """Registro de schemas e transformadores"""
+    
+    def __init__(self):
+        self.schemas: Dict[str, Dict[SchemaVersion, Type]] = {}
+        self.transformers: Dict[str, Dict[SchemaVersion, Dict[SchemaVersion, SchemaTransformer]]] = {}
+        self._default_version = SchemaVersion.V2
+    
+    def register_schema(
+        self,
+        object_type: str,
+        schema_class: Type,
+        version: SchemaVersion
+    ):
+        """Registra um schema para um tipo de objeto"""
+        
+        if object_type not in self.schemas:
+            self.schemas[object_type] = {}
+        
+        self.schemas[object_type][version] = schema_class
+        
+        logger.debug(f"Schema registrado: {object_type}@{version}")
+    
+    def register_transformer(
+        self,
+        object_type: str,
+        from_version: SchemaVersion,
+        to_version: SchemaVersion,
+        transformer: SchemaTransformer
+    ):
+        """Registra um transformador entre versões"""
+        
+        if object_type not in self.transformers:
+            self.transformers[object_type] = {}
+        
+        if from_version not in self.transformers[object_type]:
+            self.transformers[object_type][from_version] = {}
+        
+        self.transformers[object_type][from_version][to_version] = transformer
+        
+        logger.debug(f"Transformer registrado: {object_type} {from_version}->{to_version}")
+    
+    def get_schema(
+        self,
+        object_type: str,
+        version: SchemaVersion
+    ) -> Optional[Type]:
+        """Obtém schema para um tipo e versão"""
+        
+        type_schemas = self.schemas.get(object_type)
+        if not type_schemas:
+            return None
+        
+        return type_schemas.get(version)
+    
+    def get_latest_schema(self, object_type: str) -> Optional[Tuple[Type, SchemaVersion]]:
+        """Obtém schema mais recente para um tipo"""
+        
+        type_schemas = self.schemas.get(object_type)
+        if not type_schemas:
+            return None
+        
+        # Assumindo que V3 > V2 > V1
+        for version in [SchemaVersion.V3, SchemaVersion.V2, SchemaVersion.V1]:
+            if version in type_schemas:
+                return type_schemas[version], version
+        
+        return None
+    
+    def get_transformer(
+        self,
+        object_type: str,
+        from_version: SchemaVersion,
+        to_version: SchemaVersion
+    ) -> Optional[SchemaTransformer]:
+        """Obtém transformador entre versões"""
+        
+        type_transformers = self.transformers.get(object_type)
+        if not type_transformers:
+            return None
+        
+        from_transformers = type_transformers.get(from_version)
+        if not from_transformers:
+            return None
+        
+        return from_transformers.get(to_version)
+    
+    def find_transformation_path(
+        self,
+        object_type: str,
+        from_version: SchemaVersion,
+        to_version: SchemaVersion
+    ) -> Optional[list[SchemaVersion]]:
+        """Encontra caminho de transformação entre versões"""
+        
+        # Implementação básica - em produção usaria graph search
+        # Assumindo que podemos transformar incrementalmente
+        
+        if from_version == to_version:
+            return []
+        
+        # Ordem das versões
+        version_order = [SchemaVersion.V1, SchemaVersion.V2, SchemaVersion.V3]
+        
+        try:
+            from_idx = version_order.index(from_version)
+            to_idx = version_order.index(to_version)
+        except ValueError:
+            return None
+        
+        if from_idx < to_idx:
+            # Upgrade incremental
+            path = []
+            for i in range(from_idx, to_idx):
+                if self.get_transformer(object_type, version_order[i], version_order[i + 1]):
+                    path.append(version_order[i + 1])
+                else:
+                    return None
+            return path
+        else:
+            # Downgrade incremental
+            path = []
+            for i in range(from_idx, to_idx, -1):
+                if self.get_transformer(object_type, version_order[i], version_order[i - 1]):
+                    path.append(version_order[i - 1])
+                else:
+                    return None
+            return path
+
+
+class VersionedSerializer:
+    """Serializer com suporte a versionamento de schemas"""
+    
+    def __init__(self, registry: Optional[SchemaRegistry] = None):
+        self.registry = registry or SchemaRegistry()
+        self._custom_encoders = {}
+        self._custom_decoders = {}
+        
+        # Registra encoders padrão
+        self._register_default_encoders()
+        self._register_default_decoders()
+    
+    def _register_default_encoders(self):
+        """Registra encoders padrão para tipos comuns"""
+        
+        def datetime_encoder(obj):
+            if isinstance(obj, datetime):
+                return {
+                    "__type__": "datetime",
+                    "value": obj.isoformat()
+                }
+            elif isinstance(obj, date):
+                return {
+                    "__type__": "date",
+                    "value": obj.isoformat()
+                }
+            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+        
+        def enum_encoder(obj):
+            if isinstance(obj, Enum):
+                return {
+                    "__type__": "enum",
+                    "enum_type": type(obj).__name__,
+                    "value": obj.value
+                }
+            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+        
+        self._custom_encoders[datetime] = datetime_encoder
+        self._custom_encoders[date] = datetime_encoder
+        
+        # Para qualquer Enum
+        self._custom_encoders[Enum] = enum_encoder
+    
+    def _register_default_decoders(self):
+        """Registra decoders padrão"""
+        
+        def datetime_decoder(dct):
+            if "__type__" in dct:
+                if dct["__type__"] == "datetime":
+                    return datetime.fromisoformat(dct["value"])
+                elif dct["__type__"] == "date":
+                    return date.fromisoformat(dct["value"])
+                elif dct["__type__"] == "enum":
+                    # Em produção, carregaria a classe do enum
+                    return dct["value"]
+            return dct
+        
+        self._custom_decoders["__default__"] = datetime_decoder
+    
+    def serialize(
+        self,
+        obj: Any,
+        target_version: Optional[SchemaVersion] = None
+    ) -> Dict[str, Any]:
+        """
+        Serializa um objeto para formato versionado.
+        
+        Args:
+            obj: Objeto a serializar
+            target_version: Versão de destino (None para mais recente)
+            
+        Returns:
+            Dicionário com dados serializados e metadados
+        """
+        
+        try:
+            # Determina tipo e versão
+            object_type = type(obj).__name__
+            
+            # Obtém schema de destino
+            if target_version:
+                target_schema = self.registry.get_schema(object_type, target_version)
+                if not target_schema:
+                    raise SerializationError(
+                        f"Schema não encontrado para {object_type}@{target_version}"
+                    )
+            else:
+                latest = self.registry.get_latest_schema(object_type)
+                if not latest:
+                    raise SerializationError(f"Nenhum schema registrado para {object_type}")
+                
+                target_schema, target_version = latest
+            
+            # Converte objeto para dict usando schema
+            data = self._object_to_dict(obj, target_schema)
+            
+            # Calcula checksum
+            checksum = self._calculate_checksum(data)
+            
+            # Cria metadados
+            metadata = SerializationMetadata(
+                schema_version=target_version,
+                object_type=object_type,
+                checksum=checksum,
+                transformer_version="1.0.0"
+            )
+            
+            # Serializa
+            serialized = {
+                "metadata": metadata.to_dict(),
+                "data": data
+            }
+            
+            # Aplica encoders customizados
+            encoded = json.loads(
+                json.dumps(
+                    serialized,
+                    default=self._default_encoder,
+                    separators=(',', ':')
+                )
+            )
+            
+            logger.debug(
+                f"Objeto {object_type} serializado para versão {target_version} "
+                f"(checksum: {checksum[:8]})"
+            )
+            
+            return encoded
+            
+        except Exception as e:
+            logger.error(f"Erro na serialização: {str(e)}")
+            raise SerializationError(f"Falha na serialização: {str(e)}")
+    
+    def deserialize(
+        self,
+        serialized_data: Dict[str, Any],
+        target_type: Optional[Type[T]] = None,
+        target_version: Optional[SchemaVersion] = None
+    ) -> T:
+        """
+        Desserializa dados versionados para objeto.
+        
+        Args:
+            serialized_data: Dados serializados
+            target_type: Tipo esperado do objeto (None para inferir)
+            target_version: Versão de destino (None para mais recente)
+            
+        Returns:
+            Objeto desserializado
+        """
+        
+        try:
+            # Extrai metadados
+            metadata_dict = serialized_data.get("metadata", {})
+            metadata = SerializationMetadata(
+                schema_version=SchemaVersion(metadata_dict.get("schema_version", "v1")),
+                object_type=metadata_dict.get("object_type", ""),
+                serialized_at=datetime.fromisoformat(metadata_dict.get("serialized_at")) if metadata_dict.get("serialized_at") else datetime.utcnow(),
+                checksum=metadata_dict.get("checksum"),
+                transformer_version=metadata_dict.get("transformer_version")
+            )
+            
+            data = serialized_data.get("data", {})
+            
+            # Verifica checksum
+            if metadata.checksum:
+                calculated = self._calculate_checksum(data)
+                if calculated != metadata.checksum:
+                    raise IntegrityError(
+                        f"Checksum inválido: esperado {metadata.checksum[:8]}, "
+                        f"calculado {calculated[:8]}"
+                    )
+            
+            # Determina tipo e versão de destino
+            object_type = metadata.object_type
+            if target_type:
+                object_type = target_type.__name__
+            
+            target_schema_version = target_version or self.registry._default_version
+            
+            # Verifica se precisa transformar
+            if metadata.schema_version != target_schema_version:
+                data = self._transform_data(
+                    data,
+                    object_type,
+                    metadata.schema_version,
+                    target_schema_version
+                )
+            
+            # Obtém schema
+            schema = self.registry.get_schema(object_type, target_schema_version)
+            if not schema:
+                raise SerializationError(
+                    f"Schema não encontrado para {object_type}@{target_schema_version}"
+                )
+            
+            # Aplica decoders customizados
+            decoded_data = json.loads(
+                json.dumps(data),
+                object_hook=self._default_decoder
+            )
+            
+            # Converte dict para objeto
+            obj = self._dict_to_object(decoded_data, schema)
+            
+            logger.debug(
+                f"Dados desserializados para {object_type}@{target_schema_version} "
+                f"(original: {metadata.schema_version})"
+            )
+            
+            return obj
+            
+        except IntegrityError:
+            raise
+        except Exception as e:
+            logger.error(f"Erro na desserialização: {str(e)}")
+            raise DeserializationError(f"Falha na desserialização: {str(e)}")
+    
+    def _object_to_dict(self, obj: Any, schema: Type) -> Dict[str, Any]:
+        """Converte objeto para dicionário usando schema"""
+        
+        if hasattr(obj, '__dict__'):
+            # Objeto regular
+            return {k: v for k, v in obj.__dict__.items() if not k.startswith('_')}
+        
+        elif hasattr(obj, '_asdict'):
+            # Namedtuple
+            return obj._asdict()
+        
+        elif isinstance(obj, dict):
+            # Já é dict
+            return obj
+        
+        else:
+            # Tenta usar asdict de dataclasses
+            try:
+                return asdict(obj)
+            except:
+                raise SerializationError(f"Não é possível converter {type(obj)} para dict")
+    
+    def _dict_to_object(self, data: Dict[str, Any], schema: Type) -> Any:
+        """Converte dicionário para objeto usando schema"""
+        
+        # Verifica se schema é dataclass
+        if hasattr(schema, '__dataclass_fields__'):
+            # Filtra campos do schema
+            schema_fields = {f.name for f in fields(schema)}
+            filtered_data = {k: v for k, v in data.items() if k in schema_fields}
+            
+            # Tenta criar instância
+            try:
+                return schema(**filtered_data)
+            except Exception as e:
+                raise DeserializationError(f"Erro ao criar {schema.__name__}: {str(e)}")
+        
+        # Schema regular com __init__
+        elif hasattr(schema, '__init__'):
+            try:
+                return schema(**data)
+            except Exception as e:
+                raise DeserializationError(f"Erro ao criar {schema.__name__}: {str(e)}")
+        
+        else:
+            raise DeserializationError(f"Schema não suportado: {schema}")
+    
+    def _transform_data(
+        self,
+        data: Dict[str, Any],
+        object_type: str,
+        from_version: SchemaVersion,
+        to_version: SchemaVersion
+    ) -> Dict[str, Any]:
+        """Transforma dados entre versões de schema"""
+        
+        if from_version == to_version:
+            return data
+        
+        # Encontra caminho de transformação
+        path = self.registry.find_transformation_path(object_type, from_version, to_version)
+        
+        if not path:
+            raise TransformationError(
+                f"Não há caminho de transformação de {from_version} para {to_version} "
+                f"para {object_type}"
+            )
+        
+        # Aplica transformações sequenciais
+        current_data = data
+        current_version = from_version
+        
+        for next_version in path:
+            transformer = self.registry.get_transformer(
+                object_type, current_version, next_version
+            )
+            
+            if not transformer:
+                raise TransformationError(
+                    f"Transformer não encontrado: {object_type} "
+                    f"{current_version}->{next_version}"
+                )
+            
+            current_data = transformer.transform(current_data)
+            current_version = next_version
+        
+        return current_data
+    
+    def _calculate_checksum(self, data: Dict[str, Any]) -> str:
+        """Calcula checksum SHA-256 dos dados"""
+        
+        # Serializa deterministicamente
+        serialized = json.dumps(data, sort_keys=True, default=str)
+        
+        # Calcula hash
+        return hashlib.sha256(serialized.encode()).hexdigest()
+    
+    def _default_encoder(self, obj):
+        """Encoder padrão com suporte a tipos customizados"""
+        
+        # Tenta encoders customizados
+        for obj_type, encoder in self._custom_encoders.items():
+            if isinstance(obj, obj_type) or (obj_type == Enum and isinstance(obj, Enum)):
+                return encoder(obj)
+        
+        # Fallback para tipos básicos
+        if hasattr(obj, 'isoformat'):
+            return obj.isoformat()
+        
+        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+    
+    def _default_decoder(self, dct):
+        """Decoder padrão com suporte a tipos customizados"""
+        
+        if "__type__" in dct:
+            # Tenta decoder customizado
+            decoder = self._custom_decoders.get("__default__")
+            if decoder:
+                result = decoder(dct)
+                if result is not dct:
+                    return result
+        
+        return dct
+    
+    def register_custom_encoder(self, obj_type: Type, encoder: callable):
+        """Registra encoder customizado para um tipo"""
+        self._custom_encoders[obj_type] = encoder
+    
+    def register_custom_decoder(self, type_name: str, decoder: callable):
+        """Registra decoder customizado para um tipo"""
+        self._custom_decoders[type_name] = decoder
+
+
+# Transformadores de exemplo
+class V1ToV2Transformer(SchemaTransformer):
+    """Transforma de schema V1 para V2"""
+    
+    def can_transform(self, from_version: SchemaVersion, to_version: SchemaVersion) -> bool:
+        return from_version == SchemaVersion.V1 and to_version == SchemaVersion.V2
+    
+    def transform(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Exemplo: renomeia campo 'user' para 'user_id'"""
+        
+        transformed = data.copy()
+        
+        if "user" in transformed:
+            transformed["user_id"] = transformed.pop("user")
+        
+        # Adiciona timestamp se não existir
+        if "timestamp" not in transformed:
+            transformed["timestamp"] = datetime.utcnow().isoformat()
+        
+        return transformed
+
+
+class V2ToV3Transformer(SchemaTransformer):
+    """Transforma de schema V2 para V3"""
+    
+    def can_transform(self, from_version: SchemaVersion, to_version: SchemaVersion) -> bool:
+        return from_version == SchemaVersion.V2 and to_version == SchemaVersion.V3
+    
+    def transform(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Exemplo: converte 'amount' de string para float"""
+        
+        transformed = data.copy()
+        
+        if "amount" in transformed and isinstance(transformed["amount"], str):
+            try:
+                transformed["amount"] = float(transformed["amount"])
+            except ValueError:
+                transformed["amount"] = 0.0
+        
+        # Adiciona versão do schema
+        transformed["_schema_version"] = "v3"
+        
+        return transformed
+
+
+# Exceções
+class SerializationError(Exception):
+    """Erro na serialização"""
+    pass
+
+class DeserializationError(SerializationError):
+    """Erro na desserialização"""
+    pass
+
+class TransformationError(SerializationError):
+    """Erro na transformação de schema"""
+    pass
+
+class IntegrityError(SerializationError):
+    """Erro na verificação de integridade"""
+    pass
+
+
+# Singleton global
+_serializer_instance: Optional[VersionedSerializer] = None
+
+def get_serializer() -> VersionedSerializer:
+    """Retorna instância singleton do serializer"""
+    global _serializer_instance
+    
+    if _serializer_instance is None:
+        registry = SchemaRegistry()
+        
+        # Registra transformadores padrão
+        registry.register_transformer(
+            "QueueMessage",
+            SchemaVersion.V1,
+            SchemaVersion.V2,
+            V1ToV2Transformer()
+        )
+        
+        registry.register_transformer(
+            "QueueMessage", 
+            SchemaVersion.V2,
+            SchemaVersion.V3,
+            V2ToV3Transformer()
+        )
+        
+        _serializer_instance = VersionedSerializer(registry)
+    
+    return _serializer_instance

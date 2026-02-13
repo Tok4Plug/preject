@@ -1,0 +1,1510 @@
+"""
+Billing Engine - Sistema de faturamento multi-tenant com invoices, pagamentos e reembolsos.
+Integração completa com Payment Engine e Subscription Engine.
+"""
+
+from datetime import datetime, timedelta
+from decimal import Decimal
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Any, Set
+from dataclasses import dataclass, field
+import asyncio
+import json
+import uuid
+from collections import defaultdict
+
+from app.core.state_machine import StateMachine, StateTransitionError
+from app.core.audit_logger import AuditLogger
+from app.core.plan_catalog import PlanCatalog, PlanVersion, BillingCycle
+from app.models.subscription import Subscription
+from app.engines.payment_engine import PaymentEngine, PaymentRail, PaymentIntent
+
+
+class InvoiceStatus(Enum):
+    """Status de uma fatura."""
+    DRAFT = "draft"
+    OPEN = "open"
+    PAID = "paid"
+    VOID = "void"
+    UNCOLLECTIBLE = "uncollectible"
+    REFUNDED = "refunded"
+    PARTIALLY_REFUNDED = "partially_refunded"
+    DISPUTED = "disputed"
+
+
+class InvoiceType(Enum):
+    """Tipo de fatura."""
+    SUBSCRIPTION = "subscription"
+    ONE_TIME = "one_time"
+    CREDIT = "credit"
+    REFUND = "refund"
+    ADJUSTMENT = "adjustment"
+
+
+class PaymentStatus(Enum):
+    """Status de um pagamento."""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    REFUNDED = "refunded"
+    PARTIALLY_REFUNDED = "partially_refunded"
+    DISPUTED = "disputed"
+
+
+@dataclass
+class InvoiceLineItem:
+    """Item de linha de uma fatura."""
+    item_id: str
+    description: str
+    quantity: int
+    unit_amount: Decimal
+    amount: Decimal
+    tax_rate: Optional[Decimal] = None
+    tax_amount: Optional[Decimal] = None
+    discount_rate: Optional[Decimal] = None
+    discount_amount: Optional[Decimal] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    @property
+    def total_amount(self) -> Decimal:
+        """Calcula valor total do item."""
+        total = self.amount
+        if self.tax_amount:
+            total += self.tax_amount
+        if self.discount_amount:
+            total -= self.discount_amount
+        return total
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "item_id": self.item_id,
+            "description": self.description,
+            "quantity": self.quantity,
+            "unit_amount": str(self.unit_amount),
+            "amount": str(self.amount),
+            "tax_rate": str(self.tax_rate) if self.tax_rate else None,
+            "tax_amount": str(self.tax_amount) if self.tax_amount else None,
+            "discount_rate": str(self.discount_rate) if self.discount_rate else None,
+            "discount_amount": str(self.discount_amount) if self.discount_amount else None,
+            "total_amount": str(self.total_amount),
+            "metadata": self.metadata
+        }
+
+
+@dataclass
+class Invoice:
+    """Modelo de fatura."""
+    # Identificadores
+    invoice_id: str
+    tenant_id: str
+    subscription_id: Optional[str] = None
+    user_id: Optional[str] = None
+    
+    # Informações
+    invoice_number: str  # Número sequencial por tenant
+    invoice_type: InvoiceType
+    status: InvoiceStatus
+    
+    # Período
+    period_start: Optional[datetime] = None
+    period_end: Optional[datetime] = None
+    invoice_date: datetime = field(default_factory=datetime.utcnow)
+    due_date: Optional[datetime] = None
+    
+    # Valores
+    currency: str = "USD"
+    subtotal: Decimal = Decimal("0.00")
+    tax_total: Decimal = Decimal("0.00")
+    discount_total: Decimal = Decimal("0.00")
+    total_amount: Decimal = Decimal("0.00")
+    amount_paid: Decimal = Decimal("0.00")
+    amount_due: Decimal = Decimal("0.00")
+    amount_refunded: Decimal = Decimal("0.00")
+    
+    # Itens
+    line_items: List[InvoiceLineItem] = field(default_factory=list)
+    
+    # Pagamentos
+    payment_intent_id: Optional[str] = None
+    payment_method: Optional[str] = None
+    
+    # Datas importantes
+    paid_at: Optional[datetime] = None
+    voided_at: Optional[datetime] = None
+    refunded_at: Optional[datetime] = None
+    
+    # Metadados
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    notes: Optional[str] = None
+    
+    # Audit
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def calculate_totals(self):
+        """Calcula totais da fatura."""
+        self.subtotal = Decimal("0.00")
+        self.tax_total = Decimal("0.00")
+        self.discount_total = Decimal("0.00")
+        
+        for item in self.line_items:
+            self.subtotal += item.amount
+            if item.tax_amount:
+                self.tax_total += item.tax_amount
+            if item.discount_amount:
+                self.discount_total += item.discount_amount
+        
+        self.total_amount = self.subtotal + self.tax_total - self.discount_total
+        self.amount_due = self.total_amount - self.amount_paid - self.amount_refunded
+        
+        # Atualiza status baseado nos valores
+        if self.amount_due <= Decimal("0.00") and self.status == InvoiceStatus.OPEN:
+            self.status = InvoiceStatus.PAID
+            self.paid_at = datetime.utcnow()
+        elif self.amount_due > Decimal("0.00") and self.status == InvoiceStatus.PAID:
+            self.status = InvoiceStatus.OPEN
+            self.paid_at = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "invoice_id": self.invoice_id,
+            "tenant_id": self.tenant_id,
+            "subscription_id": self.subscription_id,
+            "user_id": self.user_id,
+            "invoice_number": self.invoice_number,
+            "invoice_type": self.invoice_type.value,
+            "status": self.status.value,
+            "period_start": self.period_start.isoformat() if self.period_start else None,
+            "period_end": self.period_end.isoformat() if self.period_end else None,
+            "invoice_date": self.invoice_date.isoformat(),
+            "due_date": self.due_date.isoformat() if self.due_date else None,
+            "currency": self.currency,
+            "subtotal": str(self.subtotal),
+            "tax_total": str(self.tax_total),
+            "discount_total": str(self.discount_total),
+            "total_amount": str(self.total_amount),
+            "amount_paid": str(self.amount_paid),
+            "amount_due": str(self.amount_due),
+            "amount_refunded": str(self.amount_refunded),
+            "line_items": [item.to_dict() for item in self.line_items],
+            "payment_intent_id": self.payment_intent_id,
+            "payment_method": self.payment_method,
+            "paid_at": self.paid_at.isoformat() if self.paid_at else None,
+            "voided_at": self.voided_at.isoformat() if self.voided_at else None,
+            "refunded_at": self.refunded_at.isoformat() if self.refunded_at else None,
+            "metadata": self.metadata,
+            "notes": self.notes,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat()
+        }
+
+
+@dataclass
+class Payment:
+    """Modelo de pagamento."""
+    payment_id: str
+    tenant_id: str
+    invoice_id: str
+    user_id: Optional[str] = None
+    
+    # Informações do pagamento
+    status: PaymentStatus
+    amount: Decimal
+    currency: str
+    payment_method: str
+    provider_id: str
+    provider_reference: str
+    
+    # Detalhes
+    fee_amount: Decimal = Decimal("0.00")
+    net_amount: Decimal = Decimal("0.00")
+    description: Optional[str] = None
+    
+    # Datas
+    payment_date: datetime = field(default_factory=datetime.utcnow)
+    settled_at: Optional[datetime] = None
+    refunded_at: Optional[datetime] = None
+    
+    # Metadados
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # Audit
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class Refund:
+    """Modelo de reembolso."""
+    refund_id: str
+    tenant_id: str
+    payment_id: str
+    invoice_id: str
+    
+    # Informações
+    amount: Decimal
+    currency: str
+    reason: str
+    status: str  # pending, processed, failed
+    
+    # Detalhes
+    provider_id: str
+    provider_reference: str
+    
+    # Metadados
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # Datas
+    requested_at: datetime = field(default_factory=datetime.utcnow)
+    processed_at: Optional[datetime] = None
+    
+    # Audit
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+class BillingEngine:
+    """
+    Engine de faturamento completo com invoices, pagamentos e reembolsos.
+    Integração com Payment Engine para processamento e Subscription Engine para ciclo de vida.
+    """
+    
+    def __init__(
+        self,
+        db_pool,
+        audit_logger: AuditLogger,
+        payment_engine: PaymentEngine,
+        plan_catalog: PlanCatalog,
+        redis_client=None
+    ):
+        """
+        Inicializa o Billing Engine.
+        
+        Args:
+            db_pool: Pool de conexões com banco
+            audit_logger: Logger de auditoria
+            payment_engine: Engine de pagamentos
+            plan_catalog: Catálogo de planos
+            redis_client: Cliente Redis (opcional)
+        """
+        self.db_pool = db_pool
+        self.audit_logger = audit_logger
+        self.payment_engine = payment_engine
+        self.plan_catalog = plan_catalog
+        self.redis = redis_client
+        
+        # Cache de invoices
+        self.invoice_cache: Dict[str, Invoice] = {}
+        
+        # Sequencial de invoice por tenant
+        self.invoice_counters: Dict[str, int] = defaultdict(int)
+        
+        # Máquina de estados para invoices
+        self.invoice_state_machine = StateMachine(
+            initial_states=[InvoiceStatus.DRAFT.value],
+            transitions={
+                InvoiceStatus.DRAFT.value: [
+                    InvoiceStatus.OPEN.value,
+                    InvoiceStatus.VOID.value
+                ],
+                InvoiceStatus.OPEN.value: [
+                    InvoiceStatus.PAID.value,
+                    InvoiceStatus.VOID.value,
+                    InvoiceStatus.UNCOLLECTIBLE.value,
+                    InvoiceStatus.DISPUTED.value
+                ],
+                InvoiceStatus.PAID.value: [
+                    InvoiceStatus.REFUNDED.value,
+                    InvoiceStatus.PARTIALLY_REFUNDED.value,
+                    InvoiceStatus.DISPUTED.value
+                ],
+                InvoiceStatus.VOID.value: [],
+                InvoiceStatus.UNCOLLECTIBLE.value: [],
+                InvoiceStatus.REFUNDED.value: [],
+                InvoiceStatus.PARTIALLY_REFUNDED.value: [
+                    InvoiceStatus.REFUNDED.value
+                ],
+                InvoiceStatus.DISPUTED.value: [
+                    InvoiceStatus.PAID.value,
+                    InvoiceStatus.REFUNDED.value,
+                    InvoiceStatus.VOID.value
+                ]
+            },
+            state_field="status",
+            resource_id_field="invoice_id"
+        )
+        
+        # Carrega contadores de invoice
+        asyncio.create_task(self._load_invoice_counters())
+    
+    async def _load_invoice_counters(self):
+        """Carrega os contadores de invoice de cada tenant."""
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT tenant_id, MAX(invoice_number) as last_number
+                FROM invoices 
+                WHERE invoice_number ~ '^[0-9]+$'
+                GROUP BY tenant_id
+                """
+            )
+            
+            for row in rows:
+                tenant_id = row["tenant_id"]
+                last_number = int(row["last_number"]) if row["last_number"] else 0
+                self.invoice_counters[tenant_id] = last_number
+    
+    async def create_invoice_for_subscription(
+        self,
+        subscription: Subscription,
+        period_start: Optional[datetime] = None,
+        period_end: Optional[datetime] = None,
+        created_by: str = "system"
+    ) -> Tuple[bool, Optional[Invoice], List[str]]:
+        """
+        Cria uma fatura para uma assinatura.
+        
+        Args:
+            subscription: Assinatura
+            period_start: Início do período (opcional)
+            period_end: Fim do período (opcional)
+            created_by: Quem criou
+            
+        Returns:
+            Tuple[success, invoice, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Busca plano da assinatura
+                    plan = await self.plan_catalog.get_plan_version(
+                        subscription.tenant_id,
+                        subscription.plan_id,
+                        subscription.plan_version
+                    )
+                    
+                    if not plan:
+                        return False, None, [f"Plan not found: {subscription.plan_id}:{subscription.plan_version}"]
+                    
+                    # Determina período
+                    if not period_start:
+                        period_start = subscription.current_period_start
+                    
+                    if not period_end:
+                        period_end = subscription.current_period_end
+                    
+                    # Calcula data de vencimento (7 dias após emissão)
+                    invoice_date = datetime.utcnow()
+                    due_date = invoice_date + timedelta(days=7)
+                    
+                    # Gera número de invoice
+                    invoice_number = await self._generate_invoice_number(
+                        subscription.tenant_id
+                    )
+                    
+                    # Cria invoice
+                    invoice_id = f"inv_{uuid.uuid4().hex[:12]}"
+                    
+                    # Calcula itens baseados no plano
+                    line_items = await self._calculate_subscription_line_items(
+                        plan, subscription, period_start, period_end
+                    )
+                    
+                    invoice = Invoice(
+                        invoice_id=invoice_id,
+                        tenant_id=subscription.tenant_id,
+                        subscription_id=subscription.subscription_id,
+                        user_id=subscription.user_id,
+                        invoice_number=invoice_number,
+                        invoice_type=InvoiceType.SUBSCRIPTION,
+                        status=InvoiceStatus.DRAFT,
+                        period_start=period_start,
+                        period_end=period_end,
+                        invoice_date=invoice_date,
+                        due_date=due_date,
+                        currency=subscription.metadata.get("currency", "USD"),
+                        line_items=line_items
+                    )
+                    
+                    # Calcula totais
+                    invoice.calculate_totals()
+                    
+                    # Persiste
+                    await self._save_invoice(conn, invoice)
+                    
+                    # Atualiza para OPEN
+                    await self._update_invoice_status(
+                        conn, invoice, InvoiceStatus.OPEN,
+                        created_by, "Invoice created for subscription"
+                    )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=subscription.tenant_id,
+                        user_id=subscription.user_id,
+                        action="invoice.created",
+                        resource_type="invoice",
+                        resource_id=invoice_id,
+                        changes={
+                            "subscription_id": subscription.subscription_id,
+                            "amount": str(invoice.total_amount),
+                            "currency": invoice.currency,
+                            "period": f"{period_start.date()} to {period_end.date()}"
+                        },
+                        metadata=invoice.to_dict()
+                    )
+                    
+                    return True, invoice, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def create_one_time_invoice(
+        self,
+        tenant_id: str,
+        user_id: str,
+        description: str,
+        amount: Decimal,
+        currency: str = "USD",
+        metadata: Optional[Dict[str, Any]] = None,
+        created_by: str = "system"
+    ) -> Tuple[bool, Optional[Invoice], List[str]]:
+        """
+        Cria uma fatura avulsa (não associada a assinatura).
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário
+            description: Descrição
+            amount: Valor
+            currency: Moeda
+            metadata: Metadados
+            created_by: Quem criou
+            
+        Returns:
+            Tuple[success, invoice, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Gera número de invoice
+                    invoice_number = await self._generate_invoice_number(tenant_id)
+                    
+                    # Cria invoice
+                    invoice_id = f"inv_{uuid.uuid4().hex[:12]}"
+                    invoice_date = datetime.utcnow()
+                    due_date = invoice_date + timedelta(days=7)
+                    
+                    # Cria item
+                    item = InvoiceLineItem(
+                        item_id=f"item_{uuid.uuid4().hex[:8]}",
+                        description=description,
+                        quantity=1,
+                        unit_amount=amount,
+                        amount=amount
+                    )
+                    
+                    invoice = Invoice(
+                        invoice_id=invoice_id,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        invoice_number=invoice_number,
+                        invoice_type=InvoiceType.ONE_TIME,
+                        status=InvoiceStatus.DRAFT,
+                        invoice_date=invoice_date,
+                        due_date=due_date,
+                        currency=currency,
+                        line_items=[item],
+                        metadata=metadata or {}
+                    )
+                    
+                    # Calcula totais
+                    invoice.calculate_totals()
+                    
+                    # Persiste
+                    await self._save_invoice(conn, invoice)
+                    
+                    # Atualiza para OPEN
+                    await self._update_invoice_status(
+                        conn, invoice, InvoiceStatus.OPEN,
+                        created_by, "One-time invoice created"
+                    )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        action="invoice.created.one_time",
+                        resource_type="invoice",
+                        resource_id=invoice_id,
+                        changes={
+                            "amount": str(amount),
+                            "currency": currency,
+                            "description": description
+                        },
+                        metadata=invoice.to_dict()
+                    )
+                    
+                    return True, invoice, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def process_invoice_payment(
+        self,
+        tenant_id: str,
+        invoice_id: str,
+        payment_method: str,
+        payment_intent_id: Optional[str] = None,
+        processed_by: str = "system"
+    ) -> Tuple[bool, Optional[Payment], List[str]]:
+        """
+        Processa pagamento de uma fatura.
+        
+        Args:
+            tenant_id: ID do tenant
+            invoice_id: ID da fatura
+            payment_method: Método de pagamento
+            payment_intent_id: ID do payment intent (se já existir)
+            processed_by: Quem processou
+            
+        Returns:
+            Tuple[success, payment, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Busca invoice
+                    invoice = await self._get_invoice(conn, tenant_id, invoice_id)
+                    if not invoice:
+                        return False, None, [f"Invoice not found: {invoice_id}"]
+                    
+                    # Verifica se já está paga
+                    if invoice.status == InvoiceStatus.PAID:
+                        return False, None, ["Invoice already paid"]
+                    
+                    # Verifica se está aberta
+                    if invoice.status != InvoiceStatus.OPEN:
+                        return False, None, [f"Cannot pay invoice with status {invoice.status.value}"]
+                    
+                    # Se não tem payment intent, cria um
+                    if not payment_intent_id:
+                        # Cria payment intent via Payment Engine
+                        # (em produção, integraria com payment_engine.create_payment_intent)
+                        payment_intent_id = f"pi_{uuid.uuid4().hex[:12]}"
+                    
+                    # Processa pagamento (mock)
+                    payment_result = await self._mock_process_payment(
+                        invoice, payment_method, payment_intent_id
+                    )
+                    
+                    if not payment_result.success:
+                        return False, None, [payment_result.error_message or "Payment failed"]
+                    
+                    # Cria registro de pagamento
+                    payment_id = f"pay_{uuid.uuid4().hex[:12]}"
+                    payment = Payment(
+                        payment_id=payment_id,
+                        tenant_id=tenant_id,
+                        invoice_id=invoice_id,
+                        user_id=invoice.user_id,
+                        status=PaymentStatus.COMPLETED,
+                        amount=invoice.total_amount,
+                        currency=invoice.currency,
+                        payment_method=payment_method,
+                        provider_id=payment_result.provider_id,
+                        provider_reference=payment_result.provider_reference,
+                        fee_amount=Decimal("0.00"),  # Em produção calcularia
+                        net_amount=invoice.total_amount,
+                        description=f"Payment for invoice {invoice.invoice_number}",
+                        metadata=payment_result.provider_metadata
+                    )
+                    
+                    # Persiste pagamento
+                    await self._save_payment(conn, payment)
+                    
+                    # Atualiza invoice
+                    invoice.amount_paid = invoice.total_amount
+                    invoice.payment_intent_id = payment_intent_id
+                    invoice.payment_method = payment_method
+                    invoice.paid_at = datetime.utcnow()
+                    
+                    await self._update_invoice_status(
+                        conn, invoice, InvoiceStatus.PAID,
+                        processed_by, f"Payment processed: {payment_id}"
+                    )
+                    
+                    # Atualiza invoice no banco
+                    await conn.execute(
+                        """
+                        UPDATE invoices 
+                        SET amount_paid = $1, payment_intent_id = $2,
+                            payment_method = $3, paid_at = $4,
+                            updated_at = $5
+                        WHERE invoice_id = $6
+                        """,
+                        str(invoice.amount_paid),
+                        invoice.payment_intent_id,
+                        invoice.payment_method,
+                        invoice.paid_at,
+                        datetime.utcnow(),
+                        invoice_id
+                    )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=invoice.user_id,
+                        action="invoice.paid",
+                        resource_type="invoice",
+                        resource_id=invoice_id,
+                        changes={
+                            "payment_id": payment_id,
+                            "amount": str(invoice.total_amount),
+                            "payment_method": payment_method,
+                            "provider": payment_result.provider_id
+                        },
+                        metadata={
+                            "payment": payment_result.to_dict(),
+                            "invoice": invoice.to_dict()
+                        }
+                    )
+                    
+                    return True, payment, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def process_refund(
+        self,
+        tenant_id: str,
+        payment_id: str,
+        amount: Decimal,
+        reason: str,
+        processed_by: str = "system"
+    ) -> Tuple[bool, Optional[Refund], List[str]]:
+        """
+        Processa reembolso de um pagamento.
+        
+        Args:
+            tenant_id: ID do tenant
+            payment_id: ID do pagamento
+            amount: Valor a reembolsar
+            reason: Motivo do reembolso
+            processed_by: Quem processou
+            
+        Returns:
+            Tuple[success, refund, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Busca pagamento
+                    payment = await self._get_payment(conn, payment_id)
+                    if not payment or payment.tenant_id != tenant_id:
+                        return False, None, [f"Payment not found: {payment_id}"]
+                    
+                    # Busca invoice
+                    invoice = await self._get_invoice(conn, tenant_id, payment.invoice_id)
+                    if not invoice:
+                        return False, None, [f"Invoice not found: {payment.invoice_id}"]
+                    
+                    # Verifica se pode reembolsar
+                    if payment.status != PaymentStatus.COMPLETED:
+                        return False, None, [f"Cannot refund payment with status {payment.status.value}"]
+                    
+                    # Verifica valor
+                    max_refund = payment.amount - invoice.amount_refunded
+                    if amount > max_refund:
+                        return False, None, [
+                            f"Cannot refund {amount}, maximum refundable is {max_refund}"
+                        ]
+                    
+                    # Processa reembolso (mock)
+                    refund_result = await self._mock_process_refund(
+                        payment, amount, reason
+                    )
+                    
+                    if not refund_result["success"]:
+                        return False, None, [refund_result.get("error", "Refund failed")]
+                    
+                    # Cria registro de reembolso
+                    refund_id = f"ref_{uuid.uuid4().hex[:12]}"
+                    refund = Refund(
+                        refund_id=refund_id,
+                        tenant_id=tenant_id,
+                        payment_id=payment_id,
+                        invoice_id=payment.invoice_id,
+                        amount=amount,
+                        currency=payment.currency,
+                        reason=reason,
+                        status="processed",
+                        provider_id=payment.provider_id,
+                        provider_reference=refund_result["provider_reference"],
+                        metadata=refund_result.get("metadata", {})
+                    )
+                    
+                    # Persiste reembolso
+                    await self._save_refund(conn, refund)
+                    
+                    # Atualiza invoice
+                    invoice.amount_refunded += amount
+                    invoice.amount_paid -= amount
+                    
+                    # Atualiza status da invoice
+                    if invoice.amount_refunded >= invoice.total_amount:
+                        new_status = InvoiceStatus.REFUNDED
+                    elif invoice.amount_refunded > Decimal("0.00"):
+                        new_status = InvoiceStatus.PARTIALLY_REFUNDED
+                    else:
+                        new_status = InvoiceStatus.PAID
+                    
+                    await self._update_invoice_status(
+                        conn, invoice, new_status,
+                        processed_by, f"Refund processed: {refund_id}"
+                    )
+                    
+                    # Atualiza invoice no banco
+                    await conn.execute(
+                        """
+                        UPDATE invoices 
+                        SET amount_refunded = $1, amount_paid = $2,
+                            refunded_at = $3, updated_at = $4
+                        WHERE invoice_id = $5
+                        """,
+                        str(invoice.amount_refunded),
+                        str(invoice.amount_paid),
+                        datetime.utcnow(),
+                        datetime.utcnow(),
+                        payment.invoice_id
+                    )
+                    
+                    # Atualiza pagamento
+                    payment.refunded_at = datetime.utcnow()
+                    if invoice.amount_refunded >= payment.amount:
+                        payment.status = PaymentStatus.REFUNDED
+                    else:
+                        payment.status = PaymentStatus.PARTIALLY_REFUNDED
+                    
+                    await conn.execute(
+                        """
+                        UPDATE payments 
+                        SET status = $1, refunded_at = $2, updated_at = $3
+                        WHERE payment_id = $4
+                        """,
+                        payment.status.value,
+                        payment.refunded_at,
+                        datetime.utcnow(),
+                        payment_id
+                    )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=payment.user_id,
+                        action="invoice.refunded",
+                        resource_type="invoice",
+                        resource_id=payment.invoice_id,
+                        changes={
+                            "refund_id": refund_id,
+                            "amount": str(amount),
+                            "reason": reason,
+                            "new_status": new_status.value
+                        },
+                        metadata={
+                            "refund": refund_result,
+                            "invoice": invoice.to_dict()
+                        }
+                    )
+                    
+                    return True, refund, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def void_invoice(
+        self,
+        tenant_id: str,
+        invoice_id: str,
+        reason: str,
+        voided_by: str = "system"
+    ) -> Tuple[bool, Optional[Invoice], List[str]]:
+        """
+        Cancela uma fatura (void).
+        
+        Args:
+            tenant_id: ID do tenant
+            invoice_id: ID da fatura
+            reason: Motivo do cancelamento
+            voided_by: Quem cancelou
+            
+        Returns:
+            Tuple[success, invoice, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    invoice = await self._get_invoice(conn, tenant_id, invoice_id)
+                    if not invoice:
+                        return False, None, [f"Invoice not found: {invoice_id}"]
+                    
+                    # Verifica se pode cancelar
+                    if invoice.status in [InvoiceStatus.PAID, InvoiceStatus.REFUNDED]:
+                        return False, None, [
+                            f"Cannot void invoice with status {invoice.status.value}"
+                        ]
+                    
+                    # Atualiza status
+                    await self._update_invoice_status(
+                        conn, invoice, InvoiceStatus.VOID,
+                        voided_by, reason
+                    )
+                    
+                    # Atualiza data de cancelamento
+                    invoice.voided_at = datetime.utcnow()
+                    await conn.execute(
+                        """
+                        UPDATE invoices 
+                        SET voided_at = $1, updated_at = $2
+                        WHERE invoice_id = $3
+                        """,
+                        invoice.voided_at,
+                        datetime.utcnow(),
+                        invoice_id
+                    )
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=invoice.user_id,
+                        action="invoice.voided",
+                        resource_type="invoice",
+                        resource_id=invoice_id,
+                        changes={
+                            "reason": reason,
+                            "previous_status": invoice.status.value
+                        }
+                    )
+                    
+                    return True, invoice, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def get_invoice(
+        self,
+        tenant_id: str,
+        invoice_id: str
+    ) -> Optional[Invoice]:
+        """Obtém uma fatura."""
+        async with self.db_pool.acquire() as conn:
+            return await self._get_invoice(conn, tenant_id, invoice_id)
+    
+    async def get_user_invoices(
+        self,
+        tenant_id: str,
+        user_id: str,
+        status: Optional[InvoiceStatus] = None,
+        limit: int = 100,
+        offset: int = 0
+    ) -> List[Invoice]:
+        """
+        Lista faturas de um usuário.
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário
+            status: Filtro por status
+            limit: Limite de resultados
+            offset: Offset
+            
+        Returns:
+            Lista de faturas
+        """
+        async with self.db_pool.acquire() as conn:
+            query = """
+                SELECT * FROM invoices 
+                WHERE tenant_id = $1 AND user_id = $2
+            """
+            params = [tenant_id, user_id]
+            
+            if status:
+                query += " AND status = $3"
+                params.append(status.value)
+            
+            query += " ORDER BY invoice_date DESC LIMIT $4 OFFSET $5"
+            params.extend([limit, offset])
+            
+            rows = await conn.fetch(query, *params)
+            return [self._row_to_invoice(row) for row in rows]
+    
+    async def get_overdue_invoices(
+        self,
+        days_overdue: int = 7,
+        limit: int = 100
+    ) -> List[Invoice]:
+        """
+        Obtém faturas em atraso.
+        
+        Args:
+            days_overdue: Dias de atraso
+            limit: Limite de resultados
+            
+        Returns:
+            Lista de faturas
+        """
+        async with self.db_pool.acquire() as conn:
+            cutoff_date = datetime.utcnow() - timedelta(days=days_overdue)
+            
+            rows = await conn.fetch(
+                """
+                SELECT * FROM invoices 
+                WHERE status = 'open'
+                  AND due_date < $1
+                  AND amount_due > 0
+                ORDER BY due_date ASC
+                LIMIT $2
+                """,
+                cutoff_date, limit
+            )
+            
+            return [self._row_to_invoice(row) for row in rows]
+    
+    async def get_billing_stats(
+        self,
+        tenant_id: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> Dict[str, Any]:
+        """
+        Obtém estatísticas de faturamento.
+        
+        Args:
+            tenant_id: ID do tenant
+            start_date: Data inicial
+            end_date: Data final
+            
+        Returns:
+            Estatísticas
+        """
+        async with self.db_pool.acquire() as conn:
+            # Receita total
+            total_revenue = await conn.fetchval(
+                """
+                SELECT COALESCE(SUM(total_amount), 0) FROM invoices 
+                WHERE tenant_id = $1 
+                  AND invoice_date BETWEEN $2 AND $3
+                  AND status IN ('paid', 'partially_refunded')
+                """,
+                tenant_id, start_date, end_date
+            ) or Decimal("0.00")
+            
+            # Receita por tipo
+            revenue_by_type = await conn.fetch(
+                """
+                SELECT invoice_type, COALESCE(SUM(total_amount), 0) as amount
+                FROM invoices 
+                WHERE tenant_id = $1 
+                  AND invoice_date BETWEEN $2 AND $3
+                  AND status IN ('paid', 'partially_refunded')
+                GROUP BY invoice_type
+                """,
+                tenant_id, start_date, end_date
+            )
+            
+            # Faturas emitidas
+            invoices_issued = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM invoices 
+                WHERE tenant_id = $1 
+                  AND invoice_date BETWEEN $2 AND $3
+                """,
+                tenant_id, start_date, end_date
+            ) or 0
+            
+            # Faturas pagas
+            invoices_paid = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM invoices 
+                WHERE tenant_id = $1 
+                  AND invoice_date BETWEEN $2 AND $3
+                  AND status IN ('paid', 'partially_refunded')
+                """,
+                tenant_id, start_date, end_date
+            ) or 0
+            
+            # Taxa de conversão
+            conversion_rate = (
+                (invoices_paid / invoices_issued * 100)
+                if invoices_issued > 0 else 0
+            )
+            
+            # Receita recorrente (assinaturas)
+            recurring_revenue = await conn.fetchval(
+                """
+                SELECT COALESCE(SUM(total_amount), 0) FROM invoices 
+                WHERE tenant_id = $1 
+                  AND invoice_date BETWEEN $2 AND $3
+                  AND invoice_type = 'subscription'
+                  AND status IN ('paid', 'partially_refunded')
+                """,
+                tenant_id, start_date, end_date
+            ) or Decimal("0.00")
+            
+            # Churn (assinaturas canceladas)
+            churned_subscriptions = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM subscriptions 
+                WHERE tenant_id = $1 
+                  AND cancelled_at BETWEEN $2 AND $3
+                  AND status = 'cancelled'
+                """,
+                tenant_id, start_date, end_date
+            ) or 0
+            
+            # Total de assinaturas ativas
+            active_subscriptions = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM subscriptions 
+                WHERE tenant_id = $1 
+                  AND status IN ('active', 'trialing')
+                """,
+                tenant_id
+            ) or 0
+            
+            # Taxa de churn
+            churn_rate = (
+                (churned_subscriptions / active_subscriptions * 100)
+                if active_subscriptions > 0 else 0
+            )
+            
+            return {
+                "period": {
+                    "start": start_date.isoformat(),
+                    "end": end_date.isoformat()
+                },
+                "revenue": {
+                    "total": str(total_revenue),
+                    "recurring": str(recurring_revenue),
+                    "by_type": {
+                        row["invoice_type"]: str(row["amount"])
+                        for row in revenue_by_type
+                    }
+                },
+                "invoices": {
+                    "issued": invoices_issued,
+                    "paid": invoices_paid,
+                    "conversion_rate": conversion_rate
+                },
+                "subscriptions": {
+                    "active": active_subscriptions,
+                    "churned": churned_subscriptions,
+                    "churn_rate": churn_rate
+                }
+            }
+    
+    # Métodos privados
+    async def _generate_invoice_number(self, tenant_id: str) -> str:
+        """Gera número sequencial de invoice."""
+        self.invoice_counters[tenant_id] += 1
+        invoice_number = str(self.invoice_counters[tenant_id]).zfill(8)
+        
+        # Atualiza no banco (em cache para performance)
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO invoice_counters (tenant_id, last_number, updated_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (tenant_id) 
+                DO UPDATE SET last_number = $2, updated_at = $3
+                """,
+                tenant_id,
+                self.invoice_counters[tenant_id],
+                datetime.utcnow()
+            )
+        
+        return invoice_number
+    
+    async def _calculate_subscription_line_items(
+        self,
+        plan: PlanVersion,
+        subscription: Subscription,
+        period_start: datetime,
+        period_end: datetime
+    ) -> List[InvoiceLineItem]:
+        """Calcula itens de linha para fatura de assinatura."""
+        items = []
+        
+        # Busca preço no plano para a moeda da assinatura
+        # (em produção, obteria da subscription ou metadata)
+        currency = subscription.metadata.get("currency", "USD")
+        
+        if currency in plan.prices:
+            price = plan.prices[currency]
+            
+            # Item base da assinatura
+            base_amount = price.amount * subscription.quantity
+            
+            item = InvoiceLineItem(
+                item_id=f"item_{uuid.uuid4().hex[:8]}",
+                description=f"{plan.name} - {period_start.date()} to {period_end.date()}",
+                quantity=subscription.quantity,
+                unit_amount=price.amount,
+                amount=base_amount,
+                metadata={
+                    "plan_id": plan.plan_id,
+                    "plan_version": plan.version,
+                    "billing_cycle": plan.billing_cycle.value,
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat()
+                }
+            )
+            items.append(item)
+            
+            # Taxa de setup (se aplicável)
+            if price.setup_fee > Decimal("0.00"):
+                setup_item = InvoiceLineItem(
+                    item_id=f"setup_{uuid.uuid4().hex[:8]}",
+                    description=f"Setup fee for {plan.name}",
+                    quantity=1,
+                    unit_amount=price.setup_fee,
+                    amount=price.setup_fee,
+                    metadata={"type": "setup_fee"}
+                )
+                items.append(setup_item)
+        
+        return items
+    
+    async def _get_invoice(
+        self,
+        conn,
+        tenant_id: str,
+        invoice_id: str
+    ) -> Optional[Invoice]:
+        """Busca invoice do banco."""
+        cache_key = f"invoice:{tenant_id}:{invoice_id}"
+        
+        if cache_key in self.invoice_cache:
+            return self.invoice_cache[cache_key]
+        
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM invoices 
+            WHERE tenant_id = $1 AND invoice_id = $2
+            """,
+            tenant_id, invoice_id
+        )
+        
+        if not row:
+            return None
+        
+        invoice = self._row_to_invoice(row)
+        self.invoice_cache[cache_key] = invoice
+        return invoice
+    
+    async def _get_payment(self, conn, payment_id: str) -> Optional[Payment]:
+        """Busca pagamento do banco."""
+        row = await conn.fetchrow(
+            "SELECT * FROM payments WHERE payment_id = $1",
+            payment_id
+        )
+        return self._row_to_payment(row) if row else None
+    
+    async def _save_invoice(self, conn, invoice: Invoice):
+        """Persiste invoice no banco."""
+        await conn.execute(
+            """
+            INSERT INTO invoices (
+                invoice_id, tenant_id, subscription_id, user_id,
+                invoice_number, invoice_type, status, period_start,
+                period_end, invoice_date, due_date, currency, subtotal,
+                tax_total, discount_total, total_amount, amount_paid,
+                amount_due, amount_refunded, line_items, payment_intent_id,
+                payment_method, paid_at, voided_at, refunded_at, metadata,
+                notes, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                     $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23,
+                     $24, $25, $26, $27, $28, $29)
+            """,
+            invoice.invoice_id,
+            invoice.tenant_id,
+            invoice.subscription_id,
+            invoice.user_id,
+            invoice.invoice_number,
+            invoice.invoice_type.value,
+            invoice.status.value,
+            invoice.period_start,
+            invoice.period_end,
+            invoice.invoice_date,
+            invoice.due_date,
+            invoice.currency,
+            str(invoice.subtotal),
+            str(invoice.tax_total),
+            str(invoice.discount_total),
+            str(invoice.total_amount),
+            str(invoice.amount_paid),
+            str(invoice.amount_due),
+            str(invoice.amount_refunded),
+            json.dumps([item.to_dict() for item in invoice.line_items]),
+            invoice.payment_intent_id,
+            invoice.payment_method,
+            invoice.paid_at,
+            invoice.voided_at,
+            invoice.refunded_at,
+            json.dumps(invoice.metadata),
+            invoice.notes,
+            invoice.created_at,
+            invoice.updated_at
+        )
+        
+        # Atualiza cache
+        cache_key = f"invoice:{invoice.tenant_id}:{invoice.invoice_id}"
+        self.invoice_cache[cache_key] = invoice
+    
+    async def _save_payment(self, conn, payment: Payment):
+        """Persiste pagamento no banco."""
+        await conn.execute(
+            """
+            INSERT INTO payments (
+                payment_id, tenant_id, invoice_id, user_id, status,
+                amount, currency, payment_method, provider_id,
+                provider_reference, fee_amount, net_amount, description,
+                payment_date, settled_at, refunded_at, metadata,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                     $13, $14, $15, $16, $17, $18, $19)
+            """,
+            payment.payment_id,
+            payment.tenant_id,
+            payment.invoice_id,
+            payment.user_id,
+            payment.status.value,
+            str(payment.amount),
+            payment.currency,
+            payment.payment_method,
+            payment.provider_id,
+            payment.provider_reference,
+            str(payment.fee_amount),
+            str(payment.net_amount),
+            payment.description,
+            payment.payment_date,
+            payment.settled_at,
+            payment.refunded_at,
+            json.dumps(payment.metadata),
+            payment.created_at,
+            payment.updated_at
+        )
+    
+    async def _save_refund(self, conn, refund: Refund):
+        """Persiste reembolso no banco."""
+        await conn.execute(
+            """
+            INSERT INTO refunds (
+                refund_id, tenant_id, payment_id, invoice_id,
+                amount, currency, reason, status, provider_id,
+                provider_reference, metadata, requested_at,
+                processed_at, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                     $11, $12, $13, $14)
+            """,
+            refund.refund_id,
+            refund.tenant_id,
+            refund.payment_id,
+            refund.invoice_id,
+            str(refund.amount),
+            refund.currency,
+            refund.reason,
+            refund.status,
+            refund.provider_id,
+            refund.provider_reference,
+            json.dumps(refund.metadata),
+            refund.requested_at,
+            refund.processed_at,
+            refund.created_at
+        )
+    
+    async def _update_invoice_status(
+        self,
+        conn,
+        invoice: Invoice,
+        new_status: InvoiceStatus,
+        actor: str,
+        reason: str,
+        metadata: Optional[Dict] = None
+    ):
+        """Atualiza status de uma invoice."""
+        old_status = invoice.status
+        
+        # Valida transição
+        if not self.invoice_state_machine.can_transition(old_status.value, new_status.value):
+            raise StateTransitionError(
+                f"Cannot transition invoice from {old_status.value} to {new_status.value}"
+            )
+        
+        # Atualiza
+        invoice.status = new_status
+        invoice.updated_at = datetime.utcnow()
+        
+        await conn.execute(
+            """
+            UPDATE invoices 
+            SET status = $1, updated_at = $2
+            WHERE invoice_id = $3
+            """,
+            new_status.value,
+            invoice.updated_at,
+            invoice.invoice_id
+        )
+        
+        # Log
+        await self.audit_logger.log(
+            tenant_id=invoice.tenant_id,
+            user_id=invoice.user_id,
+            action="invoice.status_changed",
+            resource_type="invoice",
+            resource_id=invoice.invoice_id,
+            changes={
+                "old_status": old_status.value,
+                "new_status": new_status.value,
+                "reason": reason,
+                "actor": actor
+            },
+            metadata=metadata or {}
+        )
+    
+    async def _mock_process_payment(
+        self,
+        invoice: Invoice,
+        payment_method: str,
+        payment_intent_id: str
+    ) -> Any:
+        """Mock de processamento de pagamento."""
+        # Em produção, integraria com Payment Engine
+        class MockPaymentResult:
+            success = True
+            provider_id = "mock_provider"
+            provider_reference = f"ref_{uuid.uuid4().hex[:8]}"
+            provider_metadata = {
+                "payment_method": payment_method,
+                "invoice_id": invoice.invoice_id
+            }
+            error_message = None
+            
+            def to_dict(self):
+                return {
+                    "success": self.success,
+                    "provider_id": self.provider_id,
+                    "provider_reference": self.provider_reference,
+                    "provider_metadata": self.provider_metadata,
+                    "error_message": self.error_message
+                }
+        
+        return MockPaymentResult()
+    
+    async def _mock_process_refund(
+        self,
+        payment: Payment,
+        amount: Decimal,
+        reason: str
+    ) -> Dict[str, Any]:
+        """Mock de processamento de reembolso."""
+        # Em produção, integraria com provider
+        return {
+            "success": True,
+            "provider_reference": f"refund_ref_{uuid.uuid4().hex[:8]}",
+            "metadata": {
+                "original_payment": payment.payment_id,
+                "amount": str(amount),
+                "reason": reason
+            }
+        }
+    
+    def _row_to_invoice(self, row) -> Invoice:
+        """Converte linha do banco para Invoice."""
+        # Parse de line_items
+        line_items_data = json.loads(row["line_items"]) if row.get("line_items") else []
+        line_items = []
+        for item_data in line_items_data:
+            line_items.append(InvoiceLineItem(
+                item_id=item_data["item_id"],
+                description=item_data["description"],
+                quantity=item_data["quantity"],
+                unit_amount=Decimal(str(item_data["unit_amount"])),
+                amount=Decimal(str(item_data["amount"])),
+                tax_rate=(
+                    Decimal(str(item_data["tax_rate"]))
+                    if item_data.get("tax_rate") else None
+                ),
+                tax_amount=(
+                    Decimal(str(item_data["tax_amount"]))
+                    if item_data.get("tax_amount") else None
+                ),
+                discount_rate=(
+                    Decimal(str(item_data["discount_rate"]))
+                    if item_data.get("discount_rate") else None
+                ),
+                discount_amount=(
+                    Decimal(str(item_data["discount_amount"]))
+                    if item_data.get("discount_amount") else None
+                ),
+                metadata=item_data.get("metadata", {})
+            ))
+        
+        return Invoice(
+            invoice_id=row["invoice_id"],
+            tenant_id=row["tenant_id"],
+            subscription_id=row.get("subscription_id"),
+            user_id=row.get("user_id"),
+            invoice_number=row["invoice_number"],
+            invoice_type=InvoiceType(row["invoice_type"]),
+            status=InvoiceStatus(row["status"]),
+            period_start=row.get("period_start"),
+            period_end=row.get("period_end"),
+            invoice_date=row["invoice_date"],
+            due_date=row.get("due_date"),
+            currency=row["currency"],
+            subtotal=Decimal(str(row["subtotal"])),
+            tax_total=Decimal(str(row["tax_total"])),
+            discount_total=Decimal(str(row["discount_total"])),
+            total_amount=Decimal(str(row["total_amount"])),
+            amount_paid=Decimal(str(row["amount_paid"])),
+            amount_due=Decimal(str(row["amount_due"])),
+            amount_refunded=Decimal(str(row["amount_refunded"])),
+            line_items=line_items,
+            payment_intent_id=row.get("payment_intent_id"),
+            payment_method=row.get("payment_method"),
+            paid_at=row.get("paid_at"),
+            voided_at=row.get("voided_at"),
+            refunded_at=row.get("refunded_at"),
+            metadata=json.loads(row["metadata"]) if row.get("metadata") else {},
+            notes=row.get("notes"),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )
+    
+    def _row_to_payment(self, row) -> Payment:
+        """Converte linha do banco para Payment."""
+        return Payment(
+            payment_id=row["payment_id"],
+            tenant_id=row["tenant_id"],
+            invoice_id=row["invoice_id"],
+            user_id=row.get("user_id"),
+            status=PaymentStatus(row["status"]),
+            amount=Decimal(str(row["amount"])),
+            currency=row["currency"],
+            payment_method=row["payment_method"],
+            provider_id=row["provider_id"],
+            provider_reference=row["provider_reference"],
+            fee_amount=Decimal(str(row["fee_amount"])),
+            net_amount=Decimal(str(row["net_amount"])),
+            description=row.get("description"),
+            payment_date=row["payment_date"],
+            settled_at=row.get("settled_at"),
+            refunded_at=row.get("refunded_at"),
+            metadata=json.loads(row["metadata"]) if row.get("metadata") else {},
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )

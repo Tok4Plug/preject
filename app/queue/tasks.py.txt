@@ -1,0 +1,608 @@
+"""
+Definições de tarefas assíncronas para o sistema de filas.
+Cada tarefa é idempotente, isolada por tenant e auditável.
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Dict, List, Optional, Union
+from uuid import UUID, uuid4
+
+# Importações internas
+from ..core.audit_logger import AuditLogger
+from ..core.metrics_engine import MetricsEngine
+from ..models.payment_intent import PaymentIntent, PaymentIntentStatus
+from ..models.invoice import Invoice, InvoiceStatus
+from ..models.subscription import Subscription, SubscriptionStatus
+from ..models.entitlement import Entitlement, EntitlementScope
+
+
+class TaskPriority(Enum):
+    """Prioridades de processamento de tarefas"""
+    CRITICAL = 0    # Processamento imediato (webhooks, pagamentos)
+    HIGH = 1        # Processamento rápido (notificações, antifraude)
+    NORMAL = 2      # Processamento padrão (relatórios, analytics)
+    LOW = 3         # Processamento em background (limpeza, manutenção)
+    BATCH = 4       # Processamento em lote (syncs massivos)
+
+
+class TaskStatus(Enum):
+    """Status do processamento de uma tarefa"""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    RETRYING = "retrying"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class TaskMetadata:
+    """Metadados imutáveis para uma tarefa"""
+    task_id: UUID = field(default_factory=uuid4)
+    tenant_id: str
+    correlation_id: str = field(default_factory=lambda: str(uuid4()))
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    scheduled_for: Optional[datetime] = None
+    priority: TaskPriority = TaskPriority.NORMAL
+    source: str = "unknown"
+    parent_task_id: Optional[UUID] = None
+    expires_at: Optional[datetime] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte metadados para dicionário serializável"""
+        return {
+            "task_id": str(self.task_id),
+            "tenant_id": self.tenant_id,
+            "correlation_id": self.correlation_id,
+            "created_at": self.created_at.isoformat(),
+            "scheduled_for": self.scheduled_for.isoformat() if self.scheduled_for else None,
+            "priority": self.priority.value,
+            "source": self.source,
+            "parent_task_id": str(self.parent_task_id) if self.parent_task_id else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None
+        }
+
+
+@dataclass(frozen=True)
+class BaseTask:
+    """Classe base para todas as tarefas"""
+    metadata: TaskMetadata
+    task_type: str
+    payload: Dict[str, Any]
+    idempotency_key: Optional[str] = None
+    max_retries: int = 3
+    retry_delay: int = 60  # segundos
+    
+    def __post_init__(self):
+        """Validações pós-inicialização"""
+        if self.idempotency_key and len(self.idempotency_key) > 255:
+            raise ValueError("Idempotency key must be 255 characters or less")
+    
+    def get_queue_name(self) -> str:
+        """Retorna o nome da fila baseado no tipo de tarefa"""
+        return f"{self.task_type}_queue"
+    
+    def get_priority_queue_name(self) -> str:
+        """Retorna o nome da fila com prioridade"""
+        return f"{self.metadata.priority.name.lower()}_{self.get_queue_name()}"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa a tarefa para dicionário"""
+        return {
+            "metadata": self.metadata.to_dict(),
+            "task_type": self.task_type,
+            "payload": self.payload,
+            "idempotency_key": self.idempotency_key,
+            "max_retries": self.max_retries,
+            "retry_delay": self.retry_delay
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'BaseTask':
+        """Cria uma tarefa a partir de dicionário"""
+        metadata_dict = data["metadata"]
+        
+        # Converte strings de volta para objetos
+        metadata_dict["task_id"] = UUID(metadata_dict["task_id"])
+        metadata_dict["created_at"] = datetime.fromisoformat(metadata_dict["created_at"])
+        
+        if metadata_dict.get("scheduled_for"):
+            metadata_dict["scheduled_for"] = datetime.fromisoformat(metadata_dict["scheduled_for"])
+        
+        metadata_dict["priority"] = TaskPriority(metadata_dict["priority"])
+        
+        if metadata_dict.get("parent_task_id"):
+            metadata_dict["parent_task_id"] = UUID(metadata_dict["parent_task_id"])
+        
+        if metadata_dict.get("expires_at"):
+            metadata_dict["expires_at"] = datetime.fromisoformat(metadata_dict["expires_at"])
+        
+        metadata = TaskMetadata(**metadata_dict)
+        
+        return cls(
+            metadata=metadata,
+            task_type=data["task_type"],
+            payload=data["payload"],
+            idempotency_key=data.get("idempotency_key"),
+            max_retries=data.get("max_retries", 3),
+            retry_delay=data.get("retry_delay", 60)
+        )
+
+
+# ============================================================================
+# Tarefas Específicas do Domínio
+# ============================================================================
+
+@dataclass(frozen=True)
+class PaymentWebhookTask(BaseTask):
+    """Tarefa para processar webhook de pagamento"""
+    
+    def __init__(self, provider: str, event_data: Dict[str, Any], **kwargs):
+        payload = {
+            "provider": provider,
+            "event_data": event_data,
+            "received_at": datetime.utcnow().isoformat()
+        }
+        
+        # Define metadados padrão para webhooks
+        metadata = kwargs.get("metadata")
+        if not metadata:
+            metadata = TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.CRITICAL,
+                source=f"webhook_{provider}"
+            )
+        
+        super().__init__(
+            metadata=metadata,
+            task_type="payment_webhook",
+            payload=payload,
+            idempotency_key=event_data.get("idempotency_key") or event_data.get("event_id"),
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class PaymentIntentUpdateTask(BaseTask):
+    """Tarefa para atualizar intent de pagamento"""
+    
+    def __init__(self, payment_intent_id: str, updates: Dict[str, Any], **kwargs):
+        payload = {
+            "payment_intent_id": payment_intent_id,
+            "updates": updates,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.HIGH,
+                source="payment_engine"
+            ),
+            task_type="payment_intent_update",
+            payload=payload,
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class InvoiceGenerationTask(BaseTask):
+    """Tarefa para gerar fatura"""
+    
+    def __init__(self, user_id: str, amount: float, currency: str, **kwargs):
+        payload = {
+            "user_id": user_id,
+            "amount": amount,
+            "currency": currency,
+            "generated_at": datetime.utcnow().isoformat(),
+            "due_date": (datetime.utcnow() + timedelta(days=7)).isoformat()
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.NORMAL,
+                source="billing_engine"
+            ),
+            task_type="invoice_generation",
+            payload=payload,
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class SubscriptionRenewalTask(BaseTask):
+    """Tarefa para renovar assinatura"""
+    
+    def __init__(self, subscription_id: str, renew_date: datetime, **kwargs):
+        payload = {
+            "subscription_id": subscription_id,
+            "renew_date": renew_date.isoformat(),
+            "processed_at": datetime.utcnow().isoformat()
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.HIGH,
+                source="subscription_engine"
+            ),
+            task_type="subscription_renewal",
+            payload=payload,
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class EntitlementGrantTask(BaseTask):
+    """Tarefa para conceder acesso a usuário"""
+    
+    def __init__(self, user_id: str, entitlement_type: str, scope: EntitlementScope, **kwargs):
+        payload = {
+            "user_id": user_id,
+            "entitlement_type": entitlement_type,
+            "scope": scope.value,
+            "granted_at": datetime.utcnow().isoformat(),
+            "expires_at": kwargs.pop("expires_at", None)
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.HIGH,
+                source="entitlement_engine"
+            ),
+            task_type="entitlement_grant",
+            payload=payload,
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class NotificationSendTask(BaseTask):
+    """Tarefa para enviar notificação"""
+    
+    def __init__(self, user_id: str, template_id: str, channel: str, variables: Dict[str, Any], **kwargs):
+        payload = {
+            "user_id": user_id,
+            "template_id": template_id,
+            "channel": channel,
+            "variables": variables,
+            "scheduled_for": kwargs.pop("scheduled_for", datetime.utcnow()).isoformat()
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.NORMAL,
+                source="notification_engine"
+            ),
+            task_type="notification_send",
+            payload=payload,
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class AntifraudAnalysisTask(BaseTask):
+    """Tarefa para análise anti-fraude"""
+    
+    def __init__(self, user_id: str, event_type: str, event_data: Dict[str, Any], **kwargs):
+        payload = {
+            "user_id": user_id,
+            "event_type": event_type,
+            "event_data": event_data,
+            "analyzed_at": datetime.utcnow().isoformat(),
+            "risk_score": kwargs.pop("risk_score", 0)
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.HIGH,
+                source="antifraud_engine"
+            ),
+            task_type="antifraud_analysis",
+            payload=payload,
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class TrackingEventTask(BaseTask):
+    """Tarefa para processar evento de tracking"""
+    
+    def __init__(self, event_name: str, user_id: str, bot_id: str, metadata: Dict[str, Any], **kwargs):
+        payload = {
+            "event_name": event_name,
+            "user_id": user_id,
+            "bot_id": bot_id,
+            "metadata": metadata,
+            "timestamp": datetime.utcnow().isoformat(),
+            "fingerprint": kwargs.pop("fingerprint", None)
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.LOW,
+                source="tracking_engine"
+            ),
+            task_type="tracking_event",
+            payload=payload,
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class MetricsCollectionTask(BaseTask):
+    """Tarefa para coletar métricas"""
+    
+    def __init__(self, metric_name: str, value: float, tags: Dict[str, str], **kwargs):
+        payload = {
+            "metric_name": metric_name,
+            "value": value,
+            "tags": tags,
+            "collected_at": datetime.utcnow().isoformat()
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.BATCH,
+                source="metrics_engine"
+            ),
+            task_type="metrics_collection",
+            payload=payload,
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class AuditLogTask(BaseTask):
+    """Tarefa para registrar log de auditoria"""
+    
+    def __init__(self, action: str, resource_type: str, resource_id: str, changes: Dict[str, Any], **kwargs):
+        payload = {
+            "action": action,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "changes": changes,
+            "performed_at": datetime.utcnow().isoformat(),
+            "actor_id": kwargs.pop("actor_id", None),
+            "actor_type": kwargs.pop("actor_type", "system")
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.NORMAL,
+                source="audit_logger"
+            ),
+            task_type="audit_log",
+            payload=payload,
+            **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class CleanupTask(BaseTask):
+    """Tarefa para limpeza de dados expirados"""
+    
+    def __init__(self, cleanup_type: str, retention_days: int, **kwargs):
+        payload = {
+            "cleanup_type": cleanup_type,
+            "retention_days": retention_days,
+            "executed_at": datetime.utcnow().isoformat(),
+            "dry_run": kwargs.pop("dry_run", False)
+        }
+        
+        super().__init__(
+            metadata=kwargs.get("metadata") or TaskMetadata(
+                tenant_id=kwargs.pop("tenant_id"),
+                priority=TaskPriority.LOW,
+                source="maintenance"
+            ),
+            task_type="cleanup",
+            payload=payload,
+            **kwargs
+        )
+
+
+class TaskFactory:
+    """Fábrica para criar tarefas de forma padronizada"""
+    
+    @staticmethod
+    def create_payment_webhook(
+        tenant_id: str,
+        provider: str,
+        event_data: Dict[str, Any],
+        **kwargs
+    ) -> PaymentWebhookTask:
+        """Cria tarefa de processamento de webhook de pagamento"""
+        return PaymentWebhookTask(
+            tenant_id=tenant_id,
+            provider=provider,
+            event_data=event_data,
+            **kwargs
+        )
+    
+    @staticmethod
+    def create_entitlement_grant(
+        tenant_id: str,
+        user_id: str,
+        entitlement_type: str,
+        scope: EntitlementScope,
+        **kwargs
+    ) -> EntitlementGrantTask:
+        """Cria tarefa de concessão de acesso"""
+        return EntitlementGrantTask(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            entitlement_type=entitlement_type,
+            scope=scope,
+            **kwargs
+        )
+    
+    @staticmethod
+    def create_notification(
+        tenant_id: str,
+        user_id: str,
+        template_id: str,
+        channel: str,
+        variables: Dict[str, Any],
+        **kwargs
+    ) -> NotificationSendTask:
+        """Cria tarefa de envio de notificação"""
+        return NotificationSendTask(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            template_id=template_id,
+            channel=channel,
+            variables=variables,
+            **kwargs
+        )
+    
+    @staticmethod
+    def create_audit_log(
+        tenant_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        changes: Dict[str, Any],
+        **kwargs
+    ) -> AuditLogTask:
+        """Cria tarefa de registro de auditoria"""
+        return AuditLogTask(
+            tenant_id=tenant_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            changes=changes,
+            **kwargs
+        )
+
+
+class TaskValidator:
+    """Validador de tarefas"""
+    
+    @staticmethod
+    def validate_task(task: BaseTask) -> List[str]:
+        """Valida uma tarefa e retorna lista de erros"""
+        errors = []
+        
+        # Valida metadados
+        if not task.metadata.tenant_id:
+            errors.append("tenant_id é obrigatório")
+        
+        if task.metadata.expires_at and task.metadata.expires_at < datetime.utcnow():
+            errors.append("task já expirou")
+        
+        # Valida payload baseado no tipo
+        if task.task_type == "payment_webhook":
+            if "provider" not in task.payload:
+                errors.append("provider é obrigatório para webhooks")
+            if "event_data" not in task.payload:
+                errors.append("event_data é obrigatório para webhooks")
+        
+        elif task.task_type == "entitlement_grant":
+            required = ["user_id", "entitlement_type", "scope"]
+            for field in required:
+                if field not in task.payload:
+                    errors.append(f"{field} é obrigatório para grant de acesso")
+        
+        # Valida idempotency key
+        if task.idempotency_key and len(task.idempotency_key) > 255:
+            errors.append("idempotency_key deve ter no máximo 255 caracteres")
+        
+        # Valida retries
+        if task.max_retries < 0 or task.max_retries > 10:
+            errors.append("max_retries deve estar entre 0 e 10")
+        
+        if task.retry_delay < 0 or task.retry_delay > 3600:
+            errors.append("retry_delay deve estar entre 0 e 3600 segundos")
+        
+        return errors
+    
+    @staticmethod
+    def is_valid(task: BaseTask) -> bool:
+        """Verifica se a tarefa é válida"""
+        return len(TaskValidator.validate_task(task)) == 0
+
+
+# Mapeamento de tipos de tarefa para classes
+TASK_TYPE_MAP = {
+    "payment_webhook": PaymentWebhookTask,
+    "payment_intent_update": PaymentIntentUpdateTask,
+    "invoice_generation": InvoiceGenerationTask,
+    "subscription_renewal": SubscriptionRenewalTask,
+    "entitlement_grant": EntitlementGrantTask,
+    "notification_send": NotificationSendTask,
+    "antifraud_analysis": AntifraudAnalysisTask,
+    "tracking_event": TrackingEventTask,
+    "metrics_collection": MetricsCollectionTask,
+    "audit_log": AuditLogTask,
+    "cleanup": CleanupTask,
+}
+
+
+def deserialize_task(data: Dict[str, Any]) -> BaseTask:
+    """Desserializa uma tarefa a partir de dicionário"""
+    task_type = data.get("task_type")
+    
+    if task_type not in TASK_TYPE_MAP:
+        # Usa BaseTask como fallback
+        return BaseTask.from_dict(data)
+    
+    # Desserializa usando a classe específica
+    task_class = TASK_TYPE_MAP[task_type]
+    
+    # Extrai parâmetros específicos do payload
+    payload = data["payload"]
+    metadata_dict = data["metadata"]
+    
+    # Converte strings de volta para objetos
+    metadata_dict["task_id"] = UUID(metadata_dict["task_id"])
+    metadata_dict["created_at"] = datetime.fromisoformat(metadata_dict["created_at"])
+    
+    if metadata_dict.get("scheduled_for"):
+        metadata_dict["scheduled_for"] = datetime.fromisoformat(metadata_dict["scheduled_for"])
+    
+    metadata_dict["priority"] = TaskPriority(metadata_dict["priority"])
+    
+    metadata = TaskMetadata(**metadata_dict)
+    
+    # Cria instância da tarefa específica
+    if task_type == "payment_webhook":
+        return PaymentWebhookTask(
+            metadata=metadata,
+            provider=payload["provider"],
+            event_data=payload["event_data"],
+            idempotency_key=data.get("idempotency_key"),
+            max_retries=data.get("max_retries", 3),
+            retry_delay=data.get("retry_delay", 60)
+        )
+    
+    elif task_type == "entitlement_grant":
+        from ..models.entitlement import EntitlementScope
+        return EntitlementGrantTask(
+            metadata=metadata,
+            user_id=payload["user_id"],
+            entitlement_type=payload["entitlement_type"],
+            scope=EntitlementScope(payload["scope"]),
+            idempotency_key=data.get("idempotency_key"),
+            max_retries=data.get("max_retries", 3),
+            retry_delay=data.get("retry_delay", 60)
+        )
+    
+    # Para outros tipos, usa a lógica genérica
+    return task_class(
+        metadata=metadata,
+        task_type=task_type,
+        payload=payload,
+        idempotency_key=data.get("idempotency_key"),
+        max_retries=data.get("max_retries", 3),
+        retry_delay=data.get("retry_delay", 60)
+    )

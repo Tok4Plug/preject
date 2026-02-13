@@ -1,0 +1,471 @@
+"""
+Sistema de métricas para filas distribuídas.
+Integra com Prometheus/OpenTelemetry e fornece métricas por tenant.
+"""
+
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+from enum import Enum
+import logging
+
+from prometheus_client import Counter, Gauge, Histogram, REGISTRY
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+
+from .base import QueueMetrics
+
+logger = logging.getLogger(__name__)
+
+
+class MetricType(Enum):
+    """Tipos de métricas suportadas"""
+    COUNTER = "counter"
+    GAUGE = "gauge"
+    HISTOGRAM = "histogram"
+
+
+@dataclass
+class QueueMetric:
+    """Definição de uma métrica de fila"""
+    name: str
+    description: str
+    metric_type: MetricType
+    labels: List[str] = field(default_factory=lambda: ["tenant_id", "queue_name"])
+    buckets: Optional[List[float]] = None  # Para histogramas
+
+
+class PrometheusQueueMetrics(QueueMetrics):
+    """Implementação de métricas usando Prometheus"""
+    
+    def __init__(self):
+        self._metrics: Dict[str, Any] = {}
+        self._initialize_metrics()
+    
+    def _initialize_metrics(self):
+        """Inicializa todas as métricas padrão"""
+        metrics_definitions = [
+            QueueMetric(
+                name="queue_messages_published_total",
+                description="Total de mensagens publicadas",
+                metric_type=MetricType.COUNTER
+            ),
+            QueueMetric(
+                name="queue_messages_consumed_total",
+                description="Total de mensagens consumidas",
+                metric_type=MetricType.COUNTER
+            ),
+            QueueMetric(
+                name="queue_messages_failed_total",
+                description="Total de mensagens falhas",
+                metric_type=MetricType.COUNTER
+            ),
+            QueueMetric(
+                name="queue_messages_retried_total",
+                description="Total de mensagens retentadas",
+                metric_type=MetricType.COUNTER
+            ),
+            QueueMetric(
+                name="queue_messages_inflight",
+                description="Mensagens sendo processadas",
+                metric_type=MetricType.GAUGE
+            ),
+            QueueMetric(
+                name="queue_processing_duration_seconds",
+                description="Duração do processamento de mensagens",
+                metric_type=MetricType.HISTOGRAM,
+                buckets=[0.1, 0.5, 1, 2, 5, 10, 30]
+            ),
+            QueueMetric(
+                name="queue_publish_duration_seconds",
+                description="Duração da publicação de mensagens",
+                metric_type=MetricType.HISTOGRAM,
+                buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+            ),
+            QueueMetric(
+                name="queue_consumer_lag_seconds",
+                description="Atraso do consumidor",
+                metric_type=MetricType.GAUGE
+            ),
+            QueueMetric(
+                name="queue_dead_letter_messages",
+                description="Mensagens na dead letter queue",
+                metric_type=MetricType.GAUGE
+            ),
+            QueueMetric(
+                name="queue_worker_active",
+                description="Workers ativos",
+                metric_type=MetricType.GAUGE
+            ),
+        ]
+        
+        for metric_def in metrics_definitions:
+            self._create_metric(metric_def)
+    
+    def _create_metric(self, metric_def: QueueMetric):
+        """Cria uma métrica Prometheus"""
+        labels = metric_def.labels
+        
+        if metric_def.metric_type == MetricType.COUNTER:
+            metric = Counter(
+                metric_def.name,
+                metric_def.description,
+                labels
+            )
+        elif metric_def.metric_type == MetricType.GAUGE:
+            metric = Gauge(
+                metric_def.name,
+                metric_def.description,
+                labels
+            )
+        elif metric_def.metric_type == MetricType.HISTOGRAM:
+            metric = Histogram(
+                metric_def.name,
+                metric_def.description,
+                labels,
+                buckets=metric_def.buckets or Histogram.DEFAULT_BUCKETS
+            )
+        
+        self._metrics[metric_def.name] = metric
+    
+    async def increment_counter(
+        self,
+        metric_name: str,
+        tenant_id: str,
+        value: int = 1,
+        tags: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Incrementa um contador"""
+        try:
+            metric = self._metrics.get(metric_name)
+            if not metric or not isinstance(metric, Counter):
+                logger.warning(f"Métrica não encontrada ou não é contador: {metric_name}")
+                return
+            
+            labels = self._build_labels(tenant_id, tags)
+            metric.labels(**labels).inc(value)
+            
+        except Exception as e:
+            logger.error(f"Erro ao incrementar métrica {metric_name}: {str(e)}")
+    
+    async def record_processing_time(
+        self,
+        queue_name: str,
+        tenant_id: str,
+        processing_time_ms: float
+    ) -> None:
+        """Registra tempo de processamento"""
+        try:
+            metric = self._metrics.get("queue_processing_duration_seconds")
+            if metric and isinstance(metric, Histogram):
+                labels = self._build_labels(tenant_id, {"queue_name": queue_name})
+                metric.labels(**labels).observe(processing_time_ms / 1000.0)
+        except Exception as e:
+            logger.error(f"Erro ao registrar tempo de processamento: {str(e)}")
+    
+    async def set_gauge(
+        self,
+        metric_name: str,
+        tenant_id: str,
+        value: float,
+        tags: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Define valor de um gauge"""
+        try:
+            metric = self._metrics.get(metric_name)
+            if not metric or not isinstance(metric, Gauge):
+                logger.warning(f"Métrica não encontrada ou não é gauge: {metric_name}")
+                return
+            
+            labels = self._build_labels(tenant_id, tags)
+            metric.labels(**labels).set(value)
+            
+        except Exception as e:
+            logger.error(f"Erro ao definir gauge {metric_name}: {str(e)}")
+    
+    async def record_histogram(
+        self,
+        metric_name: str,
+        tenant_id: str,
+        value: float,
+        tags: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Registra valor em histograma"""
+        try:
+            metric = self._metrics.get(metric_name)
+            if not metric or not isinstance(metric, Histogram):
+                logger.warning(f"Métrica não encontrada ou não é histograma: {metric_name}")
+                return
+            
+            labels = self._build_labels(tenant_id, tags)
+            metric.labels(**labels).observe(value)
+            
+        except Exception as e:
+            logger.error(f"Erro ao registrar histograma {metric_name}: {str(e)}")
+    
+    def _build_labels(self, tenant_id: str, tags: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """Constrói labels para métricas"""
+        labels = {"tenant_id": tenant_id}
+        
+        if tags:
+            labels.update(tags)
+        
+        return labels
+    
+    def get_all_metrics(self) -> Dict[str, Any]:
+        """Retorna todas as métricas atuais"""
+        return {
+            name: metric._metrics if hasattr(metric, '_metrics') else metric
+            for name, metric in self._metrics.items()
+        }
+
+
+class OpenTelemetryQueueMetrics(QueueMetrics):
+    """Implementação de métricas usando OpenTelemetry"""
+    
+    def __init__(self, meter_name: str = "queue_metrics"):
+        self.meter = metrics.get_meter(meter_name)
+        self._counters: Dict[str, Any] = {}
+        self._histograms: Dict[str, Any] = {}
+        self._gauges: Dict[str, Any] = {}
+        
+        self._initialize_metrics()
+    
+    def _initialize_metrics(self):
+        """Inicializa métricas OpenTelemetry"""
+        # Contadores
+        self._counters["messages_published"] = self.meter.create_counter(
+            name="queue.messages.published",
+            description="Total de mensagens publicadas",
+            unit="1"
+        )
+        
+        self._counters["messages_consumed"] = self.meter.create_counter(
+            name="queue.messages.consumed",
+            description="Total de mensagens consumidas",
+            unit="1"
+        )
+        
+        self._counters["messages_failed"] = self.meter.create_counter(
+            name="queue.messages.failed",
+            description="Total de mensagens falhas",
+            unit="1"
+        )
+        
+        # Histogramas
+        self._histograms["processing_duration"] = self.meter.create_histogram(
+            name="queue.processing.duration",
+            description="Duração do processamento",
+            unit="ms"
+        )
+        
+        # Gauges
+        self._gauges["messages_inflight"] = self.meter.create_observable_gauge(
+            name="queue.messages.inflight",
+            callbacks=[self._get_inflight_callback],
+            description="Mensagens sendo processadas",
+            unit="1"
+        )
+    
+    async def increment_counter(
+        self,
+        metric_name: str,
+        tenant_id: str,
+        value: int = 1,
+        tags: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Incrementa um contador OpenTelemetry"""
+        counter_name = self._map_metric_name(metric_name)
+        counter = self._counters.get(counter_name)
+        
+        if not counter:
+            logger.warning(f"Contador não encontrado: {counter_name}")
+            return
+        
+        attributes = self._build_attributes(tenant_id, tags)
+        counter.add(value, attributes)
+    
+    async def record_processing_time(
+        self,
+        queue_name: str,
+        tenant_id: str,
+        processing_time_ms: float
+    ) -> None:
+        """Registra tempo de processamento OpenTelemetry"""
+        histogram = self._histograms.get("processing_duration")
+        if histogram:
+            attributes = self._build_attributes(tenant_id, {"queue_name": queue_name})
+            histogram.record(processing_time_ms, attributes)
+    
+    def _map_metric_name(self, metric_name: str) -> str:
+        """Mapeia nome de métrica para formato OpenTelemetry"""
+        mapping = {
+            "queue_messages_published_total": "messages_published",
+            "queue_messages_consumed_total": "messages_consumed",
+            "queue_messages_failed_total": "messages_failed",
+        }
+        return mapping.get(metric_name, metric_name)
+    
+    def _build_attributes(self, tenant_id: str, tags: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """Constrói atributos para OpenTelemetry"""
+        attributes = {"tenant_id": tenant_id}
+        
+        if tags:
+            attributes.update(tags)
+        
+        return attributes
+    
+    def _get_inflight_callback(self, options):
+        """Callback para gauge de mensagens inflight"""
+        # Implementação específica para obter métricas em tempo real
+        return []
+
+
+class CompositeQueueMetrics(QueueMetrics):
+    """Métricas compostas que enviam para múltiplos backends"""
+    
+    def __init__(self, *backends: QueueMetrics):
+        self.backends = backends
+    
+    async def increment_counter(
+        self,
+        metric_name: str,
+        tenant_id: str,
+        value: int = 1,
+        tags: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Incrementa contador em todos os backends"""
+        for backend in self.backends:
+            try:
+                await backend.increment_counter(metric_name, tenant_id, value, tags)
+            except Exception as e:
+                logger.error(f"Erro no backend de métricas: {str(e)}")
+    
+    async def record_processing_time(
+        self,
+        queue_name: str,
+        tenant_id: str,
+        processing_time_ms: float
+    ) -> None:
+        """Registra tempo em todos os backends"""
+        for backend in self.backends:
+            try:
+                await backend.record_processing_time(queue_name, tenant_id, processing_time_ms)
+            except Exception as e:
+                logger.error(f"Erro no backend de métricas: {str(e)}")
+
+
+class QueueMetricsCollector:
+    """Coletor de métricas avançado com agregação"""
+    
+    def __init__(self, metrics_backend: QueueMetrics):
+        self.backend = metrics_backend
+        self._start_time = datetime.utcnow()
+    
+    async def record_message_published(
+        self,
+        queue_name: str,
+        tenant_id: str,
+        message_size: Optional[int] = None
+    ) -> None:
+        """Registra publicação de mensagem"""
+        tags = {"queue_name": queue_name}
+        
+        if message_size:
+            tags["message_size"] = str(message_size)
+        
+        await self.backend.increment_counter(
+            "queue_messages_published_total",
+            tenant_id,
+            tags=tags
+        )
+    
+    async def record_message_consumed(
+        self,
+        queue_name: str,
+        tenant_id: str,
+        processing_time_ms: float,
+        success: bool = True
+    ) -> None:
+        """Registra consumo de mensagem"""
+        tags = {"queue_name": queue_name, "status": "success" if success else "failed"}
+        
+        await self.backend.increment_counter(
+            "queue_messages_consumed_total",
+            tenant_id,
+            tags=tags
+        )
+        
+        if success:
+            await self.backend.record_processing_time(queue_name, tenant_id, processing_time_ms)
+        else:
+            await self.backend.increment_counter(
+                "queue_messages_failed_total",
+                tenant_id,
+                tags={"queue_name": queue_name}
+            )
+    
+    async def record_consumer_lag(
+        self,
+        queue_name: str,
+        tenant_id: str,
+        lag_seconds: float
+    ) -> None:
+        """Registra atraso do consumidor"""
+        await self.backend.set_gauge(
+            "queue_consumer_lag_seconds",
+            tenant_id,
+            lag_seconds,
+            tags={"queue_name": queue_name}
+        )
+    
+    async def record_queue_depth(
+        self,
+        queue_name: str,
+        tenant_id: str,
+        message_count: int
+    ) -> None:
+        """Registra profundidade da fila"""
+        await self.backend.set_gauge(
+            "queue_messages_inflight",
+            tenant_id,
+            message_count,
+            tags={"queue_name": queue_name}
+        )
+    
+    async def record_worker_status(
+        self,
+        worker_id: str,
+        tenant_id: str,
+        is_active: bool
+    ) -> None:
+        """Registra status do worker"""
+        await self.backend.set_gauge(
+            "queue_worker_active",
+            tenant_id,
+            1 if is_active else 0,
+            tags={"worker_id": worker_id}
+        )
+    
+    def get_uptime(self) -> float:
+        """Retorna tempo de atividade em segundos"""
+        return (datetime.utcnow() - self._start_time).total_seconds()
+
+
+# Fábrica para criar instâncias de métricas
+def create_queue_metrics(
+    backend: str = "prometheus",
+    **kwargs
+) -> QueueMetrics:
+    """Cria instância de métricas baseada no backend"""
+    if backend == "prometheus":
+        return PrometheusQueueMetrics()
+    elif backend == "opentelemetry":
+        return OpenTelemetryQueueMetrics(**kwargs)
+    elif backend == "composite":
+        backends = kwargs.get("backends", [])
+        return CompositeQueueMetrics(*backends)
+    else:
+        raise ValueError(f"Backend de métricas não suportado: {backend}")

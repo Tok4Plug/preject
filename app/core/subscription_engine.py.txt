@@ -1,0 +1,1506 @@
+# app/core/subscription_engine.py
+"""
+Engine de gerenciamento de assinaturas.
+Controla ciclos de vida, renovações automáticas, expirações e cancelamentos.
+Integra com BillingEngine para cobranças e EntitlementEngine para acessos.
+"""
+
+import enum
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any, Set, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+from decimal import Decimal
+import asyncio
+
+from app.core.audit_logger import audit_logger
+from app.core.billing_engine import BillingEngine, BillingResult
+from app.core.entitlement_engine import EntitlementEngine, EntitlementResult
+from app.core.state_machine import StateMachineEngine, StateMachine
+from app.models.subscription import (
+    Subscription, 
+    SubscriptionState,
+    SubscriptionCancellationReason
+)
+from app.models.payment_intent import PaymentIntent
+from app.models.invoice import Invoice, InvoiceStatus
+from app.models.offer import Offer
+from app.models.user import User
+from app.utils.idempotency import with_idempotency
+from app.utils.circuit_breaker import CircuitBreaker
+from app.queue.tasks import enqueue_subscription_task
+
+logger = logging.getLogger(__name__)
+
+
+class SubscriptionAction(Enum):
+    """Ações de gerenciamento de assinatura."""
+    CREATE = "create"
+    RENEW = "renew"
+    CANCEL = "cancel"
+    EXPIRE = "expire"
+    PAUSE = "pause"
+    RESUME = "resume"
+    UPGRADE = "upgrade"
+    DOWNGRADE = "downgrade"
+    UPDATE_PAYMENT_METHOD = "update_payment_method"
+
+
+class SubscriptionError(Exception):
+    """Exceção para erros no SubscriptionEngine."""
+    pass
+
+
+class SubscriptionValidationError(SubscriptionError):
+    """Exceção para erros de validação de assinatura."""
+    pass
+
+
+@dataclass
+class SubscriptionContext:
+    """Contexto para processamento de assinatura."""
+    subscription_id: str
+    user_id: int
+    bot_id: str
+    offer_id: str
+    action: SubscriptionAction
+    initiated_by: str = "system"  # "system", "user_id", "admin_id"
+    reason: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "subscription_id": self.subscription_id,
+            "user_id": self.user_id,
+            "bot_id": self.bot_id,
+            "offer_id": self.offer_id,
+            "action": self.action.value,
+            "initiated_by": self.initiated_by,
+            "reason": self.reason,
+            "metadata": self.metadata,
+            "timestamp": self.timestamp.isoformat()
+        }
+
+
+@dataclass
+class SubscriptionResult:
+    """Resultado de uma operação de assinatura."""
+    success: bool
+    action: SubscriptionAction
+    subscription_id: str
+    user_id: int
+    bot_id: str
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    next_billing_date: Optional[datetime] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    errors: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "action": self.action.value,
+            "subscription_id": self.subscription_id,
+            "user_id": self.user_id,
+            "bot_id": self.bot_id,
+            "timestamp": self.timestamp.isoformat(),
+            "next_billing_date": self.next_billing_date.isoformat() if self.next_billing_date else None,
+            "metadata": self.metadata,
+            "errors": self.errors
+        }
+
+
+class SubscriptionEngine:
+    """
+    Engine de gerenciamento de assinaturas.
+    Stateless, idempotente, com circuit breaker e retry automático.
+    """
+    
+    def __init__(
+        self,
+        billing_engine: Optional[BillingEngine] = None,
+        entitlement_engine: Optional[EntitlementEngine] = None
+    ):
+        self.billing_engine = billing_engine or BillingEngine()
+        self.entitlement_engine = entitlement_engine or EntitlementEngine()
+        
+        # Circuit breaker para operações externas
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            reset_timeout=60,
+            name="subscription_engine"
+        )
+        
+        # Cache de ofertas (para evitar queries repetidas)
+        self._offer_cache: Dict[str, Offer] = {}
+        
+        # Scheduler para tarefas recorrentes
+        self._scheduled_tasks: Dict[str, asyncio.Task] = {}
+        
+        # Iniciar workers de background
+        self._start_background_workers()
+    
+    def _start_background_workers(self) -> None:
+        """Inicia workers de background para tarefas recorrentes."""
+        # Em produção, usaríamos um sistema de filas distribuído
+        # Por enquanto, tasks locais para demonstração
+        self._expiry_worker_task = asyncio.create_task(
+            self._run_expiry_worker()
+        )
+        self._renewal_worker_task = asyncio.create_task(
+            self._run_renewal_worker()
+        )
+    
+    @with_idempotency(key_fields=["user_id", "bot_id", "offer_id", "payment_intent_id", "action"])
+    async def create_from_payment(
+        self,
+        user_id: int,
+        bot_id: str,
+        offer_id: str,
+        payment_intent_id: str,
+        initiated_by: str = "system",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> SubscriptionResult:
+        """
+        Cria uma assinatura a partir de um pagamento confirmado.
+        
+        Args:
+            user_id: ID do usuário
+            bot_id: ID do bot
+            offer_id: ID da oferta recorrente
+            payment_intent_id: ID do payment intent confirmado
+            initiated_by: Quem iniciou a criação
+            metadata: Metadados adicionais
+            
+        Returns:
+            SubscriptionResult com resultado da operação
+        """
+        start_time = datetime.utcnow()
+        metadata = metadata or {}
+        
+        try:
+            # 1. Validar dados de entrada
+            validation_result = await self._validate_creation_request(
+                user_id=user_id,
+                bot_id=bot_id,
+                offer_id=offer_id,
+                payment_intent_id=payment_intent_id
+            )
+            
+            if not validation_result["is_valid"]:
+                return SubscriptionResult(
+                    success=False,
+                    action=SubscriptionAction.CREATE,
+                    subscription_id="",
+                    user_id=user_id,
+                    bot_id=bot_id,
+                    timestamp=datetime.utcnow(),
+                    errors=validation_result["errors"],
+                    metadata=validation_result["metadata"]
+                )
+            
+            # 2. Buscar/calcular dados da oferta
+            offer = validation_result["offer"]
+            initial_period = self._calculate_initial_period(offer)
+            
+            # 3. Verificar se já existe assinatura ativa
+            existing_subscription = await Subscription.get_active_subscription(
+                user_id=user_id,
+                bot_id=bot_id,
+                offer_id=offer_id
+            )
+            
+            if existing_subscription:
+                # Se já existe, renovar ou estender
+                return await self._handle_existing_subscription(
+                    existing_subscription=existing_subscription,
+                    payment_intent_id=payment_intent_id,
+                    initiated_by=initiated_by,
+                    metadata=metadata
+                )
+            
+            # 4. Criar contexto
+            context = SubscriptionContext(
+                subscription_id="",  # Será definido após criação
+                user_id=user_id,
+                bot_id=bot_id,
+                offer_id=offer_id,
+                action=SubscriptionAction.CREATE,
+                initiated_by=initiated_by,
+                metadata={
+                    "payment_intent_id": payment_intent_id,
+                    "initial_invoice_id": validation_result.get("invoice_id"),
+                    "offer_type": offer.type,
+                    "billing_interval": offer.billing_interval,
+                    "billing_interval_count": offer.billing_interval_count,
+                    **metadata
+                }
+            )
+            
+            # 5. Criar assinatura no banco
+            subscription = await self._create_subscription(
+                context=context,
+                offer=offer,
+                initial_period=initial_period,
+                payment_intent_id=payment_intent_id
+            )
+            
+            context.subscription_id = subscription.id
+            
+            # 6. Registrar auditoria
+            await self._audit_subscription_creation(
+                subscription=subscription,
+                context=context,
+                start_time=start_time
+            )
+            
+            # 7. Agendar renovação (se não for trial)
+            if not offer.type == "trial":
+                await self._schedule_renewal(
+                    subscription=subscription,
+                    renewal_date=subscription.current_period_end
+                )
+            
+            # 8. Enfileirar tarefas pós-criação
+            await self._enqueue_post_creation_tasks(subscription, context)
+            
+            logger.info(
+                f"Subscription created - ID: {subscription.id}, "
+                f"User: {user_id}, Bot: {bot_id}, Offer: {offer_id}"
+            )
+            
+            return SubscriptionResult(
+                success=True,
+                action=SubscriptionAction.CREATE,
+                subscription_id=subscription.id,
+                user_id=user_id,
+                bot_id=bot_id,
+                timestamp=datetime.utcnow(),
+                next_billing_date=subscription.current_period_end,
+                metadata={
+                    "subscription_id": subscription.id,
+                    "current_period_start": subscription.current_period_start.isoformat(),
+                    "current_period_end": subscription.current_period_end.isoformat() if subscription.current_period_end else None,
+                    "status": subscription.status,
+                    "processing_time": (datetime.utcnow() - start_time).total_seconds()
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error creating subscription - User: {user_id}, "
+                f"Bot: {bot_id}, Offer: {offer_id}, Error: {e}",
+                exc_info=True
+            )
+            
+            await self._log_subscription_error(
+                action=SubscriptionAction.CREATE.value,
+                user_id=user_id,
+                bot_id=bot_id,
+                error=str(e),
+                metadata=metadata
+            )
+            
+            return SubscriptionResult(
+                success=False,
+                action=SubscriptionAction.CREATE,
+                subscription_id="",
+                user_id=user_id,
+                bot_id=bot_id,
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def _validate_creation_request(
+        self,
+        user_id: int,
+        bot_id: str,
+        offer_id: str,
+        payment_intent_id: str
+    ) -> Dict[str, Any]:
+        """Valida requisição de criação de assinatura."""
+        errors = []
+        metadata = {}
+        
+        # 1. Verificar se usuário existe
+        user = await User.get_by_id(user_id)
+        if not user:
+            errors.append(f"Usuário não encontrado: {user_id}")
+        
+        # 2. Verificar se payment intent existe e está pago
+        payment_intent = await PaymentIntent.get_by_id(payment_intent_id)
+        if not payment_intent:
+            errors.append(f"PaymentIntent não encontrado: {payment_intent_id}")
+        else:
+            if payment_intent.status != "paid":
+                errors.append(f"PaymentIntent não está pago (status: {payment_intent.status})")
+                metadata["payment_intent_status"] = payment_intent.status
+            
+            # Verificar se pertence ao usuário correto
+            if payment_intent.user_id != user_id:
+                errors.append(f"PaymentIntent pertence a outro usuário")
+                metadata["payment_intent_user_id"] = payment_intent.user_id
+            
+            # Verificar se pertence ao bot correto
+            if payment_intent.bot_id != bot_id:
+                errors.append(f"PaymentIntent pertence a outro bot")
+                metadata["payment_intent_bot_id"] = payment_intent.bot_id
+        
+        # 3. Verificar se oferta existe e é recorrente
+        offer = await Offer.get_by_id(offer_id)
+        if not offer:
+            errors.append(f"Oferta não encontrada: {offer_id}")
+        else:
+            metadata["offer_type"] = offer.type
+            metadata["is_recurring"] = offer.is_recurring
+            
+            if not offer.is_recurring:
+                errors.append(f"Oferta não é recorrente: {offer_id}")
+            
+            # Cache da oferta
+            self._offer_cache[offer_id] = offer
+        
+        # 4. Buscar invoice associada
+        invoice = None
+        if payment_intent:
+            invoice = await Invoice.get_by_payment_intent(payment_intent_id)
+            if invoice:
+                metadata["invoice_id"] = invoice.id
+                metadata["invoice_amount"] = float(invoice.amount)
+                metadata["invoice_currency"] = invoice.currency
+        
+        return {
+            "is_valid": len(errors) == 0,
+            "errors": errors,
+            "metadata": metadata,
+            "offer": offer,
+            "invoice": invoice
+        }
+    
+    def _calculate_initial_period(self, offer: Offer) -> Tuple[datetime, datetime]:
+        """Calcula período inicial baseado na oferta."""
+        start_date = datetime.utcnow()
+        
+        # Determinar duração baseada no tipo de oferta
+        if offer.billing_interval == "day":
+            days = offer.billing_interval_count or 1
+            end_date = start_date + timedelta(days=days)
+        elif offer.billing_interval == "week":
+            weeks = offer.billing_interval_count or 1
+            end_date = start_date + timedelta(weeks=weeks)
+        elif offer.billing_interval == "month":
+            months = offer.billing_interval_count or 1
+            # Simplificação - em produção usaríamos dateutil.relativedelta
+            end_date = start_date + timedelta(days=months * 30)
+        elif offer.billing_interval == "year":
+            years = offer.billing_interval_count or 1
+            end_date = start_date + timedelta(days=years * 365)
+        else:
+            # Padrão: 30 dias
+            end_date = start_date + timedelta(days=30)
+        
+        return start_date, end_date
+    
+    async def _handle_existing_subscription(
+        self,
+        existing_subscription: Subscription,
+        payment_intent_id: str,
+        initiated_by: str,
+        metadata: Dict[str, Any]
+    ) -> SubscriptionResult:
+        """Lida com assinatura existente (renovação antecipada)."""
+        # 1. Verificar status da assinatura existente
+        if existing_subscription.status == SubscriptionState.ACTIVE.value:
+            # Renovar antecipadamente
+            await existing_subscription.renew(
+                renewal_invoice_id=None,  # Será criada no próximo ciclo
+                renewed_at=datetime.utcnow(),
+                early_renewal=True,
+                early_payment_intent_id=payment_intent_id
+            )
+            
+            # Atualizar próximo ciclo
+            if existing_subscription.current_period_end:
+                new_end_date = existing_subscription.current_period_end + timedelta(days=30)  # Exemplo
+                await existing_subscription.update_period_end(new_end_date)
+            
+            await audit_logger.log_async(
+                resource_type="subscription",
+                resource_id=existing_subscription.id,
+                action="early_renewal",
+                actor=initiated_by,
+                description="Assinatura renovada antecipadamente",
+                metadata={
+                    "payment_intent_id": payment_intent_id,
+                    "existing_period_end": existing_subscription.current_period_end.isoformat() if existing_subscription.current_period_end else None,
+                    **metadata
+                }
+            )
+            
+            return SubscriptionResult(
+                success=True,
+                action=SubscriptionAction.RENEW,
+                subscription_id=existing_subscription.id,
+                user_id=existing_subscription.user_id,
+                bot_id=existing_subscription.bot_id,
+                timestamp=datetime.utcnow(),
+                next_billing_date=existing_subscription.current_period_end,
+                metadata={
+                    "existing_subscription_id": existing_subscription.id,
+                    "early_renewal": True,
+                    "payment_intent_id": payment_intent_id
+                }
+            )
+        
+        # 2. Se a assinatura está cancelada mas ainda no período
+        elif existing_subscription.status == SubscriptionState.CANCELLED.value:
+            if not existing_subscription.cancel_at_period_end:
+                # Reativar assinatura cancelada
+                await existing_subscription.reactivate(
+                    reactivated_by=initiated_by,
+                    reactivation_reason="payment_received",
+                    payment_intent_id=payment_intent_id
+                )
+                
+                return SubscriptionResult(
+                    success=True,
+                    action=SubscriptionAction.RESUME,
+                    subscription_id=existing_subscription.id,
+                    user_id=existing_subscription.user_id,
+                    bot_id=existing_subscription.bot_id,
+                    timestamp=datetime.utcnow(),
+                    next_billing_date=existing_subscription.current_period_end,
+                    metadata={
+                        "existing_subscription_id": existing_subscription.id,
+                        "reactivated": True,
+                        "previous_status": SubscriptionState.CANCELLED.value
+                    }
+                )
+        
+        # 3. Em outros casos, criar nova assinatura
+        # (será tratado pelo caller)
+        raise SubscriptionValidationError("Assinatura existente em estado inválido para renovação")
+    
+    async def _create_subscription(
+        self,
+        context: SubscriptionContext,
+        offer: Offer,
+        initial_period: Tuple[datetime, datetime],
+        payment_intent_id: str
+    ) -> Subscription:
+        """Cria nova assinatura no banco de dados."""
+        start_date, end_date = initial_period
+        
+        subscription_data = {
+            "user_id": context.user_id,
+            "bot_id": context.bot_id,
+            "offer_id": context.offer_id,
+            "status": SubscriptionState.ACTIVE.value,
+            "current_period_start": start_date,
+            "current_period_end": end_date,
+            "cancel_at_period_end": False,
+            "invoice_ids": [context.metadata.get("initial_invoice_id")],
+            "payment_intent_ids": [payment_intent_id],
+            "metadata": {
+                "created_via": "payment",
+                "initial_payment_intent_id": payment_intent_id,
+                "offer_name": offer.name,
+                "offer_description": offer.description,
+                "billing_interval": offer.billing_interval,
+                "billing_interval_count": offer.billing_interval_count,
+                "trial_period_days": offer.trial_period_days,
+                **context.metadata
+            }
+        }
+        
+        subscription = await Subscription.create(**subscription_data)
+        return subscription
+    
+    async def _audit_subscription_creation(
+        self,
+        subscription: Subscription,
+        context: SubscriptionContext,
+        start_time: datetime
+    ) -> None:
+        """Registra auditoria da criação de assinatura."""
+        try:
+            processing_time = (datetime.utcnow() - start_time).total_seconds()
+            
+            await audit_logger.log_async(
+                resource_type="subscription",
+                resource_id=subscription.id,
+                action="created",
+                actor=context.initiated_by,
+                description=f"Assinatura criada via {context.initiated_by}",
+                metadata={
+                    "user_id": subscription.user_id,
+                    "bot_id": subscription.bot_id,
+                    "offer_id": subscription.offer_id,
+                    "current_period_start": subscription.current_period_start.isoformat(),
+                    "current_period_end": subscription.current_period_end.isoformat() if subscription.current_period_end else None,
+                    "status": subscription.status,
+                    "processing_time": processing_time,
+                    **context.metadata
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error auditing subscription creation: {e}")
+    
+    async def _schedule_renewal(
+        self,
+        subscription: Subscription,
+        renewal_date: datetime
+    ) -> None:
+        """Agenda renovação automática da assinatura."""
+        try:
+            # Calcular quando agendar (24h antes do término)
+            schedule_time = renewal_date - timedelta(hours=24)
+            
+            # Se já passou, agendar para agora
+            if schedule_time < datetime.utcnow():
+                schedule_time = datetime.utcnow() + timedelta(minutes=5)
+            
+            # Enfileirar tarefa de renovação
+            delay_seconds = (schedule_time - datetime.utcnow()).total_seconds()
+            
+            await enqueue_subscription_task(
+                task_type="schedule_subscription_renewal",
+                subscription_id=subscription.id,
+                scheduled_for=schedule_time.isoformat(),
+                delay_seconds=int(delay_seconds)
+            )
+            
+            logger.debug(
+                f"Renewal scheduled for subscription {subscription.id} "
+                f"at {schedule_time}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error scheduling renewal for subscription {subscription.id}: {e}")
+    
+    async def _enqueue_post_creation_tasks(
+        self,
+        subscription: Subscription,
+        context: SubscriptionContext
+    ) -> None:
+        """Enfileira tarefas pós-criação."""
+        # 1. Enviar notificação de confirmação
+        await enqueue_subscription_task(
+            task_type="send_subscription_created_notification",
+            subscription_id=subscription.id,
+            user_id=subscription.user_id,
+            bot_id=subscription.bot_id
+        )
+        
+        # 2. Atualizar métricas
+        await enqueue_subscription_task(
+            task_type="update_subscription_metrics",
+            subscription_id=subscription.id,
+            action="created",
+            user_id=subscription.user_id,
+            bot_id=subscription.bot_id
+        )
+        
+        # 3. Iniciar monitoramento de uso (se aplicável)
+        if subscription.metadata and subscription.metadata.get("has_usage_limits"):
+            await enqueue_subscription_task(
+                task_type="start_usage_monitoring",
+                subscription_id=subscription.id,
+                user_id=subscription.user_id,
+                bot_id=subscription.bot_id
+            )
+    
+    @with_idempotency(key_fields=["subscription_id", "action"])
+    async def renew_subscription(
+        self,
+        subscription_id: str,
+        initiated_by: str = "system",
+        reason: str = "automatic_renewal",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> SubscriptionResult:
+        """
+        Renova uma assinatura ativa.
+        
+        Args:
+            subscription_id: ID da assinatura
+            initiated_by: Quem iniciou a renovação
+            reason: Motivo da renovação
+            metadata: Metadados adicionais
+            
+        Returns:
+            SubscriptionResult com resultado da operação
+        """
+        metadata = metadata or {}
+        
+        try:
+            # 1. Buscar assinatura
+            subscription = await Subscription.get_by_id(subscription_id)
+            if not subscription:
+                return SubscriptionResult(
+                    success=False,
+                    action=SubscriptionAction.RENEW,
+                    subscription_id=subscription_id,
+                    user_id=0,
+                    bot_id="",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Assinatura não encontrada: {subscription_id}"]
+                )
+            
+            # 2. Validar se pode ser renovada
+            validation_result = await self._validate_renewal_request(subscription)
+            
+            if not validation_result["is_valid"]:
+                return SubscriptionResult(
+                    success=False,
+                    action=SubscriptionAction.RENEW,
+                    subscription_id=subscription_id,
+                    user_id=subscription.user_id,
+                    bot_id=subscription.bot_id,
+                    timestamp=datetime.utcnow(),
+                    errors=validation_result["errors"],
+                    metadata=validation_result["metadata"]
+                )
+            
+            # 3. Criar contexto
+            context = SubscriptionContext(
+                subscription_id=subscription_id,
+                user_id=subscription.user_id,
+                bot_id=subscription.bot_id,
+                offer_id=subscription.offer_id,
+                action=SubscriptionAction.RENEW,
+                initiated_by=initiated_by,
+                reason=reason,
+                metadata=metadata
+            )
+            
+            # 4. Processar renovação via BillingEngine
+            billing_result = await self.billing_engine.renew_subscription(
+                subscription_id=subscription_id,
+                renewal_date=datetime.utcnow(),
+                metadata={
+                    "renewal_reason": reason,
+                    "initiated_by": initiated_by,
+                    **metadata
+                }
+            )
+            
+            if not billing_result.success:
+                # Se falhou a cobrança, marcar para retry
+                await subscription.mark_renewal_failed(
+                    failure_reason=billing_result.errors[0] if billing_result.errors else "unknown",
+                    failed_at=datetime.utcnow(),
+                    metadata={
+                        "billing_result": billing_result.to_dict(),
+                        **metadata
+                    }
+                )
+                
+                # Agendar retry (1 dia)
+                await self._schedule_retry(subscription, delay_days=1)
+                
+                return SubscriptionResult(
+                    success=False,
+                    action=SubscriptionAction.RENEW,
+                    subscription_id=subscription_id,
+                    user_id=subscription.user_id,
+                    bot_id=subscription.bot_id,
+                    timestamp=datetime.utcnow(),
+                    errors=billing_result.errors,
+                    metadata={
+                        "billing_failed": True,
+                        "scheduled_retry": True,
+                        "retry_in_days": 1
+                    }
+                )
+            
+            # 5. Atualizar assinatura com nova invoice
+            renewal_invoice_id = billing_result.metadata.get("renewal_invoice_id")
+            
+            await subscription.renew(
+                renewal_invoice_id=renewal_invoice_id,
+                renewed_at=datetime.utcnow()
+            )
+            
+            # 6. Estender período
+            offer = await Offer.get_by_id(subscription.offer_id)
+            if offer and subscription.current_period_end:
+                new_end_date = self._calculate_next_period_end(
+                    current_end=subscription.current_period_end,
+                    offer=offer
+                )
+                
+                await subscription.update_period_end(new_end_date)
+            
+            # 7. Registrar auditoria
+            await self._audit_subscription_renewal(
+                subscription=subscription,
+                context=context,
+                billing_result=billing_result
+            )
+            
+            # 8. Agendar próxima renovação
+            if subscription.current_period_end:
+                await self._schedule_renewal(subscription, subscription.current_period_end)
+            
+            # 9. Enfileirar tarefas pós-renovação
+            await self._enqueue_post_renewal_tasks(subscription, context, billing_result)
+            
+            logger.info(
+                f"Subscription renewed - ID: {subscription_id}, "
+                f"Invoice: {renewal_invoice_id}"
+            )
+            
+            return SubscriptionResult(
+                success=True,
+                action=SubscriptionAction.RENEW,
+                subscription_id=subscription_id,
+                user_id=subscription.user_id,
+                bot_id=subscription.bot_id,
+                timestamp=datetime.utcnow(),
+                next_billing_date=subscription.current_period_end,
+                metadata={
+                    "subscription_id": subscription_id,
+                    "renewal_invoice_id": renewal_invoice_id,
+                    "previous_period_end": validation_result["metadata"].get("previous_period_end"),
+                    "new_period_end": subscription.current_period_end.isoformat() if subscription.current_period_end else None,
+                    "billing_result": billing_result.metadata
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error renewing subscription {subscription_id}: {e}",
+                exc_info=True
+            )
+            
+            await self._log_subscription_error(
+                action=SubscriptionAction.RENEW.value,
+                subscription_id=subscription_id,
+                error=str(e),
+                metadata=metadata
+            )
+            
+            return SubscriptionResult(
+                success=False,
+                action=SubscriptionAction.RENEW,
+                subscription_id=subscription_id,
+                user_id=0,
+                bot_id="",
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def _validate_renewal_request(
+        self,
+        subscription: Subscription
+    ) -> Dict[str, Any]:
+        """Valida se uma assinatura pode ser renovada."""
+        errors = []
+        metadata = {}
+        
+        # 1. Verificar status
+        if subscription.status != SubscriptionState.ACTIVE.value:
+            errors.append(f"Assinatura não está ativa (status: {subscription.status})")
+            metadata["current_status"] = subscription.status
+        
+        # 2. Verificar se está marcada para cancelamento
+        if subscription.cancel_at_period_end:
+            errors.append("Assinatura marcada para cancelamento no fim do período")
+            metadata["cancel_at_period_end"] = True
+        
+        # 3. Verificar se já expirou
+        if subscription.current_period_end and subscription.current_period_end < datetime.utcnow():
+            errors.append("Assinatura já expirou")
+            metadata["current_period_end"] = subscription.current_period_end.isoformat()
+            metadata["is_expired"] = True
+        
+        # 4. Verificar se já tem renovação em andamento
+        if subscription.metadata and subscription.metadata.get("renewal_in_progress"):
+            errors.append("Renovação já em andamento")
+            metadata["renewal_in_progress"] = True
+        
+        # 5. Registrar data anterior para auditoria
+        if subscription.current_period_end:
+            metadata["previous_period_end"] = subscription.current_period_end.isoformat()
+        
+        return {
+            "is_valid": len(errors) == 0,
+            "errors": errors,
+            "metadata": metadata
+        }
+    
+    def _calculate_next_period_end(
+        self,
+        current_end: datetime,
+        offer: Offer
+    ) -> datetime:
+        """Calcula data de término do próximo período."""
+        if offer.billing_interval == "day":
+            days = offer.billing_interval_count or 1
+            return current_end + timedelta(days=days)
+        elif offer.billing_interval == "week":
+            weeks = offer.billing_interval_count or 1
+            return current_end + timedelta(weeks=weeks)
+        elif offer.billing_interval == "month":
+            months = offer.billing_interval_count or 1
+            # Simplificação
+            return current_end + timedelta(days=months * 30)
+        elif offer.billing_interval == "year":
+            years = offer.billing_interval_count or 1
+            return current_end + timedelta(days=years * 365)
+        else:
+            # Padrão: 30 dias
+            return current_end + timedelta(days=30)
+    
+    async def _schedule_retry(
+        self,
+        subscription: Subscription,
+        delay_days: int = 1
+    ) -> None:
+        """Agenda retry de renovação falha."""
+        try:
+            retry_time = datetime.utcnow() + timedelta(days=delay_days)
+            delay_seconds = (retry_time - datetime.utcnow()).total_seconds()
+            
+            await enqueue_subscription_task(
+                task_type="schedule_renewal_retry",
+                subscription_id=subscription.id,
+                scheduled_for=retry_time.isoformat(),
+                delay_seconds=int(delay_seconds),
+                retry_count=subscription.metadata.get("retry_count", 0) + 1 if subscription.metadata else 1
+            )
+            
+            logger.info(
+                f"Renewal retry scheduled for subscription {subscription.id} "
+                f"in {delay_days} days"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error scheduling retry for subscription {subscription.id}: {e}")
+    
+    async def _audit_subscription_renewal(
+        self,
+        subscription: Subscription,
+        context: SubscriptionContext,
+        billing_result: BillingResult
+    ) -> None:
+        """Registra auditoria da renovação de assinatura."""
+        try:
+            await audit_logger.log_async(
+                resource_type="subscription",
+                resource_id=subscription.id,
+                action="renewed",
+                actor=context.initiated_by,
+                description=f"Assinatura renovada: {context.reason}",
+                metadata={
+                    "user_id": subscription.user_id,
+                    "bot_id": subscription.bot_id,
+                    "offer_id": subscription.offer_id,
+                    "renewal_reason": context.reason,
+                    "billing_result": billing_result.to_dict(),
+                    "previous_period_end": subscription.current_period_end.isoformat() if subscription.current_period_end else None,
+                    **context.metadata
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error auditing subscription renewal: {e}")
+    
+    async def _enqueue_post_renewal_tasks(
+        self,
+        subscription: Subscription,
+        context: SubscriptionContext,
+        billing_result: BillingResult
+    ) -> None:
+        """Enfileira tarefas pós-renovação."""
+        # 1. Enviar notificação de renovação
+        await enqueue_subscription_task(
+            task_type="send_subscription_renewed_notification",
+            subscription_id=subscription.id,
+            user_id=subscription.user_id,
+            bot_id=subscription.bot_id,
+            invoice_id=billing_result.metadata.get("renewal_invoice_id")
+        )
+        
+        # 2. Atualizar métricas
+        await enqueue_subscription_task(
+            task_type="update_subscription_metrics",
+            subscription_id=subscription.id,
+            action="renewed",
+            user_id=subscription.user_id,
+            bot_id=subscription.bot_id
+        )
+        
+        # 3. Limpar flag de falha (se existir)
+        if subscription.metadata and subscription.metadata.get("renewal_failed"):
+            await enqueue_subscription_task(
+                task_type="clear_renewal_failure_flag",
+                subscription_id=subscription.id
+            )
+    
+    @with_idempotency(key_fields=["subscription_id", "action"])
+    async def cancel_subscription(
+        self,
+        subscription_id: str,
+        initiated_by: str = "user",
+        reason: str = "user_request",
+        cancel_immediately: bool = False,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> SubscriptionResult:
+        """
+        Cancela uma assinatura.
+        
+        Args:
+            subscription_id: ID da assinatura
+            initiated_by: Quem cancelou
+            reason: Motivo do cancelamento
+            cancel_immediately: Cancelar imediatamente ou no fim do período
+            metadata: Metadados adicionais
+            
+        Returns:
+            SubscriptionResult com resultado da operação
+        """
+        metadata = metadata or {}
+        
+        try:
+            # 1. Buscar assinatura
+            subscription = await Subscription.get_by_id(subscription_id)
+            if not subscription:
+                return SubscriptionResult(
+                    success=False,
+                    action=SubscriptionAction.CANCEL,
+                    subscription_id=subscription_id,
+                    user_id=0,
+                    bot_id="",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Assinatura não encontrada: {subscription_id}"]
+                )
+            
+            # 2. Validar se pode ser cancelada
+            if subscription.status != SubscriptionState.ACTIVE.value:
+                return SubscriptionResult(
+                    success=False,
+                    action=SubscriptionAction.CANCEL,
+                    subscription_id=subscription_id,
+                    user_id=subscription.user_id,
+                    bot_id=subscription.bot_id,
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Assinatura não está ativa (status: {subscription.status})"],
+                    metadata={"current_status": subscription.status}
+                )
+            
+            # 3. Criar contexto
+            context = SubscriptionContext(
+                subscription_id=subscription_id,
+                user_id=subscription.user_id,
+                bot_id=subscription.bot_id,
+                offer_id=subscription.offer_id,
+                action=SubscriptionAction.CANCEL,
+                initiated_by=initiated_by,
+                reason=reason,
+                metadata={
+                    "cancel_immediately": cancel_immediately,
+                    **metadata
+                }
+            )
+            
+            # 4. Executar cancelamento
+            if cancel_immediately:
+                # Cancelamento imediato - revoga acesso agora
+                await subscription.cancel(
+                    cancelled_at=datetime.utcnow(),
+                    cancel_reason=reason,
+                    immediate=True
+                )
+                
+                # Revogar entitlement associado
+                await self._revoke_subscription_access(subscription, reason)
+                
+            else:
+                # Cancelamento no fim do período
+                await subscription.cancel_at_period_end(
+                    cancelled_by=initiated_by,
+                    cancel_reason=reason,
+                    metadata=metadata
+                )
+            
+            # 5. Cancelar renovações agendadas
+            await self._cancel_scheduled_renewals(subscription_id)
+            
+            # 6. Registrar auditoria
+            await self._audit_subscription_cancellation(subscription, context)
+            
+            # 7. Enfileirar tarefas pós-cancelamento
+            await self._enqueue_post_cancellation_tasks(subscription, context)
+            
+            logger.info(
+                f"Subscription cancelled - ID: {subscription_id}, "
+                f"Immediate: {cancel_immediately}, Reason: {reason}"
+            )
+            
+            next_billing_date = None
+            if not cancel_immediately and subscription.current_period_end:
+                next_billing_date = subscription.current_period_end
+            
+            return SubscriptionResult(
+                success=True,
+                action=SubscriptionAction.CANCEL,
+                subscription_id=subscription_id,
+                user_id=subscription.user_id,
+                bot_id=subscription.bot_id,
+                timestamp=datetime.utcnow(),
+                next_billing_date=next_billing_date,
+                metadata={
+                    "subscription_id": subscription_id,
+                    "cancelled_at": datetime.utcnow().isoformat(),
+                    "cancel_immediately": cancel_immediately,
+                    "cancel_reason": reason,
+                    "initiated_by": initiated_by,
+                    "access_revoked": cancel_immediately
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error cancelling subscription {subscription_id}: {e}",
+                exc_info=True
+            )
+            
+            await self._log_subscription_error(
+                action=SubscriptionAction.CANCEL.value,
+                subscription_id=subscription_id,
+                error=str(e),
+                metadata=metadata
+            )
+            
+            return SubscriptionResult(
+                success=False,
+                action=SubscriptionAction.CANCEL,
+                subscription_id=subscription_id,
+                user_id=0,
+                bot_id="",
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def _revoke_subscription_access(
+        self,
+        subscription: Subscription,
+        reason: str
+    ) -> None:
+        """Revoga acesso associado à assinatura."""
+        try:
+            # Buscar entitlement associado
+            # (Em produção, teríamos relacionamento direto)
+            # Por enquanto, buscar por user_id, bot_id, offer_id
+            
+            # Primeiro, suspender entitlement
+            # (Implementação simplificada)
+            
+            # Em produção, integraríamos com EntitlementEngine
+            # entitlement_result = await self.entitlement_engine.revoke_access(
+            #     entitlement_id=entitlement_id,
+            #     revoked_by="system",
+            #     revoke_reason=f"subscription_cancelled: {reason}"
+            # )
+            
+            await audit_logger.log_async(
+                resource_type="subscription",
+                resource_id=subscription.id,
+                action="access_revoked",
+                actor="system",
+                description=f"Acesso revogado por cancelamento de assinatura",
+                metadata={
+                    "subscription_id": subscription.id,
+                    "user_id": subscription.user_id,
+                    "bot_id": subscription.bot_id,
+                    "offer_id": subscription.offer_id,
+                    "revoke_reason": reason
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error revoking subscription access: {e}")
+    
+    async def _cancel_scheduled_renewals(self, subscription_id: str) -> None:
+        """Cancela renovações agendadas."""
+        try:
+            await enqueue_subscription_task(
+                task_type="cancel_scheduled_renewals",
+                subscription_id=subscription_id
+            )
+        except Exception as e:
+            logger.error(f"Error cancelling scheduled renewals: {e}")
+    
+    async def _audit_subscription_cancellation(
+        self,
+        subscription: Subscription,
+        context: SubscriptionContext
+    ) -> None:
+        """Registra auditoria do cancelamento de assinatura."""
+        try:
+            await audit_logger.log_async(
+                resource_type="subscription",
+                resource_id=subscription.id,
+                action="cancelled",
+                actor=context.initiated_by,
+                description=f"Assinatura cancelada: {context.reason}",
+                metadata={
+                    "user_id": subscription.user_id,
+                    "bot_id": subscription.bot_id,
+                    "offer_id": subscription.offer_id,
+                    "cancel_reason": context.reason,
+                    "cancel_immediately": context.metadata.get("cancel_immediately", False),
+                    "current_period_end": subscription.current_period_end.isoformat() if subscription.current_period_end else None,
+                    **context.metadata
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error auditing subscription cancellation: {e}")
+    
+    async def _enqueue_post_cancellation_tasks(
+        self,
+        subscription: Subscription,
+        context: SubscriptionContext
+    ) -> None:
+        """Enfileira tarefas pós-cancelamento."""
+        # 1. Enviar notificação de cancelamento
+        await enqueue_subscription_task(
+            task_type="send_subscription_cancelled_notification",
+            subscription_id=subscription.id,
+            user_id=subscription.user_id,
+            bot_id=subscription.bot_id,
+            cancel_reason=context.reason,
+            immediate=context.metadata.get("cancel_immediately", False)
+        )
+        
+        # 2. Atualizar métricas
+        await enqueue_subscription_task(
+            task_type="update_subscription_metrics",
+            subscription_id=subscription.id,
+            action="cancelled",
+            user_id=subscription.user_id,
+            bot_id=subscription.bot_id
+        )
+        
+        # 3. Iniciar processo de retenção (se cancelamento imediato)
+        if context.metadata.get("cancel_immediately"):
+            await enqueue_subscription_task(
+                task_type="start_retention_flow",
+                subscription_id=subscription.id,
+                user_id=subscription.user_id,
+                bot_id=subscription.bot_id
+            )
+    
+    async def expire_subscription(
+        self,
+        subscription_id: str,
+        reason: str = "period_ended",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> SubscriptionResult:
+        """
+        Expira uma assinatura (quando o período termina sem renovação).
+        
+        Args:
+            subscription_id: ID da assinatura
+            reason: Motivo da expiração
+            metadata: Metadados adicionais
+            
+        Returns:
+            SubscriptionResult com resultado da operação
+        """
+        metadata = metadata or {}
+        
+        try:
+            subscription = await Subscription.get_by_id(subscription_id)
+            if not subscription:
+                return SubscriptionResult(
+                    success=False,
+                    action=SubscriptionAction.EXPIRE,
+                    subscription_id=subscription_id,
+                    user_id=0,
+                    bot_id="",
+                    timestamp=datetime.utcnow(),
+                    errors=[f"Assinatura não encontrada: {subscription_id}"]
+                )
+            
+            # Verificar se já está expirada
+            if subscription.status == SubscriptionState.EXPIRED.value:
+                return SubscriptionResult(
+                    success=True,
+                    action=SubscriptionAction.EXPIRE,
+                    subscription_id=subscription_id,
+                    user_id=subscription.user_id,
+                    bot_id=subscription.bot_id,
+                    timestamp=datetime.utcnow(),
+                    metadata={"already_expired": True}
+                )
+            
+            # Expirar assinatura
+            await subscription.expire(
+                expired_at=datetime.utcnow(),
+                expire_reason=reason,
+                metadata=metadata
+            )
+            
+            # Revogar acesso
+            await self._revoke_subscription_access(subscription, reason)
+            
+            # Cancelar renovações agendadas
+            await self._cancel_scheduled_renewals(subscription_id)
+            
+            # Registrar auditoria
+            await audit_logger.log_async(
+                resource_type="subscription",
+                resource_id=subscription_id,
+                action="expired",
+                actor="system",
+                description=f"Assinatura expirada: {reason}",
+                metadata={
+                    "user_id": subscription.user_id,
+                    "bot_id": subscription.bot_id,
+                    "offer_id": subscription.offer_id,
+                    "expire_reason": reason,
+                    "previous_status": subscription.status,
+                    **metadata
+                }
+            )
+            
+            # Enfileirar tarefas pós-expiração
+            await enqueue_subscription_task(
+                task_type="send_subscription_expired_notification",
+                subscription_id=subscription_id,
+                user_id=subscription.user_id,
+                bot_id=subscription.bot_id,
+                expire_reason=reason
+            )
+            
+            logger.info(f"Subscription expired - ID: {subscription_id}, Reason: {reason}")
+            
+            return SubscriptionResult(
+                success=True,
+                action=SubscriptionAction.EXPIRE,
+                subscription_id=subscription_id,
+                user_id=subscription.user_id,
+                bot_id=subscription.bot_id,
+                timestamp=datetime.utcnow(),
+                metadata={
+                    "subscription_id": subscription_id,
+                    "expired_at": datetime.utcnow().isoformat(),
+                    "expire_reason": reason,
+                    "access_revoked": True
+                }
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error expiring subscription {subscription_id}: {e}",
+                exc_info=True
+            )
+            
+            return SubscriptionResult(
+                success=False,
+                action=SubscriptionAction.EXPIRE,
+                subscription_id=subscription_id,
+                user_id=0,
+                bot_id="",
+                timestamp=datetime.utcnow(),
+                errors=[str(e)],
+                metadata=metadata
+            )
+    
+    async def _run_expiry_worker(self) -> None:
+        """Worker que verifica e expira assinaturas automaticamente."""
+        while True:
+            try:
+                # Verificar a cada hora
+                await asyncio.sleep(3600)
+                
+                # Buscar assinaturas que expiraram
+                expired_subscriptions = await Subscription.get_expired_subscriptions()
+                
+                for subscription in expired_subscriptions:
+                    try:
+                        await self.expire_subscription(
+                            subscription_id=subscription.id,
+                            reason="auto_expired"
+                        )
+                    except Exception as e:
+                        logger.error(f"Error auto-expiring subscription {subscription.id}: {e}")
+                
+                if expired_subscriptions:
+                    logger.info(f"Auto-expired {len(expired_subscriptions)} subscriptions")
+                    
+            except Exception as e:
+                logger.error(f"Error in expiry worker: {e}")
+                await asyncio.sleep(60)  # Esperar antes de retry
+    
+    async def _run_renewal_worker(self) -> None:
+        """Worker que processa renovações agendadas."""
+        while True:
+            try:
+                # Verificar a cada 5 minutos
+                await asyncio.sleep(300)
+                
+                # Buscar assinaturas para renovar
+                subscriptions_to_renew = await Subscription.get_subscriptions_due_for_renewal()
+                
+                for subscription in subscriptions_to_renew:
+                    try:
+                        await self.renew_subscription(
+                            subscription_id=subscription.id,
+                            reason="scheduled_renewal"
+                        )
+                    except Exception as e:
+                        logger.error(f"Error auto-renewing subscription {subscription.id}: {e}")
+                
+                if subscriptions_to_renew:
+                    logger.info(f"Auto-renewed {len(subscriptions_to_renew)} subscriptions")
+                    
+            except Exception as e:
+                logger.error(f"Error in renewal worker: {e}")
+                await asyncio.sleep(60)  # Esperar antes de retry
+    
+    async def get_subscription_stats(
+        self,
+        bot_id: Optional[str] = None,
+        days: int = 30
+    ) -> Dict[str, Any]:
+        """
+        Retorna estatísticas de assinaturas.
+        
+        Args:
+            bot_id: Filtrar por bot (opcional)
+            days: Período em dias
+            
+        Returns:
+            Dict com estatísticas
+        """
+        try:
+            start_date = datetime.utcnow() - timedelta(days=days)
+            
+            filters = {"created_at__gte": start_date}
+            if bot_id:
+                filters["bot_id"] = bot_id
+            
+            subscriptions = await Subscription.filter(**filters)
+            
+            stats = {
+                "total": len(subscriptions),
+                "active": 0,
+                "cancelled": 0,
+                "expired": 0,
+                "pending": 0,
+                "churn_rate": 0.0,
+                "mrr": 0.0,  # Monthly Recurring Revenue
+                "arr": 0.0,  # Annual Recurring Revenue
+                "by_status": {},
+                "by_offer": {},
+                "created_by_day": {}
+            }
+            
+            active_subscriptions = []
+            
+            for sub in subscriptions:
+                # Contagem por status
+                stats["by_status"][sub.status] = stats["by_status"].get(sub.status, 0) + 1
+                
+                if sub.status == SubscriptionState.ACTIVE.value:
+                    stats["active"] += 1
+                    active_subscriptions.append(sub)
+                elif sub.status == SubscriptionState.CANCELLED.value:
+                    stats["cancelled"] += 1
+                elif sub.status == SubscriptionState.EXPIRED.value:
+                    stats["expired"] += 1
+                elif sub.status == SubscriptionState.PENDING.value:
+                    stats["pending"] += 1
+                
+                # Por oferta
+                stats["by_offer"][sub.offer_id] = stats["by_offer"].get(sub.offer_id, 0) + 1
+                
+                # Por dia de criação
+                created_date = sub.created_at.date().isoformat()
+                stats["created_by_day"][created_date] = stats["created_by_day"].get(created_date, 0) + 1
+            
+            # Calcular churn rate
+            if stats["total"] > 0:
+                stats["churn_rate"] = (stats["cancelled"] + stats["expired"]) / stats["total"]
+            
+            # Calcular MRR/ARR (simplificado)
+            for sub in active_subscriptions:
+                # Buscar oferta para obter preço
+                offer = await Offer.get_by_id(sub.offer_id)
+                if offer and offer.price:
+                    if offer.billing_interval == "month":
+                        stats["mrr"] += float(offer.price)
+                        stats["arr"] += float(offer.price * 12)
+                    elif offer.billing_interval == "year":
+                        stats["arr"] += float(offer.price)
+                        stats["mrr"] += float(offer.price / 12)
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting subscription stats: {e}")
+            return {}
+    
+    async def _log_subscription_error(
+        self,
+        action: str,
+        error: str,
+        metadata: Dict[str, Any],
+        subscription_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        bot_id: Optional[str] = None
+    ) -> None:
+        """Registra erro de assinatura para auditoria."""
+        try:
+            resource_id = subscription_id or f"{user_id}_{bot_id}_{action}"
+            
+            await audit_logger.log_async(
+                resource_type="subscription_error",
+                resource_id=resource_id,
+                action="error",
+                actor="system",
+                description=f"Erro na assinatura: {action} - {error}",
+                metadata={
+                    "action": action,
+                    "error": error,
+                    "subscription_id": subscription_id,
+                    "user_id": user_id,
+                    "bot_id": bot_id,
+                    **metadata
+                },
+                severity="error"
+            )
+        except Exception as e:
+            logger.error(f"Error logging subscription error: {e}")
+
+
+# Factory para criação do SubscriptionEngine
+def create_subscription_engine(
+    billing_engine: Optional[BillingEngine] = None,
+    entitlement_engine: Optional[EntitlementEngine] = None
+) -> SubscriptionEngine:
+    """Cria uma instância configurada do SubscriptionEngine."""
+    return SubscriptionEngine(
+        billing_engine=billing_engine,
+        entitlement_engine=entitlement_engine
+    )
+
+
+# Singleton para uso global (opcional)
+_subscription_engine_instance: Optional[SubscriptionEngine] = None
+
+def get_subscription_engine() -> SubscriptionEngine:
+    """Retorna instância singleton do SubscriptionEngine."""
+    global _subscription_engine_instance
+    if _subscription_engine_instance is None:
+        _subscription_engine_instance = create_subscription_engine()
+    return _subscription_engine_instance

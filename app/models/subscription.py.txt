@@ -1,0 +1,487 @@
+# app/models/subscription.py
+"""
+Modelo de Subscription - Assinaturas recorrentes multi-tenant.
+Controle de ciclos de cobrança, renovação e expiração.
+"""
+
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text, Enum, Numeric
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+import enum
+
+from app.database import Base
+
+
+class SubscriptionStatus(enum.Enum):
+    """Status da assinatura."""
+    TRIAL = "trial"                     # Período de trial
+    ACTIVE = "active"                   # Ativa e em dia
+    PENDING = "pending"                 # Aguardando confirmação
+    PAST_DUE = "past_due"               # Pagamento atrasado
+    CANCELLED = "cancelled"             # Cancelada (não será renovada)
+    EXPIRED = "expired"                 # Expirada (fim do ciclo)
+    SUSPENDED = "suspended"             # Suspensa (bloqueada temporariamente)
+    DELETED = "deleted"                 # Deletada
+
+
+class BillingCycle(enum.Enum):
+    """Ciclo de cobrança."""
+    DAILY = "daily"                     # Diário
+    WEEKLY = "weekly"                   # Semanal
+    MONTHLY = "monthly"                 # Mensal
+    QUARTERLY = "quarterly"             # Trimestral
+    SEMI_ANNUAL = "semi_annual"         # Semestral
+    ANNUAL = "annual"                   # Anual
+    LIFETIME = "lifetime"               # Vitalícia (sem renovação)
+
+
+class RenewalStatus(enum.Enum):
+    """Status da renovação."""
+    PENDING = "pending"                 # Aguardando renovação
+    SUCCESS = "success"                 # Renovação bem-sucedida
+    FAILED = "failed"                   # Falha na renovação
+    CANCELLED = "cancelled"             # Renovação cancelada
+    MANUAL = "manual"                   # Renovação manual necessária
+
+
+class Subscription(Base):
+    """
+    Assinatura - contrato de serviço recorrente.
+    
+    Princípios:
+    1. Controle de ciclos: Cobrança periódica configurável
+    2. Trial gratuito: Suporte a períodos de teste
+    3. Renewal automático: Renovação automática com fallback
+    4. Upgrade/Downgrade: Mudança de plano mid-cycle
+    5. Isolamento por tenant
+    """
+    
+    __tablename__ = "subscriptions"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    subscription_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # sub_xxx
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Entidades envolvidas
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.users.id"), nullable=False, index=True)
+    offer_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.offers.id"), nullable=False, index=True)
+    payment_intent_id: Mapped[Optional[str]] = mapped_column(String(50), ForeignKey("saas.payment_intents.intent_id"), index=True)
+    
+    # Plano e cobrança
+    plan_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # ID do plano no catálogo
+    plan_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    plan_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    
+    # Status e ciclo
+    status: Mapped[SubscriptionStatus] = mapped_column(Enum(SubscriptionStatus), nullable=False, default=SubscriptionStatus.PENDING, index=True)
+    billing_cycle: Mapped[BillingCycle] = mapped_column(Enum(BillingCycle), nullable=False, default=BillingCycle.MONTHLY)
+    
+    # Valores
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)  # Valor recorrente
+    setup_fee: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False, default=0.0)  # Taxa de setup
+    discount_amount: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False, default=0.0)  # Desconto
+    tax_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # Taxa de imposto
+    
+    # Datas importantes
+    start_date: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    trial_start_date: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    trial_end_date: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    current_period_start: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    current_period_end: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    next_billing_date: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Trial
+    trial_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_trial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    trial_converted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # Se converteu em pago
+    
+    # Renovação
+    auto_renew: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    renewal_status: Mapped[RenewalStatus] = mapped_column(Enum(RenewalStatus), nullable=False, default=RenewalStatus.PENDING)
+    renewal_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_renewal_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    next_renewal_attempt: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Contador de ciclos
+    cycles_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_cycles: Mapped[Optional[int]] = mapped_column(Integer)  # Número máximo de ciclos (null = ilimitado)
+    
+    # Upgrade/Downgrade
+    previous_subscription_id: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    upgrade_path: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    prorated_amount: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False, default=0.0)  # Valor prorata
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="subscriptions")
+    user: Mapped["User"] = relationship(back_populates="subscriptions")
+    offer: Mapped["Offer"] = relationship(back_populates="subscriptions")
+    payment_intent: Mapped["PaymentIntent"] = relationship(back_populates="subscription")
+    invoices: Mapped[List["Invoice"]] = relationship(back_populates="subscription", cascade="all, delete-orphan")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="subscription", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_subscriptions_tenant_status', 'tenant_id', 'status'),
+        Index('ix_subscriptions_user_status', 'user_id', 'status'),
+        Index('ix_subscriptions_period_dates', 'current_period_start', 'current_period_end'),
+        Index('ix_subscriptions_next_billing', 'next_billing_date', 'status'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<Subscription(id='{self.id}', subscription_id='{self.subscription_id}', user='{self.user_id}', status='{self.status.value}', amount={self.amount} {self.currency})>"
+    
+    @classmethod
+    def generate_subscription_id(cls) -> str:
+        """Gera um ID único para a assinatura."""
+        timestamp = int(datetime.utcnow().timestamp() * 1000)
+        random_str = uuid.uuid4().hex[:8]
+        return f"sub_{timestamp}_{random_str}"
+    
+    def to_dict(self, include_invoices: bool = False) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "subscription_id": self.subscription_id,
+            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
+            "offer_id": self.offer_id,
+            "payment_intent_id": self.payment_intent_id,
+            "plan_id": self.plan_id,
+            "plan_name": self.plan_name,
+            "plan_version": self.plan_version,
+            "status": self.status.value,
+            "billing_cycle": self.billing_cycle.value,
+            "currency": self.currency,
+            "amount": float(self.amount),
+            "setup_fee": float(self.setup_fee),
+            "discount_amount": float(self.discount_amount),
+            "tax_rate": self.tax_rate,
+            "start_date": self.start_date.isoformat() if self.start_date else None,
+            "trial_start_date": self.trial_start_date.isoformat() if self.trial_start_date else None,
+            "trial_end_date": self.trial_end_date.isoformat() if self.trial_end_date else None,
+            "current_period_start": self.current_period_start.isoformat() if self.current_period_start else None,
+            "current_period_end": self.current_period_end.isoformat() if self.current_period_end else None,
+            "next_billing_date": self.next_billing_date.isoformat() if self.next_billing_date else None,
+            "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None,
+            "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "trial_days": self.trial_days,
+            "is_trial": self.is_trial,
+            "trial_converted": self.trial_converted,
+            "auto_renew": self.auto_renew,
+            "renewal_status": self.renewal_status.value,
+            "renewal_attempts": self.renewal_attempts,
+            "last_renewal_at": self.last_renewal_at.isoformat() if self.last_renewal_at else None,
+            "next_renewal_attempt": self.next_renewal_attempt.isoformat() if self.next_renewal_attempt else None,
+            "cycles_completed": self.cycles_completed,
+            "max_cycles": self.max_cycles,
+            "previous_subscription_id": self.previous_subscription_id,
+            "upgrade_path": self.upgrade_path,
+            "prorated_amount": float(self.prorated_amount),
+            "metadata": self.metadata,
+            "notes": self.notes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "is_active": self.is_active,
+            "is_trial_period": self.is_trial_period,
+            "is_cancelled": self.is_cancelled,
+            "is_past_due": self.is_past_due,
+            "days_until_next_billing": self.days_until_next_billing,
+            "days_since_start": self.days_since_start
+        }
+        
+        if include_invoices and self.invoices:
+            data["invoices"] = [
+                invoice.to_dict() for invoice in sorted(
+                    self.invoices, 
+                    key=lambda x: x.invoice_date or x.created_at, 
+                    reverse=True
+                )[:5]  # Últimas 5 faturas
+            ]
+        
+        return data
+    
+    @property
+    def is_active(self) -> bool:
+        """Verifica se a assinatura está ativa."""
+        return self.status in [
+            SubscriptionStatus.TRIAL,
+            SubscriptionStatus.ACTIVE,
+            SubscriptionStatus.PAST_DUE  # Ainda está ativa, mas com pagamento atrasado
+        ]
+    
+    @property
+    def is_trial_period(self) -> bool:
+        """Verifica se está no período de trial."""
+        if not self.is_trial or not self.trial_end_date:
+            return False
+        
+        now = datetime.utcnow()
+        return self.trial_start_date <= now <= self.trial_end_date
+    
+    @property
+    def is_cancelled(self) -> bool:
+        """Verifica se a assinatura foi cancelada."""
+        return self.status == SubscriptionStatus.CANCELLED or self.cancelled_at is not None
+    
+    @property
+    def is_past_due(self) -> bool:
+        """Verifica se a assinatura está com pagamento atrasado."""
+        return self.status == SubscriptionStatus.PAST_DUE
+    
+    @property
+    def days_until_next_billing(self) -> Optional[int]:
+        """Retorna dias até a próxima cobrança."""
+        if not self.next_billing_date:
+            return None
+        
+        now = datetime.utcnow()
+        if now > self.next_billing_date:
+            return 0
+        
+        return (self.next_billing_date - now).days
+    
+    @property
+    def days_since_start(self) -> int:
+        """Retorna dias desde o início da assinatura."""
+        return (datetime.utcnow() - self.start_date).days
+    
+    def calculate_next_billing_date(self) -> datetime:
+        """Calcula a próxima data de cobrança baseado no ciclo."""
+        if self.is_trial_period and not self.trial_converted:
+            # Se ainda está no trial, a próxima cobrança é no fim do trial
+            return self.trial_end_date
+        
+        # Calcula baseado no ciclo de cobrança
+        cycle_mapping = {
+            BillingCycle.DAILY: timedelta(days=1),
+            BillingCycle.WEEKLY: timedelta(weeks=1),
+            BillingCycle.MONTHLY: timedelta(days=30),  # Simplificado
+            BillingCycle.QUARTERLY: timedelta(days=90),
+            BillingCycle.SEMI_ANNUAL: timedelta(days=180),
+            BillingCycle.ANNUAL: timedelta(days=365),
+        }
+        
+        delta = cycle_mapping.get(self.billing_cycle, timedelta(days=30))
+        return self.current_period_end + delta
+    
+    def start_trial(self, trial_days: int = 7):
+        """Inicia o período de trial."""
+        self.is_trial = True
+        self.trial_days = trial_days
+        self.trial_start_date = datetime.utcnow()
+        self.trial_end_date = datetime.utcnow() + timedelta(days=trial_days)
+        self.status = SubscriptionStatus.TRIAL
+        self.current_period_end = self.trial_end_date
+        self.next_billing_date = self.trial_end_date
+        self.updated_at = datetime.utcnow()
+    
+    def convert_trial_to_paid(self):
+        """Converte trial em assinatura paga."""
+        if not self.is_trial_period or self.trial_converted:
+            return
+        
+        self.trial_converted = True
+        self.is_trial = False
+        self.status = SubscriptionStatus.ACTIVE
+        self.current_period_start = datetime.utcnow()
+        self.current_period_end = self.calculate_next_billing_date()
+        self.next_billing_date = self.current_period_end
+        self.updated_at = datetime.utcnow()
+    
+    def renew(self) -> bool:
+        """
+        Renova a assinatura para o próximo ciclo.
+        
+        Retorna:
+            bool: True se renovada com sucesso
+        """
+        if not self.is_active or self.is_cancelled:
+            return False
+        
+        # Atualiza datas do ciclo
+        self.current_period_start = self.current_period_end
+        self.current_period_end = self.calculate_next_billing_date()
+        self.next_billing_date = self.current_period_end
+        self.cycles_completed += 1
+        
+        # Atualiza status de renovação
+        self.renewal_status = RenewalStatus.SUCCESS
+        self.last_renewal_at = datetime.utcnow()
+        self.renewal_attempts = 0
+        self.next_renewal_attempt = None
+        
+        # Verifica se atingiu o máximo de ciclos
+        if self.max_cycles and self.cycles_completed >= self.max_cycles:
+            self.cancel("max_cycles_reached")
+        
+        self.updated_at = datetime.utcnow()
+        
+        return True
+    
+    def cancel(self, reason: str = "user_cancelled", effective_date: Optional[datetime] = None):
+        """Cancela a assinatura."""
+        if self.is_cancelled:
+            return
+        
+        self.status = SubscriptionStatus.CANCELLED
+        self.cancelled_at = datetime.utcnow()
+        self.ended_at = effective_date or self.current_period_end
+        self.auto_renew = False
+        self.renewal_status = RenewalStatus.CANCELLED
+        
+        # Registra motivo
+        if "cancellation_log" not in self.metadata:
+            self.metadata["cancellation_log"] = []
+        
+        self.metadata["cancellation_log"].append({
+            "reason": reason,
+            "cancelled_at": self.cancelled_at.isoformat(),
+            "effective_date": self.ended_at.isoformat() if self.ended_at else None
+        })
+        
+        self.updated_at = datetime.utcnow()
+    
+    def suspend(self, reason: str, suspended_by: str):
+        """Suspende a assinatura temporariamente."""
+        self.status = SubscriptionStatus.SUSPENDED
+        
+        # Registra motivo
+        if "suspension_log" not in self.metadata:
+            self.metadata["suspension_log"] = []
+        
+        self.metadata["suspension_log"].append({
+            "reason": reason,
+            "suspended_by": suspended_by,
+            "suspended_at": datetime.utcnow().isoformat()
+        })
+        
+        self.updated_at = datetime.utcnow()
+    
+    def resume(self):
+        """Retoma uma assinatura suspensa."""
+        if self.status != SubscriptionStatus.SUSPENDED:
+            return
+        
+        # Decide qual status restaurar
+        if self.is_past_due:
+            self.status = SubscriptionStatus.PAST_DUE
+        elif self.is_trial_period:
+            self.status = SubscriptionStatus.TRIAL
+        else:
+            self.status = SubscriptionStatus.ACTIVE
+        
+        self.updated_at = datetime.utcnow()
+    
+    def mark_as_past_due(self):
+        """Marca a assinatura como atrasada."""
+        self.status = SubscriptionStatus.PAST_DUE
+        self.renewal_status = RenewalStatus.FAILED
+        self.renewal_attempts += 1
+        
+        # Agenda próxima tentativa (exponencial backoff)
+        if self.renewal_attempts <= 3:
+            hours = 2 ** (self.renewal_attempts - 1)  # 1, 2, 4 horas
+            self.next_renewal_attempt = datetime.utcnow() + timedelta(hours=hours)
+        else:
+            # Após 3 tentativas, cancela automaticamente
+            self.cancel("payment_failed_after_retries")
+        
+        self.updated_at = datetime.utcnow()
+    
+    def upgrade(self, new_plan_id: str, new_amount: float, prorated_amount: float = 0.0):
+        """Faz upgrade da assinatura para um novo plano."""
+        # Registra upgrade path
+        self.upgrade_path = {
+            "previous_plan_id": self.plan_id,
+            "previous_amount": float(self.amount),
+            "new_plan_id": new_plan_id,
+            "new_amount": new_amount,
+            "upgraded_at": datetime.utcnow().isoformat(),
+            "prorated_amount": prorated_amount
+        }
+        
+        # Atualiza plano
+        self.plan_id = new_plan_id
+        self.amount = new_amount
+        self.prorated_amount = prorated_amount
+        
+        self.updated_at = datetime.utcnow()
+    
+    def downgrade(self, new_plan_id: str, new_amount: float, effective_next_cycle: bool = True):
+        """Faz downgrade da assinatura para um novo plano."""
+        if effective_next_cycle:
+            # Aplica na próxima renovação
+            self.metadata["pending_downgrade"] = {
+                "new_plan_id": new_plan_id,
+                "new_amount": new_amount,
+                "scheduled_at": self.current_period_end.isoformat()
+            }
+        else:
+            # Aplica imediatamente
+            self.upgrade_path = {
+                "previous_plan_id": self.plan_id,
+                "previous_amount": float(self.amount),
+                "new_plan_id": new_plan_id,
+                "new_amount": new_amount,
+                "downgraded_at": datetime.utcnow().isoformat(),
+                "immediate": True
+            }
+            
+            self.plan_id = new_plan_id
+            self.amount = new_amount
+        
+        self.updated_at = datetime.utcnow()
+
+
+class SubscriptionHistory(Base):
+    """
+    Histórico de mudanças da assinatura.
+    Para auditoria e rollback se necessário.
+    """
+    
+    __tablename__ = "subscription_history"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    subscription_id: Mapped[str] = mapped_column(String(50), ForeignKey("saas.subscriptions.subscription_id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Mudança
+    change_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # status_change, plan_change, amount_change, etc.
+    previous_value: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB)
+    new_value: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Contexto
+    changed_by: Mapped[Optional[str]] = mapped_column(String(100))  # user_id, system, admin_id
+    change_reason: Mapped[Optional[str]] = mapped_column(String(255))
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    
+    # Relacionamentos
+    subscription: Mapped["Subscription"] = relationship()
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_subscription_history_subscription_created', 'subscription_id', 'created_at'),
+        Index('ix_subscription_history_change_type', 'change_type', 'created_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<SubscriptionHistory(subscription_id='{self.subscription_id}', change_type='{self.change_type}', created_at='{self.created_at}')>"

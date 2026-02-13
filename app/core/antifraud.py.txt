@@ -1,0 +1,1121 @@
+# app/core/antifraud.py
+"""
+Sistema anti-fraude cross-bot.
+Avalia riscos baseado em fingerprint, comportamento e histórico.
+Stateless, com regras configuráveis e integração com auditoria.
+"""
+
+import enum
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any, Set
+from dataclasses import dataclass, field
+from enum import Enum
+import asyncio
+from collections import defaultdict
+
+from app.core.audit_logger import audit_logger
+from app.utils.cryptography import hash_data
+from app.models.antifraud_event import AntifraudEvent, AntifraudEventType
+from app.models.payment_intent import PaymentIntent, PaymentIntentState
+from app.models.user import User
+from app.core.geo_resolver import GeoRegion
+
+logger = logging.getLogger(__name__)
+
+
+class FraudScore(Enum):
+    """Score de risco de fraude."""
+    LOW = "low"          # Risco baixo - operação normal
+    MEDIUM = "medium"    # Risco médio - verificação adicional
+    HIGH = "high"        # Risco alto - bloqueio automático
+    BLOCKED = "blocked"  # Bloqueado manualmente
+
+
+class FraudAction(Enum):
+    """Ações a serem tomadas baseadas no score."""
+    ALLOW = "allow"                     # Permitir operação
+    REVIEW = "review"                   # Requer revisão manual
+    CAPTCHA = "captcha"                 # Solicitar CAPTCHA
+    DELAY = "delay"                     # Atrasar processamento
+    BLOCK = "block"                     # Bloquear completamente
+
+
+@dataclass
+class RiskFactor:
+    """Fator de risco identificado."""
+    name: str
+    score: float  # 0.0 a 1.0
+    description: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RiskAssessment:
+    """Avaliação de risco completa."""
+    fingerprint: str
+    user_id: Optional[int]
+    bot_id: Optional[str]
+    overall_score: float  # 0.0 a 1.0
+    fraud_score: FraudScore
+    recommended_action: FraudAction
+    factors: List[RiskFactor]
+    timestamp: datetime
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "fingerprint": self.fingerprint,
+            "user_id": self.user_id,
+            "bot_id": self.bot_id,
+            "overall_score": self.overall_score,
+            "fraud_score": self.fraud_score.value,
+            "recommended_action": self.recommended_action.value,
+            "factors": [
+                {
+                    "name": f.name,
+                    "score": f.score,
+                    "description": f.description,
+                    "metadata": f.metadata
+                }
+                for f in self.factors
+            ],
+            "timestamp": self.timestamp.isoformat(),
+            "metadata": self.metadata
+        }
+
+
+class AntifraudRule(Enum):
+    """Regras de antifraude configuráveis."""
+    # Comportamento
+    RAPID_CLICKS = "rapid_clicks"                # Muitos cliques em curto período
+    MULTIPLE_PAYMENT_ATTEMPTS = "multiple_payment_attempts"  # Várias tentativas de pagamento
+    CROSS_BOT_ACTIVITY = "cross_bot_activity"    # Atividade suspeita em múltiplos bots
+    
+    # Geografia
+    UNUSUAL_REGION_CHANGE = "unusual_region_change"  # Mudança de região suspeita
+    HIGH_RISK_REGION = "high_risk_region"        # Região de alto risco
+    
+    # Pagamentos
+    HIGH_FAILURE_RATE = "high_failure_rate"      # Alta taxa de falhas
+    DUPLICATE_PAYMENT = "duplicate_payment"      # Tentativa de pagamento duplicada
+    AMOUNT_MISMATCH = "amount_mismatch"          # Discrepância de valor
+    
+    # Identidade
+    DUPLICATE_FINGERPRINT = "duplicate_fingerprint"  # Fingerprint usado por múltiplos users
+    SUSPICIOUS_USER_DATA = "suspicious_user_data"  # Dados de usuário suspeitos
+    NEW_USER_RISK = "new_user_risk"             # Risco de usuário novo
+
+
+class AntifraudEngine:
+    """
+    Engine de antifraude cross-bot.
+    Avalia riscos baseado em regras configuráveis e histórico.
+    """
+    
+    def __init__(self, rules_config: Optional[Dict[str, Any]] = None):
+        # Configuração de regras (peso e limites)
+        self.rules_config = rules_config or self._get_default_rules_config()
+        
+        # Regiões de alto risco (configurável)
+        self.high_risk_regions: Set[str] = {
+            # Países com alta taxa de fraude (exemplo)
+            "NG", "VN", "RU", "UA", "BY", "KZ", "PK", "BD", "MM"
+        }
+        
+        # Cache para limites de taxa (rate limiting)
+        self._rate_limit_cache: Dict[str, List[datetime]] = defaultdict(list)
+        
+        # Cache de avaliações recentes
+        self._assessment_cache: Dict[str, Tuple[RiskAssessment, datetime]] = {}
+        
+        # Limpar cache periodicamente
+        self._cleanup_task = asyncio.create_task(self._periodic_cache_cleanup())
+    
+    def _get_default_rules_config(self) -> Dict[str, Any]:
+        """Retorna configuração padrão das regras."""
+        return {
+            AntifraudRule.RAPID_CLICKS.value: {
+                "weight": 0.3,
+                "threshold": 10,  # Máximo de cliques
+                "window_seconds": 60,
+                "score_per_excess": 0.1
+            },
+            AntifraudRule.MULTIPLE_PAYMENT_ATTEMPTS.value: {
+                "weight": 0.4,
+                "threshold": 3,  # Máximo de tentativas
+                "window_seconds": 300,
+                "score_per_excess": 0.2
+            },
+            AntifraudRule.CROSS_BOT_ACTIVITY.value: {
+                "weight": 0.5,
+                "threshold": 3,  # Máximo de bots diferentes
+                "window_seconds": 3600,
+                "score_per_excess": 0.3
+            },
+            AntifraudRule.UNUSUAL_REGION_CHANGE.value: {
+                "weight": 0.6,
+                "allowed_changes": 2,
+                "window_seconds": 86400,
+                "score_per_excess": 0.4
+            },
+            AntifraudRule.HIGH_RISK_REGION.value: {
+                "weight": 0.7,
+                "score": 0.8,  # Score fixo para regiões de risco
+                "regions": ["NG", "VN", "RU", "UA", "BY", "KZ", "PK", "BD", "MM"]
+            },
+            AntifraudRule.HIGH_FAILURE_RATE.value: {
+                "weight": 0.4,
+                "threshold_rate": 0.8,  # 80% de falhas
+                "min_attempts": 5,
+                "window_seconds": 3600,
+                "score_per_excess": 0.3
+            },
+            AntifraudRule.DUPLICATE_PAYMENT.value: {
+                "weight": 0.9,
+                "score": 0.95  # Score muito alto para pagamentos duplicados
+            },
+            AntifraudRule.AMOUNT_MISMATCH.value: {
+                "weight": 0.8,
+                "score": 0.9  # Score alto para discrepância de valor
+            },
+            AntifraudRule.DUPLICATE_FINGERPRINT.value: {
+                "weight": 0.7,
+                "threshold_users": 2,
+                "window_seconds": 86400,
+                "score_per_excess": 0.5
+            },
+            AntifraudRule.SUSPICIOUS_USER_DATA.value: {
+                "weight": 0.4,
+                "indicators": {
+                    "no_username": 0.3,
+                    "recent_account": 0.4,
+                    "generic_name": 0.2
+                }
+            },
+            AntifraudRule.NEW_USER_RISK.value: {
+                "weight": 0.2,
+                "score": 0.1,  # Score baixo, apenas para sinalização
+                "age_threshold_hours": 24
+            }
+        }
+    
+    async def assess_risk(
+        self,
+        fingerprint: str,
+        user_id: Optional[int] = None,
+        bot_id: Optional[str] = None,
+        region: Optional[GeoRegion] = None,
+        payment_amount: Optional[float] = None,
+        expected_amount: Optional[float] = None,
+        event_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> RiskAssessment:
+        """
+        Avalia o risco de uma interação.
+        
+        Args:
+            fingerprint: Fingerprint do usuário
+            user_id: ID do usuário (opcional)
+            bot_id: ID do bot (opcional)
+            region: Região do usuário
+            payment_amount: Valor do pagamento (se aplicável)
+            expected_amount: Valor esperado (se aplicável)
+            event_type: Tipo de evento
+            metadata: Metadados adicionais
+            
+        Returns:
+            RiskAssessment com score e fatores
+        """
+        # Verificar cache recente
+        cache_key = f"{fingerprint}:{user_id}:{bot_id}:{event_type}"
+        if cache_key in self._assessment_cache:
+            assessment, cached_at = self._assessment_cache[cache_key]
+            if (datetime.utcnow() - cached_at).seconds < 300:  # 5 minutos
+                return assessment
+        
+        metadata = metadata or {}
+        factors: List[RiskFactor] = []
+        
+        # Coletar eventos recentes para análise
+        recent_events = await self._get_recent_events(
+            fingerprint=fingerprint,
+            user_id=user_id,
+            bot_id=bot_id,
+            hours=24
+        )
+        
+        # Coletar histórico de pagamentos
+        payment_history = await self._get_payment_history(
+            fingerprint=fingerprint,
+            user_id=user_id,
+            bot_id=bot_id
+        )
+        
+        # Aplicar regras de análise
+        if user_id:
+            # 1. Verificar cliques rápidos
+            rapid_clicks_factor = await self._check_rapid_clicks(
+                fingerprint, user_id, bot_id, recent_events
+            )
+            if rapid_clicks_factor:
+                factors.append(rapid_clicks_factor)
+            
+            # 2. Verificar múltiplas tentativas de pagamento
+            payment_attempts_factor = await self._check_multiple_payment_attempts(
+                fingerprint, user_id, bot_id, recent_events
+            )
+            if payment_attempts_factor:
+                factors.append(payment_attempts_factor)
+            
+            # 3. Verificar atividade cross-bot
+            cross_bot_factor = await self._check_cross_bot_activity(
+                fingerprint, user_id, recent_events
+            )
+            if cross_bot_factor:
+                factors.append(cross_bot_factor)
+            
+            # 4. Verificar mudanças de região suspeitas
+            if region:
+                region_change_factor = await self._check_unusual_region_change(
+                    fingerprint, user_id, region, recent_events
+                )
+                if region_change_factor:
+                    factors.append(region_change_factor)
+                
+                # 5. Verificar região de alto risco
+                high_risk_factor = self._check_high_risk_region(region)
+                if high_risk_factor:
+                    factors.append(high_risk_factor)
+            
+            # 6. Verificar taxa de falhas em pagamentos
+            failure_rate_factor = await self._check_high_failure_rate(
+                fingerprint, user_id, bot_id, payment_history
+            )
+            if failure_rate_factor:
+                factors.append(failure_rate_factor)
+            
+            # 7. Verificar pagamento duplicado
+            duplicate_payment_factor = await self._check_duplicate_payment(
+                fingerprint, user_id, bot_id, recent_events
+            )
+            if duplicate_payment_factor:
+                factors.append(duplicate_payment_factor)
+            
+            # 8. Verificar discrepância de valor
+            if payment_amount and expected_amount:
+                amount_mismatch_factor = self._check_amount_mismatch(
+                    payment_amount, expected_amount
+                )
+                if amount_mismatch_factor:
+                    factors.append(amount_mismatch_factor)
+            
+            # 9. Verificar fingerprint duplicado
+            duplicate_fingerprint_factor = await self._check_duplicate_fingerprint(
+                fingerprint, user_id, recent_events
+            )
+            if duplicate_fingerprint_factor:
+                factors.append(duplicate_fingerprint_factor)
+            
+            # 10. Verificar dados suspeitos do usuário
+            suspicious_data_factor = await self._check_suspicious_user_data(user_id)
+            if suspicious_data_factor:
+                factors.append(suspicious_data_factor)
+            
+            # 11. Verificar risco de usuário novo
+            new_user_factor = await self._check_new_user_risk(user_id)
+            if new_user_factor:
+                factors.append(new_user_factor)
+        
+        # Calcular score geral
+        overall_score = self._calculate_overall_score(factors)
+        
+        # Determinar FraudScore e ação recomendada
+        fraud_score, recommended_action = self._score_to_fraud_action(overall_score)
+        
+        # Criar avaliação
+        assessment = RiskAssessment(
+            fingerprint=fingerprint,
+            user_id=user_id,
+            bot_id=bot_id,
+            overall_score=overall_score,
+            fraud_score=fraud_score,
+            recommended_action=recommended_action,
+            factors=factors,
+            timestamp=datetime.utcnow(),
+            metadata={
+                "region": region.value if region else None,
+                "event_type": event_type,
+                "payment_amount": payment_amount,
+                "expected_amount": expected_amount,
+                **metadata
+            }
+        )
+        
+        # Registrar avaliação
+        await self._record_assessment(assessment)
+        
+        # Se risco alto, registrar auditoria especial
+        if fraud_score in [FraudScore.HIGH, FraudScore.BLOCKED]:
+            await self._log_high_risk_assessment(assessment)
+        
+        # Cache da avaliação
+        self._assessment_cache[cache_key] = (assessment, datetime.utcnow())
+        
+        return assessment
+    
+    async def _check_rapid_clicks(
+        self,
+        fingerprint: str,
+        user_id: int,
+        bot_id: str,
+        recent_events: List[AntifraudEvent]
+    ) -> Optional[RiskFactor]:
+        """Verifica se há muitos cliques em curto período."""
+        rule_config = self.rules_config[AntifraudRule.RAPID_CLICKS.value]
+        
+        # Filtrar eventos de clique recentes
+        window_start = datetime.utcnow() - timedelta(seconds=rule_config["window_seconds"])
+        click_events = [
+            e for e in recent_events
+            if e.event_type == AntifraudEventType.CLICK.value
+            and e.bot_id == bot_id
+            and e.timestamp >= window_start
+        ]
+        
+        click_count = len(click_events)
+        threshold = rule_config["threshold"]
+        
+        if click_count > threshold:
+            excess = click_count - threshold
+            score = min(1.0, rule_config["score_per_excess"] * excess)
+            
+            return RiskFactor(
+                name=AntifraudRule.RAPID_CLICKS.value,
+                score=score,
+                description=f"Muitos cliques ({click_count} em {rule_config['window_seconds']}s)",
+                metadata={
+                    "click_count": click_count,
+                    "threshold": threshold,
+                    "window_seconds": rule_config["window_seconds"]
+                }
+            )
+        
+        return None
+    
+    async def _check_multiple_payment_attempts(
+        self,
+        fingerprint: str,
+        user_id: int,
+        bot_id: str,
+        recent_events: List[AntifraudEvent]
+    ) -> Optional[RiskFactor]:
+        """Verifica múltiplas tentativas de pagamento."""
+        rule_config = self.rules_config[AntifraudRule.MULTIPLE_PAYMENT_ATTEMPTS.value]
+        
+        window_start = datetime.utcnow() - timedelta(seconds=rule_config["window_seconds"])
+        payment_events = [
+            e for e in recent_events
+            if e.event_type == AntifraudEventType.PAYMENT_ATTEMPT.value
+            and e.bot_id == bot_id
+            and e.timestamp >= window_start
+        ]
+        
+        attempt_count = len(payment_events)
+        threshold = rule_config["threshold"]
+        
+        if attempt_count > threshold:
+            excess = attempt_count - threshold
+            score = min(1.0, rule_config["score_per_excess"] * excess)
+            
+            return RiskFactor(
+                name=AntifraudRule.MULTIPLE_PAYMENT_ATTEMPTS.value,
+                score=score,
+                description=f"Múltiplas tentativas de pagamento ({attempt_count} em {rule_config['window_seconds']}s)",
+                metadata={
+                    "attempt_count": attempt_count,
+                    "threshold": threshold,
+                    "window_seconds": rule_config["window_seconds"]
+                }
+            )
+        
+        return None
+    
+    async def _check_cross_bot_activity(
+        self,
+        fingerprint: str,
+        user_id: int,
+        recent_events: List[AntifraudEvent]
+    ) -> Optional[RiskFactor]:
+        """Verifica atividade suspeita em múltiplos bots."""
+        rule_config = self.rules_config[AntifraudRule.CROSS_BOT_ACTIVITY.value]
+        
+        window_start = datetime.utcnow() - timedelta(seconds=rule_config["window_seconds"])
+        recent_events_window = [e for e in recent_events if e.timestamp >= window_start]
+        
+        # Contar bots únicos
+        unique_bots = set(e.bot_id for e in recent_events_window if e.bot_id)
+        bot_count = len(unique_bots)
+        threshold = rule_config["threshold"]
+        
+        if bot_count > threshold:
+            excess = bot_count - threshold
+            score = min(1.0, rule_config["score_per_excess"] * excess)
+            
+            return RiskFactor(
+                name=AntifraudRule.CROSS_BOT_ACTIVITY.value,
+                score=score,
+                description=f"Atividade em múltiplos bots ({bot_count} bots em {rule_config['window_seconds']}s)",
+                metadata={
+                    "bot_count": bot_count,
+                    "bots": list(unique_bots),
+                    "threshold": threshold,
+                    "window_seconds": rule_config["window_seconds"]
+                }
+            )
+        
+        return None
+    
+    async def _check_unusual_region_change(
+        self,
+        fingerprint: str,
+        user_id: int,
+        current_region: GeoRegion,
+        recent_events: List[AntifraudEvent]
+    ) -> Optional[RiskFactor]:
+        """Verifica mudanças de região suspeitas."""
+        rule_config = self.rules_config[AntifraudRule.UNUSUAL_REGION_CHANGE.value]
+        
+        window_start = datetime.utcnow() - timedelta(seconds=rule_config["window_seconds"])
+        region_events = [
+            e for e in recent_events
+            if e.metadata and e.metadata.get("region")
+            and e.timestamp >= window_start
+        ]
+        
+        # Coletar regiões únicas
+        regions = set()
+        for e in region_events:
+            if e.metadata.get("region"):
+                try:
+                    regions.add(GeoRegion(e.metadata["region"]))
+                except ValueError:
+                    continue
+        
+        regions.add(current_region)
+        region_count = len(regions)
+        allowed_changes = rule_config["allowed_changes"]
+        
+        if region_count > allowed_changes:
+            excess = region_count - allowed_changes
+            score = min(1.0, rule_config["score_per_excess"] * excess)
+            
+            return RiskFactor(
+                name=AntifraudRule.UNUSUAL_REGION_CHANGE.value,
+                score=score,
+                description=f"Mudanças suspeitas de região ({region_count} regiões em {rule_config['window_seconds']}s)",
+                metadata={
+                    "region_count": region_count,
+                    "regions": [r.value for r in regions],
+                    "current_region": current_region.value,
+                    "allowed_changes": allowed_changes,
+                    "window_seconds": rule_config["window_seconds"]
+                }
+            )
+        
+        return None
+    
+    def _check_high_risk_region(self, region: GeoRegion) -> Optional[RiskFactor]:
+        """Verifica se a região é de alto risco."""
+        # Conversão simplificada - em produção usar mapeamento adequado
+        region_to_country = {
+            GeoRegion.BR: "BR",
+            GeoRegion.US: "US",
+            GeoRegion.EU: "DE",  # Exemplo
+            GeoRegion.LATAM: "MX",  # Exemplo
+            GeoRegion.GLOBAL: None
+        }
+        
+        country_code = region_to_country.get(region)
+        if country_code and country_code in self.high_risk_regions:
+            rule_config = self.rules_config[AntifraudRule.HIGH_RISK_REGION.value]
+            
+            return RiskFactor(
+                name=AntifraudRule.HIGH_RISK_REGION.value,
+                score=rule_config["score"],
+                description=f"Região de alto risco detectada",
+                metadata={
+                    "region": region.value,
+                    "country_code": country_code
+                }
+            )
+        
+        return None
+    
+    async def _check_high_failure_rate(
+        self,
+        fingerprint: str,
+        user_id: int,
+        bot_id: str,
+        payment_history: List[PaymentIntent]
+    ) -> Optional[RiskFactor]:
+        """Verifica alta taxa de falhas em pagamentos."""
+        rule_config = self.rules_config[AntifraudRule.HIGH_FAILURE_RATE.value]
+        
+        # Filtrar pagamentos recentes
+        window_start = datetime.utcnow() - timedelta(seconds=rule_config["window_seconds"])
+        recent_payments = [
+            p for p in payment_history
+            if p.created_at >= window_start
+        ]
+        
+        if len(recent_payments) < rule_config["min_attempts"]:
+            return None
+        
+        # Contar por status
+        status_counts = defaultdict(int)
+        for payment in recent_payments:
+            status_counts[payment.status] += 1
+        
+        attempts = len(recent_payments)
+        failures = status_counts.get(PaymentIntentState.FAILED.value, 0)
+        
+        if attempts == 0:
+            return None
+        
+        failure_rate = failures / attempts
+        threshold = rule_config["threshold_rate"]
+        
+        if failure_rate > threshold:
+            excess = failure_rate - threshold
+            score = min(1.0, rule_config["score_per_excess"] * (excess * 10))
+            
+            return RiskFactor(
+                name=AntifraudRule.HIGH_FAILURE_RATE.value,
+                score=score,
+                description=f"Alta taxa de falhas ({failures}/{attempts} = {failure_rate:.1%})",
+                metadata={
+                    "attempts": attempts,
+                    "failures": failures,
+                    "failure_rate": failure_rate,
+                    "threshold_rate": threshold
+                }
+            )
+        
+        return None
+    
+    async def _check_duplicate_payment(
+        self,
+        fingerprint: str,
+        user_id: int,
+        bot_id: str,
+        recent_events: List[AntifraudEvent]
+    ) -> Optional[RiskFactor]:
+        """Verifica tentativa de pagamento duplicada."""
+        rule_config = self.rules_config[AntifraudRule.DUPLICATE_PAYMENT.value]
+        
+        # Verificar eventos recentes de pagamento com mesmo fingerprint
+        window_start = datetime.utcnow() - timedelta(minutes=30)
+        payment_events = [
+            e for e in recent_events
+            if e.event_type == AntifraudEventType.PAYMENT_ATTEMPT.value
+            and e.timestamp >= window_start
+        ]
+        
+        if len(payment_events) > 1:
+            return RiskFactor(
+                name=AntifraudRule.DUPLICATE_PAYMENT.value,
+                score=rule_config["score"],
+                description=f"Possível pagamento duplicado detectado",
+                metadata={
+                    "event_count": len(payment_events),
+                    "time_window_minutes": 30
+                }
+            )
+        
+        return None
+    
+    def _check_amount_mismatch(
+        self,
+        payment_amount: float,
+        expected_amount: float
+    ) -> Optional[RiskFactor]:
+        """Verifica discrepância entre valor pago e esperado."""
+        rule_config = self.rules_config[AntifraudRule.AMOUNT_MISMATCH.value]
+        
+        # Calcular diferença percentual
+        if expected_amount == 0:
+            return None
+        
+        difference = abs(payment_amount - expected_amount) / expected_amount
+        
+        if difference > 0.05:  # 5% de diferença
+            return RiskFactor(
+                name=AntifraudRule.AMOUNT_MISMATCH.value,
+                score=rule_config["score"] * min(difference, 1.0),
+                description=f"Discrepância no valor do pagamento ({difference:.1%})",
+                metadata={
+                    "payment_amount": payment_amount,
+                    "expected_amount": expected_amount,
+                    "difference_percent": difference
+                }
+            )
+        
+        return None
+    
+    async def _check_duplicate_fingerprint(
+        self,
+        fingerprint: str,
+        user_id: int,
+        recent_events: List[AntifraudEvent]
+    ) -> Optional[RiskFactor]:
+        """Verifica se o fingerprint é usado por múltiplos users."""
+        rule_config = self.rules_config[AntifraudRule.DUPLICATE_FINGERPRINT.value]
+        
+        window_start = datetime.utcnow() - timedelta(seconds=rule_config["window_seconds"])
+        fingerprint_events = [
+            e for e in recent_events
+            if e.fingerprint == fingerprint
+            and e.timestamp >= window_start
+        ]
+        
+        # Contar users únicos para este fingerprint
+        unique_users = set(e.user_id for e in fingerprint_events if e.user_id)
+        user_count = len(unique_users)
+        threshold = rule_config["threshold_users"]
+        
+        if user_count > threshold:
+            excess = user_count - threshold
+            score = min(1.0, rule_config["score_per_excess"] * excess)
+            
+            return RiskFactor(
+                name=AntifraudRule.DUPLICATE_FINGERPRINT.value,
+                score=score,
+                description=f"Fingerprint usado por múltiplos users ({user_count} users)",
+                metadata={
+                    "user_count": user_count,
+                    "users": list(unique_users),
+                    "threshold": threshold
+                }
+            )
+        
+        return None
+    
+    async def _check_suspicious_user_data(self, user_id: int) -> Optional[RiskFactor]:
+        """Verifica dados suspeitos do usuário."""
+        rule_config = self.rules_config[AntifraudRule.SUSPICIOUS_USER_DATA.value]
+        
+        try:
+            user = await User.get_by_id(user_id)
+            if not user:
+                return None
+            
+            score = 0.0
+            indicators = []
+            
+            # Verificar ausência de username
+            if not user.username:
+                score += rule_config["indicators"]["no_username"]
+                indicators.append("no_username")
+            
+            # Verificar se a conta é recente (< 24h)
+            account_age = (datetime.utcnow() - user.created_at).total_seconds()
+            if account_age < 86400:  # 24 horas
+                score += rule_config["indicators"]["recent_account"]
+                indicators.append("recent_account")
+            
+            # Verificar nomes genéricos (simplificado)
+            generic_names = ["user", "test", "admin", "anonymous"]
+            if user.first_name and any(name in user.first_name.lower() for name in generic_names):
+                score += rule_config["indicators"]["generic_name"]
+                indicators.append("generic_name")
+            
+            if score > 0:
+                return RiskFactor(
+                    name=AntifraudRule.SUSPICIOUS_USER_DATA.value,
+                    score=min(score, 1.0),
+                    description=f"Dados de usuário suspeitos detectados",
+                    metadata={
+                        "indicators": indicators,
+                        "username_present": bool(user.username),
+                        "account_age_hours": account_age / 3600
+                    }
+                )
+        
+        except Exception as e:
+            logger.debug(f"Error checking suspicious user data: {e}")
+        
+        return None
+    
+    async def _check_new_user_risk(self, user_id: int) -> Optional[RiskFactor]:
+        """Verifica risco de usuário novo."""
+        rule_config = self.rules_config[AntifraudRule.NEW_USER_RISK.value]
+        
+        try:
+            user = await User.get_by_id(user_id)
+            if not user:
+                return None
+            
+            account_age = (datetime.utcnow() - user.created_at).total_seconds()
+            age_threshold = rule_config["age_threshold_hours"] * 3600
+            
+            if account_age < age_threshold:
+                return RiskFactor(
+                    name=AntifraudRule.NEW_USER_RISK.value,
+                    score=rule_config["score"],
+                    description=f"Usuário novo (conta criada há {account_age/3600:.1f}h)",
+                    metadata={
+                        "account_age_hours": account_age / 3600,
+                        "age_threshold_hours": rule_config["age_threshold_hours"]
+                    }
+                )
+        
+        except Exception as e:
+            logger.debug(f"Error checking new user risk: {e}")
+        
+        return None
+    
+    def _calculate_overall_score(self, factors: List[RiskFactor]) -> float:
+        """Calcula score geral baseado nos fatores e seus pesos."""
+        if not factors:
+            return 0.0
+        
+        weighted_sum = 0.0
+        total_weight = 0.0
+        
+        for factor in factors:
+            rule_config = self.rules_config.get(factor.name)
+            if rule_config:
+                weight = rule_config.get("weight", 0.1)
+                weighted_sum += factor.score * weight
+                total_weight += weight
+        
+        if total_weight == 0:
+            return 0.0
+        
+        # Normalizar para 0-1
+        overall_score = weighted_sum / total_weight
+        return min(1.0, overall_score)
+    
+    def _score_to_fraud_action(self, score: float) -> Tuple[FraudScore, FraudAction]:
+        """Converte score numérico para enum FraudScore e ação recomendada."""
+        if score >= 0.8:
+            return FraudScore.BLOCKED, FraudAction.BLOCK
+        elif score >= 0.6:
+            return FraudScore.HIGH, FraudAction.REVIEW
+        elif score >= 0.3:
+            return FraudScore.MEDIUM, FraudAction.DELAY
+        else:
+            return FraudScore.LOW, FraudAction.ALLOW
+    
+    async def _get_recent_events(
+        self,
+        fingerprint: str,
+        user_id: Optional[int] = None,
+        bot_id: Optional[str] = None,
+        hours: int = 24
+    ) -> List[AntifraudEvent]:
+        """
+        Busca eventos recentes de antifraude.
+        """
+        try:
+            return await AntifraudEvent.get_recent_events(
+                fingerprint=fingerprint,
+                user_id=user_id,
+                bot_id=bot_id,
+                hours=hours
+            )
+        except Exception as e:
+            logger.error(f"Error fetching recent antifraud events: {e}")
+            return []
+    
+    async def _get_payment_history(
+        self,
+        fingerprint: str,
+        user_id: Optional[int] = None,
+        bot_id: Optional[str] = None
+    ) -> List[PaymentIntent]:
+        """
+        Busca histórico de pagamentos.
+        """
+        try:
+            return await PaymentIntent.get_user_payment_history(
+                fingerprint=fingerprint,
+                user_id=user_id,
+                bot_id=bot_id,
+                days=7
+            )
+        except Exception as e:
+            logger.error(f"Error fetching payment history: {e}")
+            return []
+    
+    async def _record_assessment(self, assessment: RiskAssessment) -> None:
+        """Registra a avaliação de risco."""
+        try:
+            # Registrar evento de avaliação
+            await AntifraudEvent.create(
+                fingerprint=assessment.fingerprint,
+                user_id=assessment.user_id,
+                bot_id=assessment.bot_id,
+                event_type=AntifraudEventType.RISK_ASSESSMENT.value,
+                risk_score=assessment.overall_score,
+                fraud_score=assessment.fraud_score.value,
+                metadata=assessment.to_dict()
+            )
+        except Exception as e:
+            logger.error(f"Error recording antifraud assessment: {e}")
+    
+    async def _log_high_risk_assessment(self, assessment: RiskAssessment) -> None:
+        """Registra auditoria para avaliações de alto risco."""
+        try:
+            await audit_logger.log_async(
+                resource_type="antifraud",
+                resource_id=assessment.fingerprint,
+                action="high_risk_detected",
+                actor="system",
+                description=f"Alto risco detectado: {assessment.fraud_score.value}",
+                metadata=assessment.to_dict()
+            )
+        except Exception as e:
+            logger.error(f"Error logging high risk assessment: {e}")
+    
+    async def record_event(
+        self,
+        fingerprint: str,
+        event_type: AntifraudEventType,
+        user_id: Optional[int] = None,
+        bot_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Registra um evento para análise de antifraude.
+        
+        Args:
+            fingerprint: Fingerprint do usuário
+            event_type: Tipo de evento
+            user_id: ID do usuário (opcional)
+            bot_id: ID do bot (opcional)
+            metadata: Metadados adicionais (opcional)
+        """
+        try:
+            await AntifraudEvent.create(
+                fingerprint=fingerprint,
+                user_id=user_id,
+                bot_id=bot_id,
+                event_type=event_type.value,
+                metadata=metadata or {}
+            )
+            
+            # Atualizar cache de rate limiting se aplicável
+            if event_type == AntifraudEventType.CLICK:
+                cache_key = f"clicks:{fingerprint}:{bot_id}"
+                self._rate_limit_cache[cache_key].append(datetime.utcnow())
+            
+        except Exception as e:
+            logger.error(f"Error recording antifraud event: {e}")
+    
+    async def check_rate_limit(
+        self,
+        fingerprint: str,
+        bot_id: str,
+        rule: AntifraudRule
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """
+        Verifica se uma ação excede o limite de taxa.
+        
+        Returns:
+            Tuple (is_allowed, metadata)
+        """
+        rule_config = self.rules_config.get(rule.value)
+        if not rule_config:
+            return True, None
+        
+        cache_key = f"{rule.value}:{fingerprint}:{bot_id}"
+        now = datetime.utcnow()
+        window_start = now - timedelta(seconds=rule_config["window_seconds"])
+        
+        # Filtrar eventos dentro da janela
+        events = [ts for ts in self._rate_limit_cache.get(cache_key, []) if ts >= window_start]
+        
+        # Atualizar cache
+        self._rate_limit_cache[cache_key] = events
+        
+        # Verificar limite
+        threshold = rule_config["threshold"]
+        if len(events) >= threshold:
+            metadata = {
+                "rule": rule.value,
+                "attempts": len(events),
+                "threshold": threshold,
+                "window_seconds": rule_config["window_seconds"]
+            }
+            return False, metadata
+        
+        # Registrar novo evento
+        events.append(now)
+        self._rate_limit_cache[cache_key] = events
+        
+        return True, None
+    
+    async def _periodic_cache_cleanup(self, interval: int = 300):
+        """Limpa periodicamente o cache de rate limiting."""
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                self._cleanup_caches()
+            except Exception as e:
+                logger.error(f"Error in cache cleanup task: {e}")
+    
+    def _cleanup_caches(self, max_age_seconds: int = 3600):
+        """Limpa caches antigos."""
+        now = datetime.utcnow()
+        cutoff = now - timedelta(seconds=max_age_seconds)
+        
+        # Limpar rate limit cache
+        keys_to_delete = []
+        for key, timestamps in self._rate_limit_cache.items():
+            recent = [ts for ts in timestamps if ts >= cutoff]
+            if recent:
+                self._rate_limit_cache[key] = recent
+            else:
+                keys_to_delete.append(key)
+        
+        for key in keys_to_delete:
+            del self._rate_limit_cache[key]
+        
+        # Limpar assessment cache
+        assessment_keys_to_delete = []
+        for key, (assessment, cached_at) in self._assessment_cache.items():
+            if cached_at < cutoff:
+                assessment_keys_to_delete.append(key)
+        
+        for key in assessment_keys_to_delete:
+            del self._assessment_cache[key]
+        
+        if keys_to_delete or assessment_keys_to_delete:
+            logger.debug(
+                f"Cleaned up {len(keys_to_delete)} rate limit entries "
+                f"and {len(assessment_keys_to_delete)} assessment entries"
+            )
+    
+    async def get_user_risk_profile(
+        self,
+        user_id: int,
+        days: int = 30
+    ) -> Dict[str, Any]:
+        """
+        Retorna perfil de risco do usuário.
+        """
+        try:
+            events = await AntifraudEvent.get_user_events(user_id, days)
+            
+            # Calcular estatísticas
+            total_events = len(events)
+            event_types = defaultdict(int)
+            for event in events:
+                event_types[event.event_type] += 1
+            
+            # Última avaliação de risco
+            last_assessment = None
+            for event in events:
+                if event.event_type == AntifraudEventType.RISK_ASSESSMENT.value:
+                    last_assessment = event
+                    break
+            
+            # Histórico de scores
+            risk_scores = [
+                event.risk_score for event in events 
+                if event.risk_score is not None
+            ]
+            
+            return {
+                "user_id": user_id,
+                "total_events": total_events,
+                "event_types": dict(event_types),
+                "last_assessment": last_assessment.metadata if last_assessment else None,
+                "avg_risk_score": sum(risk_scores) / len(risk_scores) if risk_scores else 0,
+                "max_risk_score": max(risk_scores) if risk_scores else 0,
+                "analysis_period_days": days
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting user risk profile: {e}")
+            return {}
+    
+    async def block_user(
+        self,
+        user_id: int,
+        reason: str,
+        blocked_by: str = "system",
+        duration_hours: Optional[int] = None
+    ) -> bool:
+        """
+        Bloqueia um usuário manualmente.
+        
+        Args:
+            user_id: ID do usuário
+            reason: Motivo do bloqueio
+            blocked_by: Quem bloqueou
+            duration_hours: Duração do bloqueio (None = permanente)
+            
+        Returns:
+            True se bloqueado com sucesso
+        """
+        try:
+            await AntifraudEvent.create(
+                fingerprint=f"blocked_user_{user_id}",
+                user_id=user_id,
+                event_type=AntifraudEventType.MANUAL_BLOCK.value,
+                metadata={
+                    "reason": reason,
+                    "blocked_by": blocked_by,
+                    "duration_hours": duration_hours,
+                    "blocked_at": datetime.utcnow().isoformat()
+                }
+            )
+            
+            # Registrar auditoria
+            await audit_logger.log_async(
+                resource_type="user",
+                resource_id=str(user_id),
+                action="block",
+                actor=blocked_by,
+                description=f"Usuário bloqueado manualmente: {reason}",
+                metadata={
+                    "duration_hours": duration_hours,
+                    "reason": reason
+                }
+            )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error blocking user {user_id}: {e}")
+            return False
+    
+    async def close(self):
+        """Libera recursos."""
+        if hasattr(self, '_cleanup_task'):
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+
+# Factory para criação do AntifraudEngine
+def create_antifraud_engine(rules_config: Optional[Dict[str, Any]] = None) -> AntifraudEngine:
+    """Cria uma instância configurada do AntifraudEngine."""
+    return AntifraudEngine(rules_config=rules_config)
+
+
+# Singleton para uso global (opcional)
+_antifraud_engine_instance: Optional[AntifraudEngine] = None
+
+def get_antifraud_engine() -> AntifraudEngine:
+    """Retorna instância singleton do AntifraudEngine."""
+    global _antifraud_engine_instance
+    if _antifraud_engine_instance is None:
+        _antifraud_engine_instance = create_antifraud_engine()
+    return _antifraud_engine_instance

@@ -1,0 +1,549 @@
+# app/models/entitlement.py
+"""
+Modelo de Entitlement - Controle de acessos concedidos aos usuários.
+Fonte única da verdade para permissões, com escopo e expiração.
+"""
+
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text, Enum
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+import enum
+
+from app.database import Base
+
+
+class EntitlementScope(enum.Enum):
+    """Escopo do entitlement."""
+    GLOBAL = "global"               # Acesso global ao sistema
+    FEATURE = "feature"             # Acesso a uma feature específica
+    BOT = "bot"                    # Acesso a um bot específico
+    CHANNEL = "channel"            # Acesso a um canal específico
+    RESOURCE = "resource"          # Acesso a um recurso específico
+    API = "api"                    # Acesso a uma API específica
+
+
+class EntitlementType(enum.Enum):
+    """Tipo de entitlement."""
+    ACCESS = "access"              # Acesso a algo
+    FEATURE_FLAG = "feature_flag"  # Feature flag específica
+    QUOTA = "quota"                # Limite de uso (quotas)
+    PERMISSION = "permission"      # Permissão específica
+    ROLE = "role"                  # Role/papel
+
+
+class EntitlementStatus(enum.Enum):
+    """Status do entitlement."""
+    ACTIVE = "active"              # Ativo e válido
+    PENDING = "pending"            # Aguardando ativação
+    EXPIRED = "expired"            # Expirado
+    REVOKED = "revoked"            # Revogado manualmente
+    SUSPENDED = "suspended"        # Suspenso temporariamente
+    CONSUMED = "consumed"          # Consumido (para quotas)
+
+
+class Entitlement(Base):
+    """
+    Entitlement - controle de acesso imutável.
+    
+    Princípios:
+    1. Imutabilidade: Uma vez criado, não pode ser alterado
+    2. Escopo preciso: Define exatamente o que é concedido
+    3. Expiração automática: Tem validade controlada
+    4. Fonte única da verdade: Nenhum outro sistema concede acesso
+    5. Isolamento por tenant
+    """
+    
+    __tablename__ = "entitlements"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    entitlement_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # ent_xxx
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Usuário beneficiário
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.users.id"), nullable=False, index=True)
+    
+    # Origem do entitlement
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # payment, manual, promotion, etc.
+    source_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # ID da origem (payment_intent_id, admin_id, etc.)
+    
+    # Definição do entitlement
+    entitlement_type: Mapped[EntitlementType] = mapped_column(Enum(EntitlementType), nullable=False)
+    scope: Mapped[EntitlementScope] = mapped_column(Enum(EntitlementScope), nullable=False)
+    
+    # Recurso específico
+    resource_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # ID do recurso (bot_id, feature_id, etc.)
+    resource_type: Mapped[Optional[str]] = mapped_column(String(50), index=True)  # Tipo do recurso
+    
+    # Permissões
+    permissions: Mapped[List[str]] = mapped_column(JSONB, nullable=False, default=list)  # Lista de permissões específicas
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Quotas (se aplicável)
+    quota_limit: Mapped[Optional[int]] = mapped_column(Integer)  # Limite total
+    quota_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # Usado até agora
+    quota_reset_frequency: Mapped[Optional[str]] = mapped_column(String(50))  # daily, weekly, monthly, never
+    
+    # Validade
+    status: Mapped[EntitlementStatus] = mapped_column(Enum(EntitlementStatus), nullable=False, default=EntitlementStatus.ACTIVE)
+    valid_from: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    valid_until: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)  # Para expiração automática
+    
+    # Revogação
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    revoked_by: Mapped[Optional[str]] = mapped_column(String(100))
+    revocation_reason: Mapped[Optional[str]] = mapped_column(String(255))
+    
+    # Consumo (para quotas)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    activated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="entitlements")
+    user: Mapped["User"] = relationship(back_populates="entitlements")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="entitlement", cascade="all, delete-orphan")
+    usage_logs: Mapped[List["EntitlementUsage"]] = relationship(back_populates="entitlement", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_entitlements_tenant_user_status', 'tenant_id', 'user_id', 'status'),
+        Index('ix_entitlements_scope_resource', 'scope', 'resource_id', 'resource_type'),
+        Index('ix_entitlements_validity', 'valid_from', 'valid_until', 'expires_at', 'status'),
+        Index('ix_entitlements_source', 'source_type', 'source_id'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<Entitlement(id='{self.id}', entitlement_id='{self.entitlement_id}', user='{self.user_id}', type='{self.entitlement_type.value}', status='{self.status.value}')>"
+    
+    def to_dict(self, include_usage: bool = False) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "entitlement_id": self.entitlement_id,
+            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
+            "source_type": self.source_type,
+            "source_id": self.source_id,
+            "entitlement_type": self.entitlement_type.value,
+            "scope": self.scope.value,
+            "resource_id": self.resource_id,
+            "resource_type": self.resource_type,
+            "permissions": self.permissions,
+            "metadata": self.metadata,
+            "quota_limit": self.quota_limit,
+            "quota_used": self.quota_used,
+            "quota_remaining": self.quota_remaining,
+            "quota_reset_frequency": self.quota_reset_frequency,
+            "status": self.status.value,
+            "valid_from": self.valid_from.isoformat() if self.valid_from else None,
+            "valid_until": self.valid_until.isoformat() if self.valid_until else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
+            "revoked_by": self.revoked_by,
+            "revocation_reason": self.revocation_reason,
+            "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,
+            "consumed_at": self.consumed_at.isoformat() if self.consumed_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "activated_at": self.activated_at.isoformat() if self.activated_at else None,
+            "is_active": self.is_active,
+            "is_expired": self.is_expired,
+            "is_revoked": self.is_revoked,
+            "has_quota": self.has_quota,
+            "has_quota_available": self.has_quota_available,
+            "days_remaining": self.days_remaining,
+            "valid_for_resource": self.valid_for_resource
+        }
+        
+        if include_usage and self.usage_logs:
+            data["recent_usage"] = [
+                log.to_dict() for log in sorted(
+                    self.usage_logs, 
+                    key=lambda x: x.used_at or x.created_at, 
+                    reverse=True
+                )[:10]
+            ]
+        
+        return data
+    
+    @property
+    def is_active(self) -> bool:
+        """Verifica se o entitlement está ativo."""
+        if self.status != EntitlementStatus.ACTIVE:
+            return False
+        
+        now = datetime.utcnow()
+        
+        # Verifica valid_from
+        if self.valid_from and now < self.valid_from:
+            return False
+        
+        # Verifica valid_until
+        if self.valid_until and now > self.valid_until:
+            return False
+        
+        # Verifica expires_at
+        if self.expires_at and now > self.expires_at:
+            return False
+        
+        return True
+    
+    @property
+    def is_expired(self) -> bool:
+        """Verifica se o entitlement expirou."""
+        if self.status == EntitlementStatus.EXPIRED:
+            return True
+        
+        now = datetime.utcnow()
+        
+        # Verifica valid_until
+        if self.valid_until and now > self.valid_until:
+            return True
+        
+        # Verifica expires_at
+        if self.expires_at and now > self.expires_at:
+            return True
+        
+        return False
+    
+    @property
+    def is_revoked(self) -> bool:
+        """Verifica se o entitlement foi revogado."""
+        return self.status == EntitlementStatus.REVOKED or self.revoked_at is not None
+    
+    @property
+    def has_quota(self) -> bool:
+        """Verifica se tem sistema de quota."""
+        return self.quota_limit is not None
+    
+    @property
+    def quota_remaining(self) -> Optional[int]:
+        """Retorna quota restante."""
+        if not self.has_quota:
+            return None
+        
+        return max(0, self.quota_limit - self.quota_used)
+    
+    @property
+    def has_quota_available(self) -> bool:
+        """Verifica se há quota disponível."""
+        if not self.has_quota:
+            return True
+        
+        return self.quota_used < self.quota_limit
+    
+    @property
+    def days_remaining(self) -> Optional[int]:
+        """Retorna dias restantes até expiração."""
+        if not self.expires_at:
+            return None
+        
+        now = datetime.utcnow()
+        if now > self.expires_at:
+            return 0
+        
+        return (self.expires_at - now).days
+    
+    @property
+    def valid_for_resource(self) -> str:
+        """Retorna identificador do recurso."""
+        if self.resource_id and self.resource_type:
+            return f"{self.resource_type}:{self.resource_id}"
+        elif self.resource_id:
+            return self.resource_id
+        elif self.scope == EntitlementScope.GLOBAL:
+            return "global"
+        else:
+            return self.scope.value
+    
+    def activate(self) -> bool:
+        """Ativa o entitlement."""
+        if self.status != EntitlementStatus.PENDING:
+            return False
+        
+        self.status = EntitlementStatus.ACTIVE
+        self.activated_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        return True
+    
+    def revoke(self, revoked_by: str, reason: str = "manual_revocation") -> bool:
+        """
+        Revoga o entitlement.
+        
+        Retorna:
+            bool: True se revogado com sucesso
+        """
+        if self.status in [EntitlementStatus.REVOKED, EntitlementStatus.EXPIRED, EntitlementStatus.CONSUMED]:
+            return False
+        
+        self.status = EntitlementStatus.REVOKED
+        self.revoked_at = datetime.utcnow()
+        self.revoked_by = revoked_by
+        self.revocation_reason = reason
+        self.updated_at = datetime.utcnow()
+        
+        return True
+    
+    def suspend(self, reason: str = "manual_suspension") -> bool:
+        """Suspende o entitlement temporariamente."""
+        if self.status != EntitlementStatus.ACTIVE:
+            return False
+        
+        self.status = EntitlementStatus.SUSPENDED
+        self.updated_at = datetime.utcnow()
+        
+        # Registra motivo
+        if "suspension_log" not in self.metadata:
+            self.metadata["suspension_log"] = []
+        
+        self.metadata["suspension_log"].append({
+            "suspended_at": datetime.utcnow().isoformat(),
+            "reason": reason
+        })
+        
+        return True
+    
+    def resume(self) -> bool:
+        """Retoma um entitlement suspenso."""
+        if self.status != EntitlementStatus.SUSPENDED:
+            return False
+        
+        self.status = EntitlementStatus.ACTIVE
+        self.updated_at = datetime.utcnow()
+        
+        return True
+    
+    def expire(self) -> bool:
+        """Marca o entitlement como expirado."""
+        if self.status in [EntitlementStatus.EXPIRED, EntitlementStatus.REVOKED, EntitlementStatus.CONSUMED]:
+            return False
+        
+        self.status = EntitlementStatus.EXPIRED
+        self.updated_at = datetime.utcnow()
+        
+        return True
+    
+    def consume_quota(self, amount: int = 1, context: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Consome quota do entitlement.
+        
+        Retorna:
+            bool: True se quota foi consumida com sucesso
+        """
+        if not self.is_active:
+            return False
+        
+        if not self.has_quota:
+            return False
+        
+        if self.quota_used + amount > self.quota_limit:
+            return False
+        
+        self.quota_used += amount
+        self.last_used_at = datetime.utcnow()
+        
+        # Se consumiu toda a quota
+        if self.quota_used >= self.quota_limit:
+            self.status = EntitlementStatus.CONSUMED
+            self.consumed_at = datetime.utcnow()
+        
+        self.updated_at = datetime.utcnow()
+        
+        # Registra uso
+        usage_log = EntitlementUsage(
+            entitlement_id=self.id,
+            tenant_id=self.tenant_id,
+            user_id=self.user_id,
+            amount_used=amount,
+            quota_remaining=self.quota_remaining,
+            context=context or {}
+        )
+        
+        # Adiciona ao relacionamento (será salvo separadamente)
+        self.usage_logs.append(usage_log)
+        
+        return True
+    
+    def reset_quota(self) -> bool:
+        """Reseta a quota usada (baseado na frequência de reset)."""
+        if not self.has_quota:
+            return False
+        
+        self.quota_used = 0
+        self.updated_at = datetime.utcnow()
+        
+        # Se estava CONSUMED, volta para ACTIVE
+        if self.status == EntitlementStatus.CONSUMED:
+            self.status = EntitlementStatus.ACTIVE
+            self.consumed_at = None
+        
+        return True
+    
+    def check_quota_eligibility(self, required_amount: int = 1) -> bool:
+        """Verifica se há quota suficiente."""
+        if not self.is_active:
+            return False
+        
+        if not self.has_quota:
+            return True
+        
+        return self.quota_used + required_amount <= self.quota_limit
+    
+    def extend_validity(self, days: int = 30):
+        """Estende a validade do entitlement."""
+        now = datetime.utcnow()
+        
+        # Se expires_at não existe, cria a partir de agora
+        if not self.expires_at:
+            self.expires_at = now + timedelta(days=days)
+        else:
+            # Se expires_at já passou, recria a partir de agora
+            if self.expires_at < now:
+                self.expires_at = now + timedelta(days=days)
+            else:
+                # Estende a partir da data atual
+                self.expires_at = self.expires_at + timedelta(days=days)
+        
+        self.updated_at = datetime.utcnow()
+        
+        # Se estava expirado, reativa
+        if self.status == EntitlementStatus.EXPIRED:
+            self.status = EntitlementStatus.ACTIVE
+    
+    def add_permission(self, permission: str):
+        """Adiciona uma permissão ao entitlement."""
+        if permission not in self.permissions:
+            self.permissions.append(permission)
+            self.updated_at = datetime.utcnow()
+    
+    def remove_permission(self, permission: str):
+        """Remove uma permissão do entitlement."""
+        if permission in self.permissions:
+            self.permissions.remove(permission)
+            self.updated_at = datetime.utcnow()
+    
+    def has_permission(self, permission: str) -> bool:
+        """Verifica se o entitlement tem uma permissão específica."""
+        return permission in self.permissions
+    
+    def matches_scope(self, scope: EntitlementScope, resource_id: Optional[str] = None, resource_type: Optional[str] = None) -> bool:
+        """Verifica se o entitlement corresponde ao escopo e recurso."""
+        if self.scope != scope:
+            return False
+        
+        if scope == EntitlementScope.GLOBAL:
+            return True
+        
+        if resource_id and self.resource_id != resource_id:
+            return False
+        
+        if resource_type and self.resource_type != resource_type:
+            return False
+        
+        return True
+
+
+class EntitlementUsage(Base):
+    """
+    Log de uso de entitlements (para quotas).
+    """
+    
+    __tablename__ = "entitlement_usage"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    entitlement_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.entitlements.id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.users.id"), nullable=False, index=True)
+    
+    # Uso
+    amount_used: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    quota_before: Mapped[Optional[int]] = mapped_column(Integer)
+    quota_after: Mapped[Optional[int]] = mapped_column(Integer)
+    
+    # Contexto
+    context: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    action: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    resource_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    used_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    
+    # Relacionamentos
+    entitlement: Mapped["Entitlement"] = relationship(back_populates="usage_logs")
+    tenant: Mapped["Tenant"] = relationship()
+    user: Mapped["User"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_entitlement_usage_entitlement_used', 'entitlement_id', 'used_at'),
+        Index('ix_entitlement_usage_user_action', 'user_id', 'action', 'used_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<EntitlementUsage(entitlement_id='{self.entitlement_id}', amount_used={self.amount_used}, used_at='{self.used_at}')>"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "entitlement_id": self.entitlement_id,
+            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
+            "amount_used": self.amount_used,
+            "quota_before": self.quota_before,
+            "quota_after": self.quota_after,
+            "action": self.action,
+            "resource_id": self.resource_id,
+            "context": self.context,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "used_at": self.used_at.isoformat() if self.used_at else None
+        }
+
+
+class EntitlementGrantLog(Base):
+    """
+    Log de concessão de entitlements.
+    Para auditoria e rastreamento de como os acessos foram concedidos.
+    """
+    
+    __tablename__ = "entitlement_grant_logs"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    entitlement_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.entitlements.id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Grant
+    granted_by: Mapped[str] = mapped_column(String(100), nullable=False)  # system, user_id, admin_id
+    grant_type: Mapped[str] = mapped_column(String(50), nullable=False)  # payment, manual, promotion, etc.
+    grant_reason: Mapped[str] = mapped_column(String(255), nullable=False)
+    
+    # Dados originais
+    original_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    
+    # Relacionamentos
+    entitlement: Mapped["Entitlement"] = relationship()
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_entitlement_grant_logs_entitlement_created', 'entitlement_id', 'created_at'),
+        Index('ix_entitlement_grant_logs_granted_by', 'granted_by', 'created_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<EntitlementGrantLog(entitlement_id='{self.entitlement_id}', granted_by='{self.granted_by}', grant_type='{self.grant_type}')>"

@@ -1,0 +1,1539 @@
+"""
+Healthcheck Engine - Sistema de verificações de saúde para readiness, liveness e diagnósticos
+
+Princípios:
+1. Checks modulares e independentes
+2. Suporte a liveness e readiness probes
+3. Timeouts e circuit breakers nativos
+4. Diagnóstico detalhado por componente
+5. Isolamento por tenant quando aplicável
+"""
+
+import asyncio
+import time
+import socket
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Any, Tuple, Callable, Set, Union
+import psutil
+import aiohttp
+from redis import Redis
+from sqlalchemy import text
+import json
+import hashlib
+import uuid
+
+from app.models.tenant import Tenant
+from app.core.audit_logger import AuditLogger, AuditSeverity, AuditActionCategory
+from app.core.metrics_engine import MetricsEngine
+from app.core.database import DatabaseSession
+
+
+class HealthStatus(Enum):
+    """Status de saúde de um componente"""
+    HEALTHY = "healthy"        # Funcionando normalmente
+    DEGRADED = "degraded"      # Funcionando, mas com problemas
+    UNHEALTHY = "unhealthy"    # Não funcionando
+    UNKNOWN = "unknown"        # Status desconhecido
+
+
+class CheckSeverity(Enum):
+    """Severidade do check"""
+    CRITICAL = "critical"      # Falha crítica - sistema não funciona
+    HIGH = "high"              # Falha importante - funcionalidades afetadas
+    MEDIUM = "medium"          # Problema moderado
+    LOW = "low"                # Problema menor
+    INFO = "info"              # Apenas informativo
+
+
+class CheckType(Enum):
+    """Tipos de checks de saúde"""
+    LIVENESS = "liveness"      # O serviço está vivo?
+    READINESS = "readiness"    # O serviço está pronto para receber tráfego?
+    STARTUP = "startup"        # Check de inicialização
+    SHUTDOWN = "shutdown"      # Check de desligamento
+    DIAGNOSTIC = "diagnostic"  # Diagnóstico detalhado
+
+
+@dataclass
+class HealthCheckResult:
+    """Resultado de uma verificação de saúde"""
+    check_id: str
+    check_name: str
+    status: HealthStatus
+    severity: CheckSeverity
+    message: str
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    duration_ms: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    component: Optional[str] = None  # Ex: "database", "cache", "api"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "check_id": self.check_id,
+            "check_name": self.check_name,
+            "status": self.status.value,
+            "severity": self.severity.value,
+            "message": self.message,
+            "timestamp": self.timestamp.isoformat(),
+            "duration_ms": self.duration_ms,
+            "metadata": self.metadata,
+            "error": self.error,
+            "component": self.component
+        }
+    
+    def is_healthy(self) -> bool:
+        """Verifica se o resultado indica saúde"""
+        return self.status == HealthStatus.HEALTHY
+    
+    def is_critical(self) -> bool:
+        """Verifica se é uma falha crítica"""
+        return self.severity == CheckSeverity.CRITICAL and not self.is_healthy()
+
+
+@dataclass
+class HealthCheckDefinition:
+    """Definição de um check de saúde"""
+    check_id: str
+    name: str
+    description: str
+    check_type: CheckType
+    component: str
+    severity: CheckSeverity
+    timeout_seconds: float = 5.0
+    interval_seconds: float = 30.0  # Intervalo entre execuções
+    enabled: bool = True
+    dependencies: List[str] = field(default_factory=list)  # IDs de checks dependentes
+    tags: List[str] = field(default_factory=list)
+    
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "check_id": self.check_id,
+            "name": self.name,
+            "description": self.description,
+            "type": self.check_type.value,
+            "component": self.component,
+            "severity": self.severity.value,
+            "timeout_seconds": self.timeout_seconds,
+            "interval_seconds": self.interval_seconds,
+            "enabled": self.enabled,
+            "dependencies": self.dependencies,
+            "tags": self.tags,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat()
+        }
+
+
+class HealthCheck:
+    """Interface base para checks de saúde"""
+    
+    def __init__(
+        self,
+        check_id: str,
+        name: str,
+        description: str,
+        check_type: CheckType,
+        component: str,
+        severity: CheckSeverity = CheckSeverity.MEDIUM,
+        timeout_seconds: float = 5.0
+    ):
+        self.check_id = check_id
+        self.name = name
+        self.description = description
+        self.check_type = check_type
+        self.component = component
+        self.severity = severity
+        self.timeout_seconds = timeout_seconds
+        self._last_result: Optional[HealthCheckResult] = None
+        self._last_execution: Optional[datetime] = None
+    
+    async def execute(self) -> HealthCheckResult:
+        """Executa o check de saúde"""
+        start_time = time.time()
+        
+        try:
+            result = await self._execute_async()
+            result.duration_ms = (time.time() - start_time) * 1000
+            self._last_result = result
+            self._last_execution = datetime.utcnow()
+            return result
+            
+        except asyncio.TimeoutError:
+            duration = (time.time() - start_time) * 1000
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=self.severity,
+                message=f"Check timeout após {self.timeout_seconds}s",
+                duration_ms=duration,
+                error="Timeout",
+                component=self.component
+            )
+        except Exception as e:
+            duration = (time.time() - start_time) * 1000
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=self.severity,
+                message=f"Erro inesperado: {str(e)}",
+                duration_ms=duration,
+                error=str(e),
+                component=self.component
+            )
+    
+    async def _execute_async(self) -> HealthCheckResult:
+        """Implementação específica do check"""
+        raise NotImplementedError
+    
+    def get_last_result(self) -> Optional[HealthCheckResult]:
+        """Obtém último resultado"""
+        return self._last_result
+    
+    def get_last_execution(self) -> Optional[datetime]:
+        """Obtém última execução"""
+        return self._last_execution
+
+
+class DatabaseHealthCheck(HealthCheck):
+    """Check de saúde do banco de dados"""
+    
+    def __init__(self, database_session: DatabaseSession):
+        super().__init__(
+            check_id="database_connectivity",
+            name="Database Connectivity",
+            description="Verifica conectividade com o banco de dados",
+            check_type=CheckType.LIVENESS,
+            component="database",
+            severity=CheckSeverity.CRITICAL,
+            timeout_seconds=3.0
+        )
+        self.database_session = database_session
+    
+    async def _execute_async(self) -> HealthCheckResult:
+        """Verifica conectividade com o banco"""
+        try:
+            # Tenta executar uma query simples
+            async with self.database_session() as session:
+                result = await session.execute(text("SELECT 1"))
+                value = result.scalar()
+                
+                if value == 1:
+                    return HealthCheckResult(
+                        check_id=self.check_id,
+                        check_name=self.name,
+                        status=HealthStatus.HEALTHY,
+                        severity=self.severity,
+                        message="Conexão com banco de dados estabelecida",
+                        metadata={"query_result": value},
+                        component=self.component
+                    )
+                else:
+                    return HealthCheckResult(
+                        check_id=self.check_id,
+                        check_name=self.name,
+                        status=HealthStatus.UNHEALTHY,
+                        severity=self.severity,
+                        message="Query de teste retornou valor inesperado",
+                        metadata={"query_result": value},
+                        component=self.component
+                    )
+                    
+        except Exception as e:
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=self.severity,
+                message=f"Falha na conexão com banco de dados: {str(e)}",
+                error=str(e),
+                component=self.component
+            )
+
+
+class CacheHealthCheck(HealthCheck):
+    """Check de saúde do cache (Redis)"""
+    
+    def __init__(self, redis_client: Redis):
+        super().__init__(
+            check_id="cache_connectivity",
+            name="Cache Connectivity",
+            description="Verifica conectividade com o cache Redis",
+            check_type=CheckType.LIVENESS,
+            component="cache",
+            severity=CheckSeverity.HIGH,
+            timeout_seconds=2.0
+        )
+        self.redis_client = redis_client
+    
+    async def _execute_async(self) -> HealthCheckResult:
+        """Verifica conectividade com Redis"""
+        try:
+            # Testa ping
+            response = await asyncio.get_event_loop().run_in_executor(
+                None, self.redis_client.ping
+            )
+            
+            if response:
+                # Testa set/get simples
+                test_key = f"healthcheck:{uuid.uuid4().hex}"
+                test_value = "test_value"
+                
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.redis_client.set(test_key, test_value, ex=5)
+                )
+                
+                retrieved = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.redis_client.get(test_key)
+                )
+                
+                if retrieved and retrieved.decode() == test_value:
+                    return HealthCheckResult(
+                        check_id=self.check_id,
+                        check_name=self.name,
+                        status=HealthStatus.HEALTHY,
+                        severity=self.severity,
+                        message="Conexão com cache Redis estabelecida",
+                        metadata={"ping_response": response},
+                        component=self.component
+                    )
+            
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=self.severity,
+                message="Resposta inesperada do Redis",
+                metadata={"ping_response": response},
+                component=self.component
+            )
+            
+        except Exception as e:
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=self.severity,
+                message=f"Falha na conexão com Redis: {str(e)}",
+                error=str(e),
+                component=self.component
+            )
+
+
+class ExternalServiceHealthCheck(HealthCheck):
+    """Check de saúde de serviço externo"""
+    
+    def __init__(
+        self,
+        service_name: str,
+        endpoint: str,
+        expected_status: int = 200,
+        timeout_seconds: float = 5.0
+    ):
+        super().__init__(
+            check_id=f"external_service_{service_name.lower()}",
+            name=f"{service_name} Service",
+            description=f"Verifica saúde do serviço {service_name}",
+            check_type=CheckType.READINESS,
+            component="external_service",
+            severity=CheckSeverity.HIGH,
+            timeout_seconds=timeout_seconds
+        )
+        self.service_name = service_name
+        self.endpoint = endpoint
+        self.expected_status = expected_status
+    
+    async def _execute_async(self) -> HealthCheckResult:
+        """Verifica saúde do serviço externo"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    self.endpoint,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout_seconds)
+                ) as response:
+                    if response.status == self.expected_status:
+                        return HealthCheckResult(
+                            check_id=self.check_id,
+                            check_name=self.name,
+                            status=HealthStatus.HEALTHY,
+                            severity=self.severity,
+                            message=f"Serviço {self.service_name} respondendo normalmente",
+                            metadata={
+                                "endpoint": self.endpoint,
+                                "status_code": response.status,
+                                "response_time_ms": response.response_time
+                            },
+                            component=self.component
+                        )
+                    else:
+                        return HealthCheckResult(
+                            check_id=self.check_id,
+                            check_name=self.name,
+                            status=HealthStatus.DEGRADED,
+                            severity=self.severity,
+                            message=f"Serviço {self.service_name} retornou status {response.status}",
+                            metadata={
+                                "endpoint": self.endpoint,
+                                "status_code": response.status,
+                                "expected_status": self.expected_status,
+                                "response_time_ms": response.response_time
+                            },
+                            component=self.component
+                        )
+                        
+        except asyncio.TimeoutError:
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=self.severity,
+                message=f"Timeout ao acessar serviço {self.service_name}",
+                metadata={"endpoint": self.endpoint, "timeout_seconds": self.timeout_seconds},
+                error="Timeout",
+                component=self.component
+            )
+        except Exception as e:
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=self.severity,
+                message=f"Erro ao acessar serviço {self.service_name}: {str(e)}",
+                metadata={"endpoint": self.endpoint},
+                error=str(e),
+                component=self.component
+            )
+
+
+class DiskHealthCheck(HealthCheck):
+    """Check de saúde do disco"""
+    
+    def __init__(self, path: str = "/", warning_threshold: float = 80.0, critical_threshold: float = 90.0):
+        super().__init__(
+            check_id="disk_usage",
+            name="Disk Usage",
+            description="Verifica uso de disco",
+            check_type=CheckType.DIAGNOSTIC,
+            component="disk",
+            severity=CheckSeverity.MEDIUM,
+            timeout_seconds=2.0
+        )
+        self.path = path
+        self.warning_threshold = warning_threshold
+        self.critical_threshold = critical_threshold
+    
+    async def _execute_async(self) -> HealthCheckResult:
+        """Verifica uso de disco"""
+        try:
+            usage = psutil.disk_usage(self.path)
+            percent_used = usage.percent
+            
+            if percent_used >= self.critical_threshold:
+                status = HealthStatus.UNHEALTHY
+                severity = CheckSeverity.CRITICAL
+                message = f"Uso de disco crítico: {percent_used:.1f}%"
+            elif percent_used >= self.warning_threshold:
+                status = HealthStatus.DEGRADED
+                severity = CheckSeverity.HIGH
+                message = f"Uso de disco alto: {percent_used:.1f}%"
+            else:
+                status = HealthStatus.HEALTHY
+                severity = CheckSeverity.INFO
+                message = f"Uso de disco normal: {percent_used:.1f}%"
+            
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=status,
+                severity=severity,
+                message=message,
+                metadata={
+                    "path": self.path,
+                    "total_gb": usage.total / (1024**3),
+                    "used_gb": usage.used / (1024**3),
+                    "free_gb": usage.free / (1024**3),
+                    "percent_used": percent_used,
+                    "warning_threshold": self.warning_threshold,
+                    "critical_threshold": self.critical_threshold
+                },
+                component=self.component
+            )
+            
+        except Exception as e:
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=CheckSeverity.MEDIUM,
+                message=f"Erro ao verificar uso de disco: {str(e)}",
+                error=str(e),
+                component=self.component
+            )
+
+
+class MemoryHealthCheck(HealthCheck):
+    """Check de saúde da memória"""
+    
+    def __init__(self, warning_threshold: float = 80.0, critical_threshold: float = 90.0):
+        super().__init__(
+            check_id="memory_usage",
+            name="Memory Usage",
+            description="Verifica uso de memória",
+            check_type=CheckType.DIAGNOSTIC,
+            component="memory",
+            severity=CheckSeverity.MEDIUM,
+            timeout_seconds=1.0
+        )
+        self.warning_threshold = warning_threshold
+        self.critical_threshold = critical_threshold
+    
+    async def _execute_async(self) -> HealthCheckResult:
+        """Verifica uso de memória"""
+        try:
+            memory = psutil.virtual_memory()
+            percent_used = memory.percent
+            
+            if percent_used >= self.critical_threshold:
+                status = HealthStatus.UNHEALTHY
+                severity = CheckSeverity.CRITICAL
+                message = f"Uso de memória crítico: {percent_used:.1f}%"
+            elif percent_used >= self.warning_threshold:
+                status = HealthStatus.DEGRADED
+                severity = CheckSeverity.HIGH
+                message = f"Uso de memória alto: {percent_used:.1f}%"
+            else:
+                status = HealthStatus.HEALTHY
+                severity = CheckSeverity.INFO
+                message = f"Uso de memória normal: {percent_used:.1f}%"
+            
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=status,
+                severity=severity,
+                message=message,
+                metadata={
+                    "total_gb": memory.total / (1024**3),
+                    "available_gb": memory.available / (1024**3),
+                    "used_gb": memory.used / (1024**3),
+                    "percent_used": percent_used,
+                    "warning_threshold": self.warning_threshold,
+                    "critical_threshold": self.critical_threshold
+                },
+                component=self.component
+            )
+            
+        except Exception as e:
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=CheckSeverity.MEDIUM,
+                message=f"Erro ao verificar uso de memória: {str(e)}",
+                error=str(e),
+                component=self.component
+            )
+
+
+class QueueHealthCheck(HealthCheck):
+    """Check de saúde das filas"""
+    
+    def __init__(self, queue_name: str, max_queue_size: int = 10000):
+        super().__init__(
+            check_id=f"queue_{queue_name}",
+            name=f"Queue {queue_name}",
+            description=f"Verifica saúde da fila {queue_name}",
+            check_type=CheckType.READINESS,
+            component="queue",
+            severity=CheckSeverity.HIGH,
+            timeout_seconds=3.0
+        )
+        self.queue_name = queue_name
+        self.max_queue_size = max_queue_size
+        # Em produção, seria uma conexão real com RabbitMQ, SQS, etc.
+    
+    async def _execute_async(self) -> HealthCheckResult:
+        """Verifica saúde da fila"""
+        try:
+            # Simulação - em produção verificaria conexão e tamanho da fila
+            queue_size = 0  # Obteria tamanho real da fila
+            
+            if queue_size >= self.max_queue_size:
+                return HealthCheckResult(
+                    check_id=self.check_id,
+                    check_name=self.name,
+                    status=HealthStatus.UNHEALTHY,
+                    severity=CheckSeverity.CRITICAL,
+                    message=f"Fila {self.queue_name} está cheia",
+                    metadata={
+                        "queue_name": self.queue_name,
+                        "queue_size": queue_size,
+                        "max_queue_size": self.max_queue_size
+                    },
+                    component=self.component
+                )
+            elif queue_size > self.max_queue_size * 0.8:
+                return HealthCheckResult(
+                    check_id=self.check_id,
+                    check_name=self.name,
+                    status=HealthStatus.DEGRADED,
+                    severity=CheckSeverity.HIGH,
+                    message=f"Fila {self.queue_name} quase cheia",
+                    metadata={
+                        "queue_name": self.queue_name,
+                        "queue_size": queue_size,
+                        "max_queue_size": self.max_queue_size
+                    },
+                    component=self.component
+                )
+            else:
+                return HealthCheckResult(
+                    check_id=self.check_id,
+                    check_name=self.name,
+                    status=HealthStatus.HEALTHY,
+                    severity=CheckSeverity.INFO,
+                    message=f"Fila {self.queue_name} operando normalmente",
+                    metadata={
+                        "queue_name": self.queue_name,
+                        "queue_size": queue_size,
+                        "max_queue_size": self.max_queue_size
+                    },
+                    component=self.component
+                )
+                
+        except Exception as e:
+            return HealthCheckResult(
+                check_id=self.check_id,
+                check_name=self.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=CheckSeverity.HIGH,
+                message=f"Erro ao verificar fila {self.queue_name}: {str(e)}",
+                error=str(e),
+                component=self.component
+            )
+
+
+class HealthCheckRegistry:
+    """Registro de checks de saúde"""
+    
+    def __init__(self):
+        self._checks: Dict[str, HealthCheck] = {}
+        self._definitions: Dict[str, HealthCheckDefinition] = {}
+        self._component_index: Dict[str, List[str]] = defaultdict(list)
+        self._type_index: Dict[CheckType, List[str]] = defaultdict(list)
+    
+    def register(self, check: HealthCheck, definition: HealthCheckDefinition) -> bool:
+        """Registra um check de saúde"""
+        if check.check_id in self._checks:
+            return False
+        
+        self._checks[check.check_id] = check
+        self._definitions[definition.check_id] = definition
+        
+        # Atualiza índices
+        self._component_index[check.component].append(check.check_id)
+        self._type_index[definition.check_type].append(check.check_id)
+        
+        return True
+    
+    def unregister(self, check_id: str) -> bool:
+        """Remove um check de saúde"""
+        if check_id not in self._checks:
+            return False
+        
+        check = self._checks[check_id]
+        definition = self._definitions[check_id]
+        
+        # Remove dos índices
+        if check_id in self._component_index[check.component]:
+            self._component_index[check.component].remove(check_id)
+        
+        if check_id in self._type_index[definition.check_type]:
+            self._type_index[definition.check_type].remove(check_id)
+        
+        # Remove dos registros
+        del self._checks[check_id]
+        del self._definitions[check_id]
+        
+        return True
+    
+    def get_check(self, check_id: str) -> Optional[HealthCheck]:
+        """Obtém check por ID"""
+        return self._checks.get(check_id)
+    
+    def get_definition(self, check_id: str) -> Optional[HealthCheckDefinition]:
+        """Obtém definição por ID"""
+        return self._definitions.get(check_id)
+    
+    def get_checks_by_component(self, component: str) -> List[HealthCheck]:
+        """Obtém checks por componente"""
+        check_ids = self._component_index.get(component, [])
+        return [self._checks[cid] for cid in check_ids if cid in self._checks]
+    
+    def get_checks_by_type(self, check_type: CheckType) -> List[HealthCheck]:
+        """Obtém checks por tipo"""
+        check_ids = self._type_index.get(check_type, [])
+        return [self._checks[cid] for cid in check_ids if cid in self._checks]
+    
+    def get_all_checks(self) -> List[HealthCheck]:
+        """Obtém todos os checks"""
+        return list(self._checks.values())
+    
+    def get_all_definitions(self) -> List[HealthCheckDefinition]:
+        """Obtém todas as definições"""
+        return list(self._definitions.values())
+
+
+class HealthCheckEngine:
+    """
+    Engine principal de health checks
+    """
+    
+    def __init__(
+        self,
+        audit_logger: AuditLogger,
+        metrics_engine: Optional[MetricsEngine] = None,
+        circuit_breaker_failures: int = 3,
+        circuit_breaker_reset_seconds: int = 60
+    ):
+        self.audit_logger = audit_logger
+        self.metrics_engine = metrics_engine
+        self.registry = HealthCheckRegistry()
+        
+        # Circuit breaker configuration
+        self.circuit_breaker_failures = circuit_breaker_failures
+        self.circuit_breaker_reset_seconds = circuit_breaker_reset_seconds
+        
+        # Estado dos circuit breakers
+        self._circuit_breakers: Dict[str, Dict[str, Any]] = {}
+        
+        # Histórico de execuções
+        self._execution_history: Dict[str, List[HealthCheckResult]] = defaultdict(list)
+        
+        # Inicializa checks padrão
+        self._initialize_default_checks()
+    
+    def _initialize_default_checks(self):
+        """Inicializa checks de saúde padrão do sistema"""
+        # Em produção, esses checks seriam criados com dependências reais
+        # Por enquanto, são placeholders
+        
+        # Database check será registrado quando database_session estiver disponível
+        # Cache check será registrado quando redis_client estiver disponível
+        pass
+    
+    def register_database_check(self, database_session: DatabaseSession) -> None:
+        """Registra check de banco de dados"""
+        check = DatabaseHealthCheck(database_session)
+        definition = HealthCheckDefinition(
+            check_id=check.check_id,
+            name=check.name,
+            description=check.description,
+            check_type=check.check_type,
+            component=check.component,
+            severity=check.severity,
+            timeout_seconds=check.timeout_seconds,
+            interval_seconds=30.0,
+            enabled=True,
+            tags=["database", "critical"]
+        )
+        
+        self.registry.register(check, definition)
+        
+        # Inicializa circuit breaker
+        self._circuit_breakers[check.check_id] = {
+            "failures": 0,
+            "last_failure": None,
+            "open": False
+        }
+    
+    def register_cache_check(self, redis_client: Redis) -> None:
+        """Registra check de cache"""
+        check = CacheHealthCheck(redis_client)
+        definition = HealthCheckDefinition(
+            check_id=check.check_id,
+            name=check.name,
+            description=check.description,
+            check_type=check.check_type,
+            component=check.component,
+            severity=check.severity,
+            timeout_seconds=check.timeout_seconds,
+            interval_seconds=30.0,
+            enabled=True,
+            tags=["cache", "high"]
+        )
+        
+        self.registry.register(check, definition)
+        
+        # Inicializa circuit breaker
+        self._circuit_breakers[check.check_id] = {
+            "failures": 0,
+            "last_failure": None,
+            "open": False
+        }
+    
+    def register_external_service_check(
+        self,
+        service_name: str,
+        endpoint: str,
+        expected_status: int = 200,
+        timeout_seconds: float = 5.0
+    ) -> None:
+        """Registra check de serviço externo"""
+        check = ExternalServiceHealthCheck(
+            service_name=service_name,
+            endpoint=endpoint,
+            expected_status=expected_status,
+            timeout_seconds=timeout_seconds
+        )
+        
+        definition = HealthCheckDefinition(
+            check_id=check.check_id,
+            name=check.name,
+            description=check.description,
+            check_type=check.check_type,
+            component=check.component,
+            severity=check.severity,
+            timeout_seconds=check.timeout_seconds,
+            interval_seconds=30.0,
+            enabled=True,
+            tags=["external", service_name.lower()]
+        )
+        
+        self.registry.register(check, definition)
+        
+        # Inicializa circuit breaker
+        self._circuit_breakers[check.check_id] = {
+            "failures": 0,
+            "last_failure": None,
+            "open": False
+        }
+    
+    def register_disk_check(self, path: str = "/") -> None:
+        """Registra check de disco"""
+        check = DiskHealthCheck(path=path)
+        definition = HealthCheckDefinition(
+            check_id=check.check_id,
+            name=check.name,
+            description=check.description,
+            check_type=check.check_type,
+            component=check.component,
+            severity=check.severity,
+            timeout_seconds=check.timeout_seconds,
+            interval_seconds=60.0,  # Verifica disco a cada minuto
+            enabled=True,
+            tags=["disk", "diagnostic"]
+        )
+        
+        self.registry.register(check, definition)
+    
+    def register_memory_check(self) -> None:
+        """Registra check de memória"""
+        check = MemoryHealthCheck()
+        definition = HealthCheckDefinition(
+            check_id=check.check_id,
+            name=check.name,
+            description=check.description,
+            check_type=check.check_type,
+            component=check.component,
+            severity=check.severity,
+            timeout_seconds=check.timeout_seconds,
+            interval_seconds=30.0,
+            enabled=True,
+            tags=["memory", "diagnostic"]
+        )
+        
+        self.registry.register(check, definition)
+    
+    def _update_circuit_breaker(self, check_id: str, result: HealthCheckResult):
+        """Atualiza estado do circuit breaker para um check"""
+        if check_id not in self._circuit_breakers:
+            return
+        
+        cb = self._circuit_breakers[check_id]
+        
+        if result.is_healthy():
+            # Sucesso - reset circuit breaker
+            cb["failures"] = 0
+            cb["last_failure"] = None
+            cb["open"] = False
+        else:
+            # Falha
+            cb["failures"] += 1
+            cb["last_failure"] = datetime.utcnow()
+            
+            # Se atingiu limite de falhas, abre circuit breaker
+            if cb["failures"] >= self.circuit_breaker_failures:
+                cb["open"] = True
+    
+    def _is_circuit_breaker_open(self, check_id: str) -> bool:
+        """Verifica se circuit breaker está aberto"""
+        if check_id not in self._circuit_breakers:
+            return False
+        
+        cb = self._circuit_breakers[check_id]
+        
+        if not cb["open"]:
+            return False
+        
+        # Verifica se já passou tempo suficiente para tentar novamente
+        if cb["last_failure"]:
+            reset_time = cb["last_failure"] + timedelta(seconds=self.circuit_breaker_reset_seconds)
+            if datetime.utcnow() >= reset_time:
+                # Reset parcial - permite tentativa
+                cb["failures"] = self.circuit_breaker_failures - 1
+                cb["open"] = False
+                return False
+        
+        return True
+    
+    async def execute_check(self, check_id: str, force: bool = False) -> HealthCheckResult:
+        """Executa um check específico"""
+        check = self.registry.get_check(check_id)
+        if not check:
+            return HealthCheckResult(
+                check_id=check_id,
+                check_name="Unknown",
+                status=HealthStatus.UNKNOWN,
+                severity=CheckSeverity.LOW,
+                message=f"Check {check_id} não encontrado",
+                component="system"
+            )
+        
+        # Verifica circuit breaker
+        if not force and self._is_circuit_breaker_open(check_id):
+            return HealthCheckResult(
+                check_id=check.check_id,
+                check_name=check.name,
+                status=HealthStatus.UNHEALTHY,
+                severity=check.severity,
+                message="Circuit breaker aberto - check temporariamente desabilitado",
+                component=check.component
+            )
+        
+        # Executa check
+        result = await check.execute()
+        
+        # Atualiza circuit breaker
+        self._update_circuit_breaker(check_id, result)
+        
+        # Armazena no histórico
+        self._execution_history[check_id].append(result)
+        
+        # Mantém apenas últimos 100 resultados
+        if len(self._execution_history[check_id]) > 100:
+            self._execution_history[check_id] = self._execution_history[check_id][-100:]
+        
+        # Registra métricas
+        if self.metrics_engine:
+            await self.metrics_engine.record_histogram(
+                tenant_id="system",
+                histogram_name="healthcheck_duration_ms",
+                value=result.duration_ms,
+                labels={
+                    "check_id": check_id,
+                    "check_name": check.name,
+                    "component": check.component,
+                    "status": result.status.value
+                }
+            )
+            
+            await self.metrics_engine.increment_counter(
+                tenant_id="system",
+                counter_name="healthcheck_executions_total",
+                labels={
+                    "check_id": check_id,
+                    "check_name": check.name,
+                    "component": check.component,
+                    "status": result.status.value
+                }
+            )
+        
+        # Log de auditoria para falhas críticas
+        if result.is_critical():
+            await self.audit_logger.log(
+                tenant_id="system",
+                user_id="system",
+                action="healthcheck.critical_failure",
+                action_category=AuditActionCategory.SYSTEM,
+                severity=AuditSeverity.HIGH,
+                description=f"Falha crítica no check {check.name}: {result.message}",
+                metadata=result.to_dict(),
+                tags=["healthcheck", "critical", check.component]
+            )
+        
+        return result
+    
+    async def execute_checks(
+        self,
+        check_type: Optional[CheckType] = None,
+        component: Optional[str] = None,
+        check_ids: Optional[List[str]] = None,
+        parallel: bool = True
+    ) -> Dict[str, HealthCheckResult]:
+        """Executa múltiplos checks"""
+        # Determina quais checks executar
+        checks_to_execute = []
+        
+        if check_ids:
+            for check_id in check_ids:
+                check = self.registry.get_check(check_id)
+                if check:
+                    checks_to_execute.append(check)
+        elif check_type:
+            checks_to_execute = self.registry.get_checks_by_type(check_type)
+        elif component:
+            checks_to_execute = self.registry.get_checks_by_component(component)
+        else:
+            checks_to_execute = self.registry.get_all_checks()
+        
+        # Filtra checks desabilitados
+        checks_to_execute = [
+            check for check in checks_to_execute
+            if self.registry.get_definition(check.check_id).enabled
+        ]
+        
+        # Executa checks
+        results = {}
+        
+        if parallel:
+            # Executa em paralelo
+            tasks = []
+            for check in checks_to_execute:
+                task = self.execute_check(check.check_id)
+                tasks.append(task)
+            
+            completed = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for i, check in enumerate(checks_to_execute):
+                result = completed[i]
+                if isinstance(result, Exception):
+                    results[check.check_id] = HealthCheckResult(
+                        check_id=check.check_id,
+                        check_name=check.name,
+                        status=HealthStatus.UNHEALTHY,
+                        severity=check.severity,
+                        message=f"Erro ao executar check: {str(result)}",
+                        error=str(result),
+                        component=check.component
+                    )
+                else:
+                    results[check.check_id] = result
+        else:
+            # Executa sequencialmente
+            for check in checks_to_execute:
+                result = await self.execute_check(check.check_id)
+                results[check.check_id] = result
+        
+        return results
+    
+    async def get_liveness_status(self) -> Dict[str, Any]:
+        """Obtém status de liveness do sistema"""
+        results = await self.execute_checks(
+            check_type=CheckType.LIVENESS,
+            parallel=True
+        )
+        
+        return self._aggregate_results(results, "liveness")
+    
+    async def get_readiness_status(self) -> Dict[str, Any]:
+        """Obtém status de readiness do sistema"""
+        results = await self.execute_checks(
+            check_type=CheckType.READINESS,
+            parallel=True
+        )
+        
+        return self._aggregate_results(results, "readiness")
+    
+    async def get_diagnostic_status(self) -> Dict[str, Any]:
+        """Obtém status de diagnóstico do sistema"""
+        results = await self.execute_checks(
+            check_type=CheckType.DIAGNOSTIC,
+            parallel=True
+        )
+        
+        return self._aggregate_results(results, "diagnostic")
+    
+    def _aggregate_results(self, results: Dict[str, HealthCheckResult], check_type: str) -> Dict[str, Any]:
+        """Agrega resultados de múltiplos checks"""
+        total = len(results)
+        healthy = sum(1 for r in results.values() if r.is_healthy())
+        unhealthy = total - healthy
+        
+        # Determina status geral
+        if unhealthy == 0:
+            overall_status = HealthStatus.HEALTHY
+        else:
+            # Verifica se há falhas críticas
+            critical_failures = sum(1 for r in results.values() if r.is_critical())
+            if critical_failures > 0:
+                overall_status = HealthStatus.UNHEALTHY
+            else:
+                overall_status = HealthStatus.DEGRADED
+        
+        # Agrupa por componente
+        by_component = {}
+        for result in results.values():
+            component = result.component or "unknown"
+            if component not in by_component:
+                by_component[component] = {
+                    "total": 0,
+                    "healthy": 0,
+                    "unhealthy": 0,
+                    "checks": []
+                }
+            
+            by_component[component]["total"] += 1
+            if result.is_healthy():
+                by_component[component]["healthy"] += 1
+            else:
+                by_component[component]["unhealthy"] += 1
+            
+            by_component[component]["checks"].append(result.to_dict())
+        
+        return {
+            "check_type": check_type,
+            "timestamp": datetime.utcnow().isoformat(),
+            "overall_status": overall_status.value,
+            "summary": {
+                "total_checks": total,
+                "healthy_checks": healthy,
+                "unhealthy_checks": unhealthy,
+                "health_percentage": (healthy / total * 100) if total > 0 else 0
+            },
+            "components": by_component,
+            "checks": {check_id: result.to_dict() for check_id, result in results.items()}
+        }
+    
+    async def get_system_health(self, detailed: bool = False) -> Dict[str, Any]:
+        """Obtém saúde completa do sistema"""
+        # Executa todos os checks em paralelo
+        liveness_task = self.get_liveness_status()
+        readiness_task = self.get_readiness_status()
+        diagnostic_task = self.get_diagnostic_status()
+        
+        liveness, readiness, diagnostic = await asyncio.gather(
+            liveness_task, readiness_task, diagnostic_task
+        )
+        
+        # Determina saúde geral baseada em liveness e readiness
+        liveness_healthy = liveness["overall_status"] == HealthStatus.HEALTHY.value
+        readiness_healthy = readiness["overall_status"] == HealthStatus.HEALTHY.value
+        
+        if not liveness_healthy:
+            overall_status = "unhealthy"
+        elif not readiness_healthy:
+            overall_status = "degraded"
+        else:
+            overall_status = "healthy"
+        
+        response = {
+            "status": overall_status,
+            "timestamp": datetime.utcnow().isoformat(),
+            "uptime_seconds": self._get_uptime(),
+            "liveness": liveness if detailed else {"status": liveness["overall_status"]},
+            "readiness": readiness if detailed else {"status": readiness["overall_status"]},
+            "version": "1.0.0",
+            "environment": self._get_environment()
+        }
+        
+        if detailed:
+            response["diagnostic"] = diagnostic
+        
+        return response
+    
+    def _get_uptime(self) -> float:
+        """Obtém uptime do processo"""
+        try:
+            return time.time() - psutil.Process().create_time()
+        except:
+            return 0.0
+    
+    def _get_environment(self) -> str:
+        """Obtém ambiente de execução"""
+        import os
+        return os.getenv("ENVIRONMENT", "development")
+    
+    async def get_check_history(
+        self,
+        check_id: str,
+        limit: int = 50
+    ) -> List[HealthCheckResult]:
+        """Obtém histórico de execuções de um check"""
+        return self._execution_history.get(check_id, [])[-limit:]
+    
+    async def get_component_health(
+        self,
+        component: str,
+        detailed: bool = False
+    ) -> Dict[str, Any]:
+        """Obtém saúde de um componente específico"""
+        checks = self.registry.get_checks_by_component(component)
+        
+        if not checks:
+            return {
+                "component": component,
+                "status": HealthStatus.UNKNOWN.value,
+                "message": f"Componente {component} não encontrado",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        
+        # Executa checks do componente
+        results = {}
+        for check in checks:
+            result = await self.execute_check(check.check_id)
+            results[check.check_id] = result
+        
+        # Agrega resultados
+        return self._aggregate_results(results, "component")
+    
+    async def reset_circuit_breaker(self, check_id: str) -> bool:
+        """Reseta circuit breaker de um check"""
+        if check_id not in self._circuit_breakers:
+            return False
+        
+        self._circuit_breakers[check_id] = {
+            "failures": 0,
+            "last_failure": None,
+            "open": False
+        }
+        
+        return True
+    
+    def get_registered_checks(self) -> List[Dict[str, Any]]:
+        """Obtém lista de checks registrados"""
+        checks = []
+        
+        for check in self.registry.get_all_checks():
+            definition = self.registry.get_definition(check.check_id)
+            cb_state = self._circuit_breakers.get(check.check_id, {})
+            
+            checks.append({
+                "check_id": check.check_id,
+                "name": check.name,
+                "description": check.description,
+                "type": check.check_type.value,
+                "component": check.component,
+                "severity": check.severity.value,
+                "timeout_seconds": check.timeout_seconds,
+                "enabled": definition.enabled if definition else True,
+                "circuit_breaker": {
+                    "open": cb_state.get("open", False),
+                    "failures": cb_state.get("failures", 0),
+                    "last_failure": cb_state.get("last_failure")
+                }
+            })
+        
+        return checks
+    
+    async def create_custom_check(
+        self,
+        name: str,
+        description: str,
+        check_type: CheckType,
+        component: str,
+        check_function: Callable,
+        severity: CheckSeverity = CheckSeverity.MEDIUM,
+        timeout_seconds: float = 5.0
+    ) -> str:
+        """Cria um check de saúde personalizado"""
+        check_id = f"custom_{uuid.uuid4().hex[:16]}"
+        
+        class CustomHealthCheck(HealthCheck):
+            def __init__(self):
+                super().__init__(
+                    check_id=check_id,
+                    name=name,
+                    description=description,
+                    check_type=check_type,
+                    component=component,
+                    severity=severity,
+                    timeout_seconds=timeout_seconds
+                )
+            
+            async def _execute_async(self) -> HealthCheckResult:
+                try:
+                    result = await check_function()
+                    return result
+                except Exception as e:
+                    return HealthCheckResult(
+                        check_id=self.check_id,
+                        check_name=self.name,
+                        status=HealthStatus.UNHEALTHY,
+                        severity=self.severity,
+                        message=f"Erro no check personalizado: {str(e)}",
+                        error=str(e),
+                        component=self.component
+                    )
+        
+        check = CustomHealthCheck()
+        definition = HealthCheckDefinition(
+            check_id=check_id,
+            name=name,
+            description=description,
+            check_type=check_type,
+            component=component,
+            severity=severity,
+            timeout_seconds=timeout_seconds,
+            interval_seconds=30.0,
+            enabled=True,
+            tags=["custom", component]
+        )
+        
+        self.registry.register(check, definition)
+        
+        # Inicializa circuit breaker
+        self._circuit_breakers[check_id] = {
+            "failures": 0,
+            "last_failure": None,
+            "open": False
+        }
+        
+        return check_id
+
+
+# Middleware para health checks HTTP
+class HealthCheckMiddleware:
+    """Middleware para expor endpoints de health check"""
+    
+    def __init__(self, healthcheck_engine: HealthCheckEngine, base_path: str = "/health"):
+        self.healthcheck = healthcheck_engine
+        self.base_path = base_path
+    
+    async def handle_request(self, request):
+        """Processa requisições de health check"""
+        path = request.path
+        
+        if path == self.base_path:
+            # Health check completo
+            detailed = request.query.get("detailed", "").lower() == "true"
+            health = await self.healthcheck.get_system_health(detailed=detailed)
+            return self._create_response(health, 200 if health["status"] != "unhealthy" else 503)
+        
+        elif path == f"{self.base_path}/liveness":
+            # Liveness probe
+            status = await self.healthcheck.get_liveness_status()
+            return self._create_response(status, 200 if status["overall_status"] == "healthy" else 503)
+        
+        elif path == f"{self.base_path}/readiness":
+            # Readiness probe
+            status = await self.healthcheck.get_readiness_status()
+            return self._create_response(status, 200 if status["overall_status"] == "healthy" else 503)
+        
+        elif path == f"{self.base_path}/diagnostic":
+            # Diagnostic completo
+            status = await self.healthcheck.get_diagnostic_status()
+            return self._create_response(status, 200)
+        
+        elif path.startswith(f"{self.base_path}/component/"):
+            # Health de componente específico
+            component = path.split("/")[-1]
+            detailed = request.query.get("detailed", "").lower() == "true"
+            status = await self.healthcheck.get_component_health(component, detailed)
+            return self._create_response(status, 200)
+        
+        elif path == f"{self.base_path}/checks":
+            # Lista de checks registrados
+            checks = self.healthcheck.get_registered_checks()
+            return self._create_response({"checks": checks}, 200)
+        
+        return None
+    
+    def _create_response(self, data: Dict[str, Any], status_code: int):
+        """Cria resposta HTTP"""
+        return {
+            "status": status_code,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(data, indent=2)
+        }
+
+
+# Utilitários para health checks
+class HealthCheckUtils:
+    """Utilitários para criação de health checks"""
+    
+    @staticmethod
+    def create_database_connectivity_check(
+        database_session: DatabaseSession,
+        query: str = "SELECT 1",
+        expected_result: Any = 1
+    ) -> Callable:
+        """Cria função para check de conectividade com banco"""
+        async def check_function() -> HealthCheckResult:
+            try:
+                async with database_session() as session:
+                    result = await session.execute(text(query))
+                    value = result.scalar()
+                    
+                    if value == expected_result:
+                        return HealthCheckResult(
+                            check_id="database_custom",
+                            check_name="Database Connectivity",
+                            status=HealthStatus.HEALTHY,
+                            severity=CheckSeverity.CRITICAL,
+                            message="Conexão com banco de dados estabelecida",
+                            component="database"
+                        )
+                    else:
+                        return HealthCheckResult(
+                            check_id="database_custom",
+                            check_name="Database Connectivity",
+                            status=HealthStatus.UNHEALTHY,
+                            severity=CheckSeverity.CRITICAL,
+                            message=f"Query retornou valor inesperado: {value}",
+                            component="database"
+                        )
+            except Exception as e:
+                return HealthCheckResult(
+                    check_id="database_custom",
+                    check_name="Database Connectivity",
+                    status=HealthStatus.UNHEALTHY,
+                    severity=CheckSeverity.CRITICAL,
+                    message=f"Falha na conexão com banco: {str(e)}",
+                    error=str(e),
+                    component="database"
+                )
+        
+        return check_function
+    
+    @staticmethod
+    def create_http_endpoint_check(
+        endpoint: str,
+        expected_status: int = 200,
+        timeout_seconds: float = 5.0
+    ) -> Callable:
+        """Cria função para check de endpoint HTTP"""
+        async def check_function() -> HealthCheckResult:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        endpoint,
+                        timeout=aiohttp.ClientTimeout(total=timeout_seconds)
+                    ) as response:
+                        if response.status == expected_status:
+                            return HealthCheckResult(
+                                check_id="http_endpoint_custom",
+                                check_name=f"HTTP Endpoint {endpoint}",
+                                status=HealthStatus.HEALTHY,
+                                severity=CheckSeverity.HIGH,
+                                message=f"Endpoint respondendo com status {expected_status}",
+                                metadata={
+                                    "endpoint": endpoint,
+                                    "status_code": response.status,
+                                    "response_time_ms": response.response_time
+                                },
+                                component="http"
+                            )
+                        else:
+                            return HealthCheckResult(
+                                check_id="http_endpoint_custom",
+                                check_name=f"HTTP Endpoint {endpoint}",
+                                status=HealthStatus.DEGRADED,
+                                severity=CheckSeverity.HIGH,
+                                message=f"Endpoint retornou status {response.status}, esperado {expected_status}",
+                                metadata={
+                                    "endpoint": endpoint,
+                                    "status_code": response.status,
+                                    "expected_status": expected_status
+                                },
+                                component="http"
+                            )
+            except asyncio.TimeoutError:
+                return HealthCheckResult(
+                    check_id="http_endpoint_custom",
+                    check_name=f"HTTP Endpoint {endpoint}",
+                    status=HealthStatus.UNHEALTHY,
+                    severity=CheckSeverity.HIGH,
+                    message=f"Timeout ao acessar endpoint após {timeout_seconds}s",
+                    metadata={"endpoint": endpoint, "timeout_seconds": timeout_seconds},
+                    error="Timeout",
+                    component="http"
+                )
+            except Exception as e:
+                return HealthCheckResult(
+                    check_id="http_endpoint_custom",
+                    check_name=f"HTTP Endpoint {endpoint}",
+                    status=HealthStatus.UNHEALTHY,
+                    severity=CheckSeverity.HIGH,
+                    message=f"Erro ao acessar endpoint: {str(e)}",
+                    metadata={"endpoint": endpoint},
+                    error=str(e),
+                    component="http"
+                )
+        
+        return check_function
+    
+    @staticmethod
+    def create_tcp_port_check(
+        host: str,
+        port: int,
+        timeout_seconds: float = 3.0
+    ) -> Callable:
+        """Cria função para check de porta TCP"""
+        async def check_function() -> HealthCheckResult:
+            try:
+                # Tenta conectar via socket
+                loop = asyncio.get_event_loop()
+                
+                def connect():
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(timeout_seconds)
+                    sock.connect((host, port))
+                    sock.close()
+                    return True
+                
+                connected = await loop.run_in_executor(None, connect)
+                
+                if connected:
+                    return HealthCheckResult(
+                        check_id="tcp_port_custom",
+                        check_name=f"TCP Port {host}:{port}",
+                        status=HealthStatus.HEALTHY,
+                        severity=CheckSeverity.MEDIUM,
+                        message=f"Porta TCP {port} acessível em {host}",
+                        metadata={"host": host, "port": port},
+                        component="network"
+                    )
+                else:
+                    return HealthCheckResult(
+                        check_id="tcp_port_custom",
+                        check_name=f"TCP Port {host}:{port}",
+                        status=HealthStatus.UNHEALTHY,
+                        severity=CheckSeverity.MEDIUM,
+                        message=f"Porta TCP {port} inacessível em {host}",
+                        metadata={"host": host, "port": port},
+                        component="network"
+                    )
+                    
+            except socket.timeout:
+                return HealthCheckResult(
+                    check_id="tcp_port_custom",
+                    check_name=f"TCP Port {host}:{port}",
+                    status=HealthStatus.UNHEALTHY,
+                    severity=CheckSeverity.MEDIUM,
+                    message=f"Timeout ao tentar conectar a {host}:{port}",
+                    metadata={"host": host, "port": port, "timeout_seconds": timeout_seconds},
+                    error="Socket timeout",
+                    component="network"
+                )
+            except Exception as e:
+                return HealthCheckResult(
+                    check_id="tcp_port_custom",
+                    check_name=f"TCP Port {host}:{port}",
+                    status=HealthStatus.UNHEALTHY,
+                    severity=CheckSeverity.MEDIUM,
+                    message=f"Erro ao conectar a {host}:{port}: {str(e)}",
+                    metadata={"host": host, "port": port},
+                    error=str(e),
+                    component="network"
+                )
+        
+        return check_function

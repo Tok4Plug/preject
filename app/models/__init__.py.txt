@@ -1,0 +1,55 @@
+# app/models/__init__.py
+"""
+Exporta todos os modelos do sistema.
+"""
+
+from app.models.tenant import Tenant, TenantStats
+from app.models.user import User, UserIdentity, UserSession, UserPreference, UserStatus, UserRole
+from app.models.bot import Bot, BotStat, BotOverride, BotStatus, BotPlatform
+from app.models.offer import Offer, OfferTemplate, OfferStat, OfferType, OfferStatus, PricingModel
+from app.models.payment_intent import PaymentIntent, PaymentIntentEvent, PaymentIntentStatus, PaymentRail, PaymentMethod
+from app.models.invoice import Invoice, Refund, InvoiceStatus, InvoiceType, TaxType
+from app.models.subscription import Subscription, SubscriptionHistory, SubscriptionStatus, BillingCycle, RenewalStatus
+from app.models.entitlement import Entitlement, EntitlementUsage, EntitlementGrantLog, EntitlementScope, EntitlementType, EntitlementStatus
+from app.models.webhook_event import WebhookEvent, WebhookProcessorLock, WebhookStatus, WebhookSource
+from app.models.antifraud_event import AntifraudEvent, AntifraudRule, AntifraudEventType, AntifraudSeverity, AntifraudStatus
+from app.models.flow_state import FlowState, FlowDefinition, FlowStateStatus, FlowStepType
+from app.models.audit_log import AuditLog, AuditAction, AuditResourceType
+
+__all__ = [
+    # Tenant
+    "Tenant", "TenantStats",
+    
+    # User
+    "User", "UserIdentity", "UserSession", "UserPreference", "UserStatus", "UserRole",
+    
+    # Bot
+    "Bot", "BotStat", "BotOverride", "BotStatus", "BotPlatform",
+    
+    # Offer
+    "Offer", "OfferTemplate", "OfferStat", "OfferType", "OfferStatus", "PricingModel",
+    
+    # Payment
+    "PaymentIntent", "PaymentIntentEvent", "PaymentIntentStatus", "PaymentRail", "PaymentMethod",
+    
+    # Invoice
+    "Invoice", "Refund", "InvoiceStatus", "InvoiceType", "TaxType",
+    
+    # Subscription
+    "Subscription", "SubscriptionHistory", "SubscriptionStatus", "BillingCycle", "RenewalStatus",
+    
+    # Entitlement
+    "Entitlement", "EntitlementUsage", "EntitlementGrantLog", "EntitlementScope", "EntitlementType", "EntitlementStatus",
+    
+    # Webhook
+    "WebhookEvent", "WebhookProcessorLock", "WebhookStatus", "WebhookSource",
+    
+    # Antifraud
+    "AntifraudEvent", "AntifraudRule", "AntifraudEventType", "AntifraudSeverity", "AntifraudStatus",
+    
+    # Flow
+    "FlowState", "FlowDefinition", "FlowStateStatus", "FlowStepType",
+    
+    # Audit
+    "AuditLog", "AuditAction", "AuditResourceType",
+]

@@ -1,0 +1,682 @@
+# app/models/user.py (continuação)
+"""
+Modelo de User - Usuário dentro de um tenant.
+Um usuário pode ter múltiplas identidades (Telegram, Email, etc.)
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, ForeignKey, Index, Text
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
+import enum
+
+from app.database import Base
+
+
+class UserStatus(enum.Enum):
+    """Status do usuário no sistema."""
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    SUSPENDED = "suspended"
+    BANNED = "banned"
+    DELETED = "deleted"
+
+
+class UserRole(enum.Enum):
+    """Papéis do usuário no tenant."""
+    OWNER = "owner"          # Dono do tenant
+    ADMIN = "admin"          # Administrador
+    MANAGER = "manager"      # Gerente
+    AGENT = "agent"          # Agente/Atendente
+    USER = "user"            # Usuário final
+    VIEWER = "viewer"        # Somente leitura
+
+
+class User(Base):
+    """
+    Usuário do sistema com isolamento por tenant.
+    
+    Princípios:
+    1. Multi-identidade: Um usuário pode ter várias identidades (Telegram, Email, etc.)
+    2. Fingerprint único: Identificação antifraude cross-tenant
+    3. Dados sensíveis criptografados
+    4. Status e permissões por tenant
+    5. Roles e hierarquia de acesso
+    """
+    
+    __tablename__ = "users"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    external_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)  # ID no sistema do cliente
+    
+    # Identidades
+    telegram_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True, index=True)
+    telegram_username: Mapped[Optional[str]] = mapped_column(String(100))
+    telegram_language_code: Mapped[Optional[str]] = mapped_column(String(10))
+    telegram_is_premium: Mapped[Optional[bool]] = mapped_column(Boolean)
+    
+    email: Mapped[Optional[str]] = mapped_column(String(255), unique=True, index=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(50), unique=True, index=True)
+    
+    # Dados criptografados (AES-256)
+    encrypted_data: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB)  # CPF, dados sensíveis
+    encrypted_data_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    
+    # Fingerprint antifraude
+    fingerprint_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    fingerprint_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    fingerprint_components: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Dados do usuário
+    first_name: Mapped[Optional[str]] = mapped_column(String(100))
+    last_name: Mapped[Optional[str]] = mapped_column(String(100))
+    display_name: Mapped[Optional[str]] = mapped_column(String(200))
+    avatar_url: Mapped[Optional[str]] = mapped_column(Text)
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    tags: Mapped[List[str]] = mapped_column(ARRAY(String(50)), nullable=False, default=[])
+    
+    # Status e roles
+    status: Mapped[UserStatus] = mapped_column(Enum(UserStatus), nullable=False, default=UserStatus.ACTIVE)
+    role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False, default=UserRole.USER)
+    is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    
+    # Região operacional (cache do Geo Resolver)
+    geo_region: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    geo_confidence: Mapped[Optional[float]] = mapped_column(Float)
+    geo_resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    geo_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Preferências
+    language: Mapped[str] = mapped_column(String(10), nullable=False, default="pt-BR")
+    timezone: Mapped[str] = mapped_column(String(50), nullable=False, default="America/Sao_Paulo")
+    currency_preference: Mapped[str] = mapped_column(String(3), nullable=False, default="BRL")
+    
+    # Configurações
+    settings: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    notification_preferences: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Estatísticas
+    total_purchases: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_spent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    last_purchase_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    login_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    email_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    phone_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="users")
+    payment_intents: Mapped[List["PaymentIntent"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    subscriptions: Mapped[List["Subscription"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    invoices: Mapped[List["Invoice"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    entitlements: Mapped[List["Entitlement"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    antifraud_events: Mapped[List["AntifraudEvent"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    flow_states: Mapped[List["FlowState"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    identities: Mapped[List["UserIdentity"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    sessions: Mapped[List["UserSession"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_users_tenant_fingerprint', 'tenant_id', 'fingerprint_hash'),
+        Index('ix_users_tenant_telegram', 'tenant_id', 'telegram_id'),
+        Index('ix_users_tenant_email', 'tenant_id', 'email'),
+        Index('ix_users_tenant_status_role', 'tenant_id', 'status', 'role'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<User(id='{self.id}', tenant_id='{self.tenant_id}', fingerprint='{self.fingerprint_hash[:8]}...', status='{self.status.value}')>"
+    
+    def to_dict(self, include_sensitive: bool = False, include_relationships: bool = False) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "id": self.id,
+            "tenant_id": self.tenant_id,
+            "external_id": self.external_id,
+            "telegram_username": self.telegram_username,
+            "email": self.email,
+            "phone": self.phone,
+            "first_name": self.first_name,
+            "last_name": self.last_name,
+            "display_name": self.display_name,
+            "avatar_url": self.avatar_url,
+            "status": self.status.value,
+            "role": self.role.value,
+            "is_verified": self.is_verified,
+            "is_blocked": self.is_blocked,
+            "geo_region": self.geo_region,
+            "geo_confidence": self.geo_confidence,
+            "language": self.language,
+            "timezone": self.timezone,
+            "currency_preference": self.currency_preference,
+            "settings": self.settings,
+            "notification_preferences": self.notification_preferences,
+            "total_purchases": self.total_purchases,
+            "total_spent": self.total_spent,
+            "login_count": self.login_count,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "last_seen_at": self.last_seen_at.isoformat() if self.last_seen_at else None,
+            "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
+            "last_purchase_at": self.last_purchase_at.isoformat() if self.last_purchase_at else None,
+            "email_verified_at": self.email_verified_at.isoformat() if self.email_verified_at else None,
+            "phone_verified_at": self.phone_verified_at.isoformat() if self.phone_verified_at else None,
+            "tags": self.tags,
+            "metadata": {k: v for k, v in self.metadata.items() if not k.startswith('_')}
+        }
+        
+        if include_sensitive:
+            data.update({
+                "telegram_id": self.telegram_id,
+                "telegram_language_code": self.telegram_language_code,
+                "telegram_is_premium": self.telegram_is_premium,
+                "fingerprint_hash": self.fingerprint_hash,
+                "fingerprint_version": self.fingerprint_version,
+                "geo_data": self.geo_data,
+                "fingerprint_components": self.fingerprint_components
+            })
+        
+        if include_relationships:
+            data.update({
+                "subscription_count": len([s for s in self.subscriptions if s.is_active]),
+                "entitlement_count": len([e for e in self.entitlements if e.is_active]),
+                "payment_intent_count": len(self.payment_intents),
+                "invoice_count": len(self.invoices)
+            })
+        
+        return data
+    
+    @property
+    def is_active(self) -> bool:
+        """Verifica se o usuário está ativo."""
+        return (
+            self.status == UserStatus.ACTIVE and 
+            not self.is_blocked and 
+            self.deleted_at is None
+        )
+    
+    @property
+    def full_name(self) -> str:
+        """Retorna o nome completo do usuário."""
+        if self.first_name and self.last_name:
+            return f"{self.first_name} {self.last_name}"
+        elif self.first_name:
+            return self.first_name
+        elif self.display_name:
+            return self.display_name
+        elif self.telegram_username:
+            return f"@{self.telegram_username}"
+        elif self.email:
+            return self.email.split('@')[0]
+        else:
+            return f"User {self.id[:8]}"
+    
+    @property
+    def primary_identity(self) -> str:
+        """Retorna a identidade primária do usuário."""
+        if self.telegram_id:
+            return f"telegram:{self.telegram_id}"
+        elif self.email:
+            return f"email:{self.email}"
+        elif self.phone:
+            return f"phone:{self.phone}"
+        else:
+            return f"fingerprint:{self.fingerprint_hash[:16]}"
+    
+    @property
+    def has_telegram(self) -> bool:
+        """Verifica se o usuário tem Telegram vinculado."""
+        return self.telegram_id is not None
+    
+    @property
+    def has_email(self) -> bool:
+        """Verifica se o usuário tem email verificado."""
+        return self.email is not None and self.email_verified_at is not None
+    
+    @property
+    def has_phone(self) -> bool:
+        """Verifica se o usuário tem telefone verificado."""
+        return self.phone is not None and self.phone_verified_at is not None
+    
+    def update_geo_data(self, region: str, confidence: float, geo_data: Optional[Dict[str, Any]] = None):
+        """Atualiza dados de geolocalização do usuário."""
+        self.geo_region = region
+        self.geo_confidence = confidence
+        self.geo_resolved_at = datetime.utcnow()
+        
+        if geo_data:
+            self.geo_data.update(geo_data)
+        
+        self.updated_at = datetime.utcnow()
+    
+    def update_last_seen(self):
+        """Atualiza o timestamp de última visualização."""
+        self.last_seen_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def record_login(self):
+        """Registra um login do usuário."""
+        self.last_login_at = datetime.utcnow()
+        self.login_count += 1
+        self.last_seen_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def record_purchase(self, amount: float):
+        """Registra uma compra do usuário."""
+        self.total_purchases += 1
+        self.total_spent += amount
+        self.last_purchase_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def verify_email(self):
+        """Verifica o email do usuário."""
+        self.is_verified = True
+        self.email_verified_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def verify_phone(self):
+        """Verifica o telefone do usuário."""
+        self.is_verified = True
+        self.phone_verified_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def suspend(self, reason: Optional[str] = None, suspended_by: Optional[str] = None):
+        """Suspende o usuário."""
+        self.status = UserStatus.SUSPENDED
+        self.updated_at = datetime.utcnow()
+        
+        # Registra motivo
+        if reason:
+            if "suspension_log" not in self.metadata:
+                self.metadata["suspension_log"] = []
+            
+            self.metadata["suspension_log"].append({
+                "reason": reason,
+                "suspended_by": suspended_by,
+                "suspended_at": datetime.utcnow().isoformat()
+            })
+        
+        # Revoga todos os entitlements
+        for entitlement in self.entitlements:
+            if entitlement.is_active:
+                entitlement.revoke(reason="user_suspended")
+    
+    def activate(self):
+        """Ativa o usuário."""
+        self.status = UserStatus.ACTIVE
+        self.updated_at = datetime.utcnow()
+    
+    def ban(self, reason: str, banned_by: str):
+        """Bane o usuário permanentemente."""
+        self.status = UserStatus.BANNED
+        self.is_blocked = True
+        self.updated_at = datetime.utcnow()
+        
+        # Registra motivo
+        if "ban_log" not in self.metadata:
+            self.metadata["ban_log"] = []
+        
+        self.metadata["ban_log"].append({
+            "reason": reason,
+            "banned_by": banned_by,
+            "banned_at": datetime.utcnow().isoformat()
+        })
+        
+        # Revoga todos os entitlements
+        for entitlement in self.entitlements:
+            if entitlement.is_active:
+                entitlement.revoke(reason="user_banned")
+    
+    def unban(self):
+        """Desbane o usuário."""
+        self.status = UserStatus.ACTIVE
+        self.is_blocked = False
+        self.updated_at = datetime.utcnow()
+    
+    def update_role(self, new_role: UserRole, changed_by: str, reason: Optional[str] = None):
+        """Atualiza o papel do usuário."""
+        old_role = self.role
+        self.role = new_role
+        self.updated_at = datetime.utcnow()
+        
+        # Registra mudança de papel
+        if "role_change_log" not in self.metadata:
+            self.metadata["role_change_log"] = []
+        
+        self.metadata["role_change_log"].append({
+            "old_role": old_role.value,
+            "new_role": new_role.value,
+            "changed_by": changed_by,
+            "changed_at": datetime.utcnow().isoformat(),
+            "reason": reason
+        })
+    
+    def add_tag(self, tag: str):
+        """Adiciona uma tag ao usuário."""
+        if tag not in self.tags:
+            self.tags.append(tag)
+            self.updated_at = datetime.utcnow()
+    
+    def remove_tag(self, tag: str):
+        """Remove uma tag do usuário."""
+        if tag in self.tags:
+            self.tags.remove(tag)
+            self.updated_at = datetime.utcnow()
+    
+    def has_tag(self, tag: str) -> bool:
+        """Verifica se o usuário tem uma tag específica."""
+        return tag in self.tags
+    
+    def update_settings(self, new_settings: Dict[str, Any], merge: bool = True):
+        """Atualiza as configurações do usuário."""
+        if merge:
+            self.settings.update(new_settings)
+        else:
+            self.settings = new_settings
+        self.updated_at = datetime.utcnow()
+    
+    def update_notification_preferences(self, new_preferences: Dict[str, Any], merge: bool = True):
+        """Atualiza as preferências de notificação."""
+        if merge:
+            self.notification_preferences.update(new_preferences)
+        else:
+            self.notification_preferences = new_preferences
+        self.updated_at = datetime.utcnow()
+    
+    def can_access_feature(self, feature_name: str) -> bool:
+        """Verifica se o usuário pode acessar uma feature baseado em seus entitlements."""
+        # Em produção, isso consultaria o EntitlementResolver
+        active_entitlements = [e for e in self.entitlements if e.is_active]
+        
+        for entitlement in active_entitlements:
+            if entitlement.matches_scope(scope=EntitlementScope.FEATURE, resource_id=feature_name):
+                return True
+        
+        return False
+
+
+class UserIdentity(Base):
+    """
+    Identidades adicionais do usuário.
+    Permite que um usuário tenha múltiplas formas de login/identificação.
+    """
+    
+    __tablename__ = "user_identities"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.users.id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Tipo de identidade
+    identity_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # telegram, email, phone, oauth, etc.
+    identity_value: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    
+    # Dados da identidade
+    data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    encrypted_data: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB)  # Dados sensíveis
+    
+    # Status
+    is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    deactivated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    user: Mapped["User"] = relationship(back_populates="identities")
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_user_identities_tenant_type_value', 'tenant_id', 'identity_type', 'identity_value', unique=True),
+        Index('ix_user_identities_user_type', 'user_id', 'identity_type'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<UserIdentity(user_id='{self.user_id}', type='{self.identity_type}', value='{self.identity_value}', is_primary={self.is_primary})>"
+    
+    @property
+    def is_usable(self) -> bool:
+        """Verifica se a identidade está ativa e verificada."""
+        return self.is_active and self.is_verified and self.deactivated_at is None
+    
+    def verify(self):
+        """Verifica a identidade."""
+        self.is_verified = True
+        self.verified_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def set_as_primary(self):
+        """Define esta identidade como primária."""
+        # Primeiro, remove primary de todas as outras identidades do usuário
+        for identity in self.user.identities:
+            if identity.id != self.id and identity.is_primary:
+                identity.is_primary = False
+                identity.updated_at = datetime.utcnow()
+        
+        self.is_primary = True
+        self.updated_at = datetime.utcnow()
+    
+    def deactivate(self, reason: Optional[str] = None):
+        """Desativa a identidade."""
+        self.is_active = False
+        self.deactivated_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        if reason:
+            if "deactivation_log" not in self.data:
+                self.data["deactivation_log"] = []
+            
+            self.data["deactivation_log"].append({
+                "reason": reason,
+                "deactivated_at": self.deactivated_at.isoformat()
+            })
+    
+    def update_last_used(self):
+        """Atualiza o timestamp de último uso."""
+        self.last_used_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+
+
+class UserSession(Base):
+    """
+    Sessão do usuário - controle de sessões ativas.
+    Suporte a múltiplos dispositivos e plataformas.
+    """
+    
+    __tablename__ = "user_sessions"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)  # ID da sessão
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.users.id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Dispositivo e plataforma
+    device_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    platform: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # web, mobile, telegram, api
+    user_agent: Mapped[Optional[str]] = mapped_column(Text)
+    ip_address: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    
+    # Token e autenticação
+    refresh_token_hash: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    access_token_hash: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    
+    # Status
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    
+    # Segurança
+    fingerprint_hash: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    geo_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_activity_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    user: Mapped["User"] = relationship(back_populates="sessions")
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_user_sessions_user_active', 'user_id', 'is_active', 'expires_at'),
+        Index('ix_user_sessions_tenant_user', 'tenant_id', 'user_id', 'is_active'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<UserSession(session_id='{self.session_id}', user_id='{self.user_id}', platform='{self.platform}', is_active={self.is_active})>"
+    
+    @property
+    def is_valid(self) -> bool:
+        """Verifica se a sessão é válida."""
+        now = datetime.utcnow()
+        return (
+            self.is_active and 
+            not self.is_blocked and 
+            self.revoked_at is None and 
+            now <= self.expires_at
+        )
+    
+    @property
+    def is_expired(self) -> bool:
+        """Verifica se a sessão expirou."""
+        return datetime.utcnow() > self.expires_at
+    
+    @property
+    def time_remaining_seconds(self) -> int:
+        """Retorna segundos restantes até a expiração."""
+        now = datetime.utcnow()
+        if now > self.expires_at:
+            return 0
+        
+        return int((self.expires_at - now).total_seconds())
+    
+    def update_activity(self):
+        """Atualiza o timestamp da última atividade."""
+        self.last_activity_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def extend(self, additional_hours: int = 24):
+        """Estende a validade da sessão."""
+        self.expires_at = self.expires_at + timedelta(hours=additional_hours)
+        self.updated_at = datetime.utcnow()
+    
+    def revoke(self, reason: Optional[str] = None):
+        """Revoga a sessão."""
+        self.is_active = False
+        self.revoked_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        if reason:
+            if "revocation_log" not in self.metadata:
+                self.metadata["revocation_log"] = []
+            
+            self.metadata["revocation_log"].append({
+                "reason": reason,
+                "revoked_at": self.revoked_at.isoformat()
+            })
+    
+    def block(self, reason: str, blocked_by: str):
+        """Bloqueia a sessão."""
+        self.is_blocked = True
+        self.is_active = False
+        self.updated_at = datetime.utcnow()
+        
+        if "block_log" not in self.metadata:
+            self.metadata["block_log"] = []
+        
+        self.metadata["block_log"].append({
+            "reason": reason,
+            "blocked_by": blocked_by,
+            "blocked_at": datetime.utcnow().isoformat()
+        })
+    
+    def update_geo_data(self, ip_address: Optional[str] = None, geo_data: Optional[Dict[str, Any]] = None):
+        """Atualiza dados geográficos da sessão."""
+        if ip_address:
+            self.ip_address = ip_address
+        
+        if geo_data:
+            self.geo_data.update(geo_data)
+        
+        self.updated_at = datetime.utcnow()
+
+
+class UserPreference(Base):
+    """
+    Preferências do usuário - configurações específicas por aplicativo.
+    """
+    
+    __tablename__ = "user_preferences"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.users.id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Categoria da preferência
+    category: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # notifications, ui, privacy, etc.
+    preference_key: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    
+    # Valor da preferência
+    preference_value: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relacionamentos
+    user: Mapped["User"] = relationship()
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_user_preferences_user_category_key', 'user_id', 'category', 'preference_key', unique=True),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<UserPreference(user_id='{self.user_id}', category='{self.category}', key='{self.preference_key}')>"
+    
+    def update_value(self, new_value: Dict[str, Any], merge: bool = True):
+        """Atualiza o valor da preferência."""
+        if merge:
+            self.preference_value.update(new_value)
+        else:
+            self.preference_value = new_value
+        
+        self.updated_at = datetime.utcnow()
+
+
+# Adiciona o relacionamento de volta nos modelos relacionados
+User.preferences = relationship("UserPreference", back_populates="user", cascade="all, delete-orphan")

@@ -1,0 +1,179 @@
+"""
+Exemplo de uso do sistema de filas.
+Demonstra como publicar e consumir mensagens.
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+
+from .redis_queue import create_redis_queue
+from .tasks import TaskFactory
+from .workers import create_default_workers
+
+# Configura logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+async def example_publish():
+    """Exemplo de publicação de tarefas"""
+    # Cria a fila
+    queue = create_redis_queue()
+    
+    try:
+        # Exemplo 1: Publicar webhook de pagamento
+        webhook_task = TaskFactory.create_payment_webhook(
+            tenant_id="tenant_123",
+            provider="stripe",
+            event_data={
+                "event_id": "evt_123",
+                "payment_intent": "pi_123",
+                "amount": 2990,
+                "currency": "usd",
+                "status": "succeeded"
+            },
+            idempotency_key="stripe_evt_123"
+        )
+        
+        await queue.publish(
+            queue_name=webhook_task.get_queue_name(),
+            payload=webhook_task.to_dict(),
+            tenant_id="tenant_123",
+            source="stripe_webhook"
+        )
+        
+        logger.info("Published payment webhook task")
+        
+        # Exemplo 2: Publicar concessão de acesso
+        from ..models.entitlement import EntitlementScope
+        
+        entitlement_task = TaskFactory.create_entitlement_grant(
+            tenant_id="tenant_123",
+            user_id="user_456",
+            entitlement_type="premium_access",
+            scope=EntitlementScope.GLOBAL
+        )
+        
+        await queue.publish(
+            queue_name=entitlement_task.get_queue_name(),
+            payload=entitlement_task.to_dict(),
+            tenant_id="tenant_123",
+            source="payment_processor"
+        )
+        
+        logger.info("Published entitlement grant task")
+        
+        # Exemplo 3: Publicar notificação
+        notification_task = TaskFactory.create_notification(
+            tenant_id="tenant_123",
+            user_id="user_456",
+            template_id="welcome_message",
+            channel="telegram",
+            variables={"username": "john_doe"}
+        )
+        
+        await queue.publish(
+            queue_name=notification_task.get_queue_name(),
+            payload=notification_task.to_dict(),
+            tenant_id="tenant_123",
+            source="onboarding"
+        )
+        
+        logger.info("Published notification task")
+        
+    finally:
+        await queue.shutdown()
+
+
+async def example_consume():
+    """Exemplo de consumo de tarefas"""
+    # Nota: Para este exemplo funcionar, você precisa ter as engines implementadas
+    # Vamos apenas demonstrar a estrutura
+    
+    from ..core.billing_engine import BillingEngine
+    from ..core.entitlement_engine import EntitlementEngine
+    from ..core.notification_engine import NotificationEngine
+    from ..core.audit_logger import AuditLogger
+    
+    # Cria a fila
+    queue = create_redis_queue()
+    
+    # Cria as engines (instâncias mock para exemplo)
+    billing_engine = BillingEngine()
+    entitlement_engine = EntitlementEngine()
+    notification_engine = NotificationEngine()
+    audit_logger = AuditLogger()
+    
+    # Cria os workers
+    worker_manager = create_default_workers(
+        queue=queue,
+        billing_engine=billing_engine,
+        entitlement_engine=entitlement_engine,
+        notification_engine=notification_engine,
+        audit_logger=audit_logger,
+        tenant_id="tenant_123"
+    )
+    
+    try:
+        # Inicia todos os workers
+        await worker_manager.start_all()
+        
+        # Mantém o worker rodando por 30 segundos
+        logger.info("Workers started. Running for 30 seconds...")
+        await asyncio.sleep(30)
+        
+        # Para os workers
+        await worker_manager.stop_all()
+        
+    finally:
+        await queue.shutdown()
+
+
+async def example_stats():
+    """Exemplo de obtenção de estatísticas"""
+    queue = create_redis_queue()
+    
+    try:
+        # Obtém estatísticas da fila de webhooks
+        stats = await queue.get_queue_stats("payment_webhook_queue", "tenant_123")
+        
+        logger.info(f"Queue stats: {stats}")
+        
+        # Obtém estatísticas globais
+        all_queues = [
+            "payment_webhook_queue",
+            "entitlement_grant_queue", 
+            "notification_send_queue",
+            "audit_log_queue"
+        ]
+        
+        for queue_name in all_queues:
+            stats = await queue.get_queue_stats(queue_name)
+            logger.info(f"{queue_name}: {stats.get('total_messages', 0)} messages")
+            
+    finally:
+        await queue.shutdown()
+
+
+async def main():
+    """Função principal do exemplo"""
+    print("Sistema de Filas - Exemplos")
+    print("=" * 50)
+    
+    # Executa os exemplos
+    print("\n1. Publicando tarefas...")
+    await example_publish()
+    
+    print("\n2. Obtendo estatísticas...")
+    await example_stats()
+    
+    print("\n3. Consumindo tarefas...")
+    print("   (Este exemplo requer engines implementadas)")
+    # await example_consume()  # Descomente quando as engines estiverem prontas
+    
+    print("\nExemplos concluídos!")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,1218 @@
+"""
+Audit Logger - Sistema de auditoria imutável para compliance, LGPD, forense e observabilidade
+
+Princípios:
+1. Imutabilidade absoluta: logs nunca são alterados ou deletados
+2. Isolamento por tenant
+3. Estrutura rica com contexto completo
+4. Performance otimizada para alta escala
+5. Suporte a queries complexas para forense
+"""
+
+import json
+import time
+import zlib
+import base64
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Any, Tuple, Union, Callable
+from decimal import Decimal
+import uuid
+import hashlib
+import asyncio
+
+from app.models.tenant import Tenant
+from app.models.user import User
+from app.utils.cryptography import encrypt_field, decrypt_field, generate_secure_hash
+from app.core.metrics_engine import MetricsEngine
+
+
+class AuditSeverity(Enum):
+    """Severidade do evento de auditoria"""
+    DEBUG = "debug"        # Informações de depuração
+    INFO = "info"         # Eventos normais
+    WARNING = "warning"   # Eventos anômalos não críticos
+    HIGH = "high"         # Eventos críticos
+    CRITICAL = "critical" # Falhas graves do sistema
+
+
+class AuditActionCategory(Enum):
+    """Categorias de ações de auditoria"""
+    AUTHENTICATION = "authentication"      # Login, logout, tokens
+    AUTHORIZATION = "authorization"        # Controle de acesso
+    DATA_ACCESS = "data_access"           # Acesso a dados
+    DATA_MODIFICATION = "data_modification" # Criação, atualização, deleção
+    CONFIGURATION = "configuration"       # Mudanças de configuração
+    SYSTEM = "system"                     # Eventos do sistema
+    BILLING = "billing"                   # Eventos financeiros
+    SECURITY = "security"                 # Eventos de segurança
+    COMPLIANCE = "compliance"             # Eventos de conformidade
+    WORKFLOW = "workflow"                 Transições de estado
+
+
+@dataclass
+class AuditContext:
+    """Contexto completo de um evento de auditoria"""
+    # Identificação
+    tenant_id: str                    # Tenant do evento
+    user_id: Optional[str] = None    # Usuário que causou o evento
+    session_id: Optional[str] = None # ID da sessão
+    request_id: Optional[str] = None # ID da requisição (correlação)
+    
+    # Localização
+    ip_address: Optional[str] = None # IP do cliente
+    user_agent: Optional[str] = None # User agent do cliente
+    geolocation: Optional[str] = None # Geolocalização aproximada
+    
+    # Sistema
+    service_name: str = "core"       # Serviço que gerou o log
+    service_version: str = "1.0.0"   # Versão do serviço
+    environment: str = "production"  # Ambiente (dev/staging/prod)
+    
+    # Recursos
+    resource_type: Optional[str] = None # Tipo do recurso (user, plan, etc.)
+    resource_id: Optional[str] = None   # ID do recurso
+    resource_changes: Optional[Dict[str, Any]] = None # Mudanças no recurso
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário, removendo campos None"""
+        return {k: v for k, v in asdict(self).items() if v is not None}
+
+
+@dataclass
+class AuditEvent:
+    """Evento de auditoria completo e imutável"""
+    # Identificação única
+    event_id: str                    # ID único do evento
+    trace_id: str                    # ID de rastreamento distribuído
+    parent_event_id: Optional[str] = None # Evento pai (para chains)
+    
+    # Metadados básicos
+    action: str                     # Ação realizada (ex: "user.login")
+    action_category: AuditActionCategory # Categoria da ação
+    severity: AuditSeverity         # Severidade
+    timestamp: datetime = field(default_factory=datetime.utcnow) # Momento exato
+    timestamp_ns: int = field(default_factory=lambda: time.time_ns()) # Nanosegundos
+    
+    # Contexto
+    context: AuditContext           # Contexto completo
+    
+    # Dados do evento
+    description: str                # Descrição legível
+    metadata: Dict[str, Any] = field(default_factory=dict) # Metadados extensíveis
+    tags: List[str] = field(default_factory=list) # Tags para busca
+    
+    # Dados sensíveis (criptografados)
+    sensitive_data: Optional[bytes] = None # Dados sensíveis criptografados
+    sensitive_data_schema: Optional[str] = None # Schema dos dados sensíveis
+    
+    # Integridade
+    checksum: str = ""              # Checksum para validação
+    is_tampered: bool = False       # Flag de adulteração detectada
+    
+    # Performance
+    processing_time_ms: Optional[int] = None # Tempo de processamento em ms
+    
+    def __post_init__(self):
+        """Calcula checksum após inicialização"""
+        if not self.checksum:
+            self.checksum = self.calculate_checksum()
+    
+    def calculate_checksum(self) -> str:
+        """Calcula checksum SHA-256 do evento"""
+        # Prepara dados para hash (excluindo checksum e sensitive_data)
+        hash_data = {
+            "event_id": self.event_id,
+            "trace_id": self.trace_id,
+            "parent_event_id": self.parent_event_id,
+            "action": self.action,
+            "action_category": self.action_category.value,
+            "severity": self.severity.value,
+            "timestamp": self.timestamp.isoformat(),
+            "timestamp_ns": self.timestamp_ns,
+            "context": self.context.to_dict(),
+            "description": self.description,
+            "metadata": json.dumps(self.metadata, sort_keys=True),
+            "tags": sorted(self.tags),
+            "sensitive_data_schema": self.sensitive_data_schema,
+            "is_tampered": self.is_tampered,
+            "processing_time_ms": self.processing_time_ms
+        }
+        
+        # Adiciona hash dos dados sensíveis se existirem
+        if self.sensitive_data:
+            hash_data["sensitive_data_hash"] = hashlib.sha256(self.sensitive_data).hexdigest()
+        
+        # Calcula hash
+        json_str = json.dumps(hash_data, sort_keys=True)
+        return hashlib.sha256(json_str.encode()).hexdigest()
+    
+    def validate_integrity(self) -> bool:
+        """Valida integridade do evento"""
+        return self.checksum == self.calculate_checksum()
+    
+    def add_sensitive_data(self, data: Dict[str, Any], encryption_key: str) -> None:
+        """Adiciona dados sensíveis criptografados"""
+        # Serializa dados
+        json_data = json.dumps(data, ensure_ascii=False)
+        
+        # Criptografa
+        encrypted = encrypt_field(json_data, encryption_key)
+        self.sensitive_data = encrypted
+        
+        # Atualiza checksum
+        self.checksum = self.calculate_checksum()
+    
+    def get_sensitive_data(self, encryption_key: str) -> Optional[Dict[str, Any]]:
+        """Recupera dados sensíveis descriptografados"""
+        if not self.sensitive_data:
+            return None
+        
+        try:
+            decrypted = decrypt_field(self.sensitive_data, encryption_key)
+            return json.loads(decrypted)
+        except Exception:
+            return None
+    
+    def to_dict(self, include_sensitive: bool = False, encryption_key: Optional[str] = None) -> Dict[str, Any]:
+        """Converte para dicionário para serialização"""
+        data = {
+            "event_id": self.event_id,
+            "trace_id": self.trace_id,
+            "parent_event_id": self.parent_event_id,
+            "action": self.action,
+            "action_category": self.action_category.value,
+            "severity": self.severity.value,
+            "timestamp": self.timestamp.isoformat(),
+            "timestamp_ns": self.timestamp_ns,
+            "context": self.context.to_dict(),
+            "description": self.description,
+            "metadata": self.metadata,
+            "tags": self.tags,
+            "checksum": self.checksum,
+            "is_tampered": self.is_tampered,
+            "processing_time_ms": self.processing_time_ms,
+            "sensitive_data_schema": self.sensitive_data_schema
+        }
+        
+        # Inclui dados sensíveis se solicitado e possível
+        if include_sensitive and encryption_key and self.sensitive_data:
+            sensitive = self.get_sensitive_data(encryption_key)
+            if sensitive:
+                data["sensitive_data"] = sensitive
+        
+        return data
+    
+    def compress(self) -> bytes:
+        """Comprime evento para armazenamento eficiente"""
+        event_dict = self.to_dict()
+        json_str = json.dumps(event_dict, ensure_ascii=False)
+        compressed = zlib.compress(json_str.encode('utf-8'), level=9)
+        
+        # Adiciona dados sensíveis se existirem
+        if self.sensitive_data:
+            combined = compressed + b"||SENSITIVE||" + self.sensitive_data
+            return base64.b64encode(combined)
+        
+        return base64.b64encode(compressed)
+    
+    @classmethod
+    def decompress(cls, data: bytes, encryption_key: Optional[str] = None) -> Optional['AuditEvent']:
+        """Descomprime evento do armazenamento"""
+        try:
+            decoded = base64.b64decode(data)
+            
+            # Verifica se tem dados sensíveis
+            if b"||SENSITIVE||" in decoded:
+                compressed, sensitive_data = decoded.split(b"||SENSITIVE||")
+                sensitive_data = sensitive_data
+            else:
+                compressed = decoded
+                sensitive_data = None
+            
+            # Descomprime
+            json_str = zlib.decompress(compressed).decode('utf-8')
+            event_dict = json.loads(json_str)
+            
+            # Reconstrói contexto
+            context_dict = event_dict.pop("context", {})
+            context = AuditContext(**context_dict)
+            
+            # Reconstrói enums
+            event_dict["action_category"] = AuditActionCategory(event_dict["action_category"])
+            event_dict["severity"] = AuditSeverity(event_dict["severity"])
+            event_dict["timestamp"] = datetime.fromisoformat(event_dict["timestamp"])
+            
+            # Cria evento
+            event = cls(
+                event_id=event_dict.pop("event_id"),
+                trace_id=event_dict.pop("trace_id"),
+                parent_event_id=event_dict.pop("parent_event_id", None),
+                action=event_dict.pop("action"),
+                action_category=event_dict.pop("action_category"),
+                severity=event_dict.pop("severity"),
+                timestamp=event_dict.pop("timestamp"),
+                timestamp_ns=event_dict.pop("timestamp_ns", time.time_ns()),
+                context=context,
+                description=event_dict.pop("description"),
+                metadata=event_dict.pop("metadata", {}),
+                tags=event_dict.pop("tags", []),
+                checksum=event_dict.pop("checksum", ""),
+                is_tampered=event_dict.pop("is_tampered", False),
+                processing_time_ms=event_dict.pop("processing_time_ms", None),
+                sensitive_data_schema=event_dict.pop("sensitive_data_schema", None)
+            )
+            
+            # Restaura dados sensíveis
+            if sensitive_data and encryption_key:
+                event.sensitive_data = sensitive_data
+            
+            # Valida integridade
+            if not event.validate_integrity():
+                event.is_tampered = True
+            
+            return event
+            
+        except Exception as e:
+            print(f"Erro ao descomprimir evento: {e}")
+            return None
+
+
+class AuditStorageBackend:
+    """Interface para backends de armazenamento de auditoria"""
+    
+    async def store(self, event: AuditEvent) -> bool:
+        """Armazena evento de auditoria"""
+        raise NotImplementedError
+    
+    async def retrieve(self, event_id: str) -> Optional[AuditEvent]:
+        """Recupera evento por ID"""
+        raise NotImplementedError
+    
+    async def search(
+        self,
+        tenant_id: str,
+        filters: Dict[str, Any],
+        limit: int = 100,
+        offset: int = 0
+    ) -> Tuple[List[AuditEvent], int]:
+        """Busca eventos com filtros"""
+        raise NotImplementedError
+    
+    async def delete_tenant_data(self, tenant_id: str) -> int:
+        """Exclui dados de um tenant (para compliance)"""
+        raise NotImplementedError
+    
+    async def export_tenant_data(
+        self,
+        tenant_id: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> List[AuditEvent]:
+        """Exporta dados de tenant para compliance"""
+        raise NotImplementedError
+    
+    async def cleanup_old_records(self, older_than_days: int) -> int:
+        """Limpa registros antigos (exceto se retention policy proibir)"""
+        raise NotImplementedError
+
+
+class InMemoryAuditStorage(AuditStorageBackend):
+    """Backend em memória para testes e desenvolvimento"""
+    
+    def __init__(self):
+        self._storage: Dict[str, AuditEvent] = {}
+        self._tenant_index: Dict[str, List[str]] = {}
+        self._compressed_storage: Dict[str, bytes] = {}
+    
+    async def store(self, event: AuditEvent) -> bool:
+        """Armazena evento em memória"""
+        event_id = event.event_id
+        tenant_id = event.context.tenant_id
+        
+        # Comprime evento
+        compressed = event.compress()
+        
+        # Armazena
+        self._storage[event_id] = event
+        self._compressed_storage[event_id] = compressed
+        
+        # Atualiza índice por tenant
+        if tenant_id not in self._tenant_index:
+            self._tenant_index[tenant_id] = []
+        
+        self._tenant_index[tenant_id].append(event_id)
+        
+        return True
+    
+    async def retrieve(self, event_id: str) -> Optional[AuditEvent]:
+        """Recupera evento por ID"""
+        return self._storage.get(event_id)
+    
+    async def search(
+        self,
+        tenant_id: str,
+        filters: Dict[str, Any],
+        limit: int = 100,
+        offset: int = 0
+    ) -> Tuple[List[AuditEvent], int]:
+        """Busca eventos com filtros"""
+        if tenant_id not in self._tenant_index:
+            return [], 0
+        
+        # Obtém todos eventos do tenant
+        event_ids = self._tenant_index[tenant_id]
+        events = [self._storage[eid] for eid in event_ids if eid in self._storage]
+        
+        # Aplica filtros
+        filtered = []
+        for event in events:
+            if self._matches_filters(event, filters):
+                filtered.append(event)
+        
+        # Ordena por timestamp decrescente
+        filtered.sort(key=lambda e: e.timestamp, reverse=True)
+        
+        # Paginação
+        total = len(filtered)
+        paginated = filtered[offset:offset + limit]
+        
+        return paginated, total
+    
+    def _matches_filters(self, event: AuditEvent, filters: Dict[str, Any]) -> bool:
+        """Verifica se evento corresponde aos filtros"""
+        for key, value in filters.items():
+            if key == "action":
+                if event.action != value:
+                    return False
+            elif key == "action_category":
+                if event.action_category != value:
+                    return False
+            elif key == "severity":
+                if event.severity != value:
+                    return False
+            elif key == "user_id":
+                if event.context.user_id != value:
+                    return False
+            elif key == "resource_type":
+                if event.context.resource_type != value:
+                    return False
+            elif key == "resource_id":
+                if event.context.resource_id != value:
+                    return False
+            elif key == "start_date":
+                if event.timestamp < value:
+                    return False
+            elif key == "end_date":
+                if event.timestamp > value:
+                    return False
+            elif key == "tags":
+                if not all(tag in event.tags for tag in value):
+                    return False
+            elif key.startswith("metadata."):
+                meta_key = key[9:]  # Remove "metadata."
+                if meta_key not in event.metadata or event.metadata[meta_key] != value:
+                    return False
+        
+        return True
+    
+    async def delete_tenant_data(self, tenant_id: str) -> int:
+        """Exclui dados de um tenant"""
+        if tenant_id not in self._tenant_index:
+            return 0
+        
+        # Conta eventos excluídos
+        event_ids = self._tenant_index[tenant_id]
+        count = len(event_ids)
+        
+        # Remove do armazenamento
+        for event_id in event_ids:
+            self._storage.pop(event_id, None)
+            self._compressed_storage.pop(event_id, None)
+        
+        # Remove do índice
+        del self._tenant_index[tenant_id]
+        
+        return count
+    
+    async def export_tenant_data(
+        self,
+        tenant_id: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> List[AuditEvent]:
+        """Exporta dados de tenant"""
+        if tenant_id not in self._tenant_index:
+            return []
+        
+        event_ids = self._tenant_index[tenant_id]
+        events = []
+        
+        for event_id in event_ids:
+            event = self._storage.get(event_id)
+            if event and start_date <= event.timestamp <= end_date:
+                events.append(event)
+        
+        events.sort(key=lambda e: e.timestamp)
+        return events
+    
+    async def cleanup_old_records(self, older_than_days: int) -> int:
+        """Limpa registros antigos"""
+        cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+        count = 0
+        
+        for event_id, event in list(self._storage.items()):
+            if event.timestamp < cutoff:
+                # Remove do armazenamento
+                self._storage.pop(event_id, None)
+                self._compressed_storage.pop(event_id, None)
+                
+                # Remove do índice
+                tenant_id = event.context.tenant_id
+                if tenant_id in self._tenant_index and event_id in self._tenant_index[tenant_id]:
+                    self._tenant_index[tenant_id].remove(event_id)
+                
+                count += 1
+        
+        return count
+
+
+class AuditQueryBuilder:
+    """Construtor de queries complexas para auditoria"""
+    
+    def __init__(self, tenant_id: str):
+        self.tenant_id = tenant_id
+        self.filters = {"tenant_id": tenant_id}
+        self.sort_field = "timestamp"
+        self.sort_desc = True
+        self.limit = 100
+        self.offset = 0
+    
+    def by_action(self, action: str) -> 'AuditQueryBuilder':
+        """Filtra por ação específica"""
+        self.filters["action"] = action
+        return self
+    
+    def by_category(self, category: AuditActionCategory) -> 'AuditQueryBuilder':
+        """Filtra por categoria"""
+        self.filters["action_category"] = category
+        return self
+    
+    def by_severity(self, severity: AuditSeverity) -> 'AuditQueryBuilder':
+        """Filtra por severidade"""
+        self.filters["severity"] = severity
+        return self
+    
+    def by_user(self, user_id: str) -> 'AuditQueryBuilder':
+        """Filtra por usuário"""
+        self.filters["user_id"] = user_id
+        return self
+    
+    def by_resource(self, resource_type: str, resource_id: Optional[str] = None) -> 'AuditQueryBuilder':
+        """Filtra por recurso"""
+        self.filters["resource_type"] = resource_type
+        if resource_id:
+            self.filters["resource_id"] = resource_id
+        return self
+    
+    def by_date_range(self, start_date: datetime, end_date: datetime) -> 'AuditQueryBuilder':
+        """Filtra por intervalo de datas"""
+        self.filters["start_date"] = start_date
+        self.filters["end_date"] = end_date
+        return self
+    
+    def by_tags(self, tags: List[str]) -> 'AuditQueryBuilder':
+        """Filtra por tags"""
+        self.filters["tags"] = tags
+        return self
+    
+    def by_metadata(self, key: str, value: Any) -> 'AuditQueryBuilder':
+        """Filtra por metadados"""
+        self.filters[f"metadata.{key}"] = value
+        return self
+    
+    def sort_by(self, field: str, descending: bool = True) -> 'AuditQueryBuilder':
+        """Define ordenação"""
+        self.sort_field = field
+        self.sort_desc = descending
+        return self
+    
+    def paginate(self, limit: int = 100, offset: int = 0) -> 'AuditQueryBuilder':
+        """Define paginação"""
+        self.limit = limit
+        self.offset = offset
+        return self
+    
+    def build(self) -> Dict[str, Any]:
+        """Constrói query final"""
+        return {
+            "filters": self.filters,
+            "sort": {"field": self.sort_field, "desc": self.sort_desc},
+            "pagination": {"limit": self.limit, "offset": self.offset}
+        }
+
+
+class AuditLogger:
+    """
+    Logger principal de auditoria com suporte a alta escala e compliance
+    """
+    
+    def __init__(
+        self,
+        storage_backend: Optional[AuditStorageBackend] = None,
+        metrics_engine: Optional[MetricsEngine] = None,
+        encryption_key: Optional[str] = None
+    ):
+        self.storage = storage_backend or InMemoryAuditStorage()
+        self.metrics = metrics_engine
+        self.encryption_key = encryption_key or "default-audit-key-change-in-prod"
+        
+        # Buffer para batch processing
+        self._event_buffer: List[AuditEvent] = []
+        self._buffer_lock = asyncio.Lock()
+        self._buffer_max_size = 1000
+        self._buffer_flush_interval = 30  # segundos
+        
+        # Estatísticas
+        self._stats = {
+            "events_logged": 0,
+            "events_failed": 0,
+            "buffer_size": 0,
+            "last_flush": datetime.utcnow()
+        }
+        
+        # Inicia background task para flush periódico
+        self._flush_task = asyncio.create_task(self._periodic_flush())
+    
+    async def _periodic_flush(self):
+        """Flush periódico do buffer"""
+        while True:
+            await asyncio.sleep(self._buffer_flush_interval)
+            await self.flush_buffer()
+    
+    async def flush_buffer(self) -> int:
+        """Força flush do buffer para armazenamento"""
+        async with self._buffer_lock:
+            if not self._event_buffer:
+                return 0
+            
+            events_to_flush = self._event_buffer.copy()
+            self._event_buffer.clear()
+            
+            # Atualiza estatísticas
+            self._stats["buffer_size"] = 0
+            self._stats["last_flush"] = datetime.utcnow()
+        
+        # Armazena eventos em batch
+        success_count = 0
+        for event in events_to_flush:
+            try:
+                await self.storage.store(event)
+                success_count += 1
+            except Exception as e:
+                print(f"Erro ao armazenar evento {event.event_id}: {e}")
+                self._stats["events_failed"] += 1
+        
+        self._stats["events_logged"] += success_count
+        
+        # Atualiza métricas
+        if self.metrics:
+            await self.metrics.increment_counter(
+                "audit.events.flushed",
+                value=success_count,
+                tags={"status": "success"}
+            )
+            await self.metrics.increment_counter(
+                "audit.events.failed",
+                value=len(events_to_flush) - success_count,
+                tags={"status": "failed"}
+            )
+        
+        return success_count
+    
+    async def log(
+        self,
+        tenant_id: str,
+        user_id: Optional[str],
+        action: str,
+        action_category: AuditActionCategory,
+        severity: AuditSeverity,
+        description: str,
+        context: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        resource_changes: Optional[Dict[str, Any]] = None,
+        sensitive_data: Optional[Dict[str, Any]] = None,
+        trace_id: Optional[str] = None,
+        parent_event_id: Optional[str] = None,
+        processing_time_ms: Optional[int] = None,
+        immediate_flush: bool = False
+    ) -> str:
+        """
+        Registra evento de auditoria
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário que causou o evento
+            action: Ação realizada (ex: "user.login")
+            action_category: Categoria da ação
+            severity: Severidade do evento
+            description: Descrição legível
+            context: Contexto adicional
+            metadata: Metadados extensíveis
+            tags: Tags para busca
+            resource_type: Tipo do recurso afetado
+            resource_id: ID do recurso afetado
+            resource_changes: Mudanças no recurso (antes/depois)
+            sensitive_data: Dados sensíveis que precisam de criptografia
+            trace_id: ID de rastreamento distribuído
+            parent_event_id: ID do evento pai
+            processing_time_ms: Tempo de processamento em ms
+            immediate_flush: Se True, flush imediato ao invés de buffer
+        
+        Returns:
+            ID do evento criado
+        """
+        start_time = time.time_ns()
+        
+        # Gera IDs
+        event_id = f"audit_{uuid.uuid4().hex}"
+        trace_id = trace_id or f"trace_{uuid.uuid4().hex}"
+        
+        # Prepara contexto
+        audit_context = AuditContext(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=context.get("session_id") if context else None,
+            request_id=context.get("request_id") if context else None,
+            ip_address=context.get("ip_address") if context else None,
+            user_agent=context.get("user_agent") if context else None,
+            geolocation=context.get("geolocation") if context else None,
+            service_name=context.get("service_name", "core") if context else "core",
+            service_version=context.get("service_version", "1.0.0") if context else "1.0.0",
+            environment=context.get("environment", "production") if context else "production",
+            resource_type=resource_type,
+            resource_id=resource_id,
+            resource_changes=resource_changes
+        )
+        
+        # Cria evento
+        event = AuditEvent(
+            event_id=event_id,
+            trace_id=trace_id,
+            parent_event_id=parent_event_id,
+            action=action,
+            action_category=action_category,
+            severity=severity,
+            context=audit_context,
+            description=description,
+            metadata=metadata or {},
+            tags=tags or [],
+            processing_time_ms=processing_time_ms
+        )
+        
+        # Adiciona dados sensíveis se fornecidos
+        if sensitive_data:
+            event.add_sensitive_data(sensitive_data, self.encryption_key)
+        
+        # Valida integridade
+        if not event.validate_integrity():
+            event.is_tampered = True
+        
+        # Armazena no buffer ou flush imediato
+        if immediate_flush:
+            await self.storage.store(event)
+            self._stats["events_logged"] += 1
+        else:
+            async with self._buffer_lock:
+                self._event_buffer.append(event)
+                self._stats["buffer_size"] = len(self._event_buffer)
+                
+                # Flush automático se buffer cheio
+                if len(self._event_buffer) >= self._buffer_max_size:
+                    asyncio.create_task(self.flush_buffer())
+        
+        # Calcula tempo de processamento
+        processing_time = (time.time_ns() - start_time) // 1_000_000
+        
+        # Atualiza métricas
+        if self.metrics:
+            await self.metrics.increment_counter(
+                "audit.events.logged",
+                tags={
+                    "action": action,
+                    "category": action_category.value,
+                    "severity": severity.value,
+                    "tenant": tenant_id
+                }
+            )
+            await self.metrics.record_histogram(
+                "audit.processing_time_ms",
+                value=processing_time,
+                tags={"action": action}
+            )
+        
+        return event_id
+    
+    async def retrieve(self, event_id: str) -> Optional[AuditEvent]:
+        """Recupera evento por ID"""
+        return await self.storage.retrieve(event_id)
+    
+    async def search(
+        self,
+        tenant_id: str,
+        query_builder: AuditQueryBuilder
+    ) -> Tuple[List[AuditEvent], int]:
+        """Busca eventos usando query builder"""
+        query = query_builder.build()
+        return await self.storage.search(tenant_id, query["filters"], query["pagination"]["limit"], query["pagination"]["offset"])
+    
+    async def search_simple(
+        self,
+        tenant_id: str,
+        action: Optional[str] = None,
+        user_id: Optional[str] = None,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        severity: Optional[AuditSeverity] = None,
+        limit: int = 100,
+        offset: int = 0
+    ) -> Tuple[List[AuditEvent], int]:
+        """Busca simplificada de eventos"""
+        query_builder = AuditQueryBuilder(tenant_id)
+        
+        if action:
+            query_builder.by_action(action)
+        if user_id:
+            query_builder.by_user(user_id)
+        if resource_type:
+            query_builder.by_resource(resource_type, resource_id)
+        if start_date and end_date:
+            query_builder.by_date_range(start_date, end_date)
+        if severity:
+            query_builder.by_severity(severity)
+        
+        query_builder.paginate(limit, offset)
+        
+        return await self.search(tenant_id, query_builder)
+    
+    async def get_user_activity(
+        self,
+        tenant_id: str,
+        user_id: str,
+        days: int = 30
+    ) -> List[AuditEvent]:
+        """Obtém atividade de usuário nos últimos N dias"""
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=days)
+        
+        query_builder = AuditQueryBuilder(tenant_id)
+        query_builder.by_user(user_id)
+        query_builder.by_date_range(start_date, end_date)
+        query_builder.sort_by("timestamp", descending=True)
+        
+        events, _ = await self.search(tenant_id, query_builder)
+        return events
+    
+    async def get_resource_audit_trail(
+        self,
+        tenant_id: str,
+        resource_type: str,
+        resource_id: str,
+        limit: int = 100
+    ) -> List[AuditEvent]:
+        """Obtém trilha de auditoria completa de um recurso"""
+        query_builder = AuditQueryBuilder(tenant_id)
+        query_builder.by_resource(resource_type, resource_id)
+        query_builder.sort_by("timestamp", descending=True)
+        query_builder.paginate(limit, 0)
+        
+        events, _ = await self.search(tenant_id, query_builder)
+        return events
+    
+    async def export_for_compliance(
+        self,
+        tenant_id: str,
+        start_date: datetime,
+        end_date: datetime,
+        include_sensitive: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Exporta dados para compliance (LGPD, etc.)"""
+        events = await self.storage.export_tenant_data(tenant_id, start_date, end_date)
+        
+        export_data = []
+        for event in events:
+            event_dict = event.to_dict(
+                include_sensitive=include_sensitive,
+                encryption_key=self.encryption_key if include_sensitive else None
+            )
+            export_data.append(event_dict)
+        
+        return export_data
+    
+    async def delete_tenant_data(self, tenant_id: str) -> int:
+        """Exclui todos os dados de um tenant (para compliance)"""
+        count = await self.storage.delete_tenant_data(tenant_id)
+        
+        # Log da própria exclusão
+        await self.log(
+            tenant_id="system",
+            user_id="system",
+            action="audit.tenant_data_deleted",
+            action_category=AuditActionCategory.COMPLIANCE,
+            severity=AuditSeverity.HIGH,
+            description=f"Dados de auditoria do tenant {tenant_id} excluídos por compliance",
+            metadata={"tenant_id": tenant_id, "records_deleted": count},
+            immediate_flush=True
+        )
+        
+        return count
+    
+    async def get_stats(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+        """Obtém estatísticas de auditoria"""
+        stats = self._stats.copy()
+        
+        # Adiciona métricas do sistema
+        if self.metrics:
+            system_stats = await self.metrics.get_counters("audit.")
+            stats["system_metrics"] = system_stats
+        
+        return stats
+    
+    async def integrity_check(self, sample_size: int = 100) -> Dict[str, Any]:
+        """Verifica integridade dos logs de auditoria"""
+        # Implementação básica - em produção seria mais robusta
+        results = {
+            "total_checked": 0,
+            "tampered_count": 0,
+            "invalid_checksum": 0,
+            "valid_count": 0
+        }
+        
+        # Amostra aleatória de eventos
+        all_tenants = list(self.storage._tenant_index.keys()) if hasattr(self.storage, '_tenant_index') else []
+        
+        for tenant_id in all_tenants[:10]:  # Limita a 10 tenants para performance
+            query_builder = AuditQueryBuilder(tenant_id)
+            query_builder.paginate(sample_size // len(all_tenants) if all_tenants else sample_size, 0)
+            
+            events, _ = await self.search(tenant_id, query_builder)
+            
+            for event in events:
+                results["total_checked"] += 1
+                
+                if event.is_tampered:
+                    results["tampered_count"] += 1
+                elif not event.validate_integrity():
+                    results["invalid_checksum"] += 1
+                else:
+                    results["valid_count"] += 1
+        
+        return results
+    
+    async def create_audit_report(
+        self,
+        tenant_id: str,
+        report_type: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> Dict[str, Any]:
+        """Gera relatório de auditoria"""
+        query_builder = AuditQueryBuilder(tenant_id)
+        query_builder.by_date_range(start_date, end_date)
+        
+        events, total = await self.search(tenant_id, query_builder)
+        
+        # Análise por categoria
+        by_category = {}
+        by_severity = {}
+        by_action = {}
+        by_user = {}
+        
+        for event in events:
+            # Categoria
+            cat = event.action_category.value
+            by_category[cat] = by_category.get(cat, 0) + 1
+            
+            # Severidade
+            sev = event.severity.value
+            by_severity[sev] = by_severity.get(sev, 0) + 1
+            
+            # Ação
+            action = event.action
+            by_action[action] = by_action.get(action, 0) + 1
+            
+            # Usuário
+            user = event.context.user_id or "system"
+            by_user[user] = by_user.get(user, 0) + 1
+        
+        return {
+            "report_type": report_type,
+            "tenant_id": tenant_id,
+            "period": {
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat()
+            },
+            "summary": {
+                "total_events": total,
+                "categories": by_category,
+                "severities": by_severity,
+                "top_actions": dict(sorted(by_action.items(), key=lambda x: x[1], reverse=True)[:10]),
+                "top_users": dict(sorted(by_user.items(), key=lambda x: x[1], reverse=True)[:10])
+            },
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    
+    async def shutdown(self):
+        """Desliga o logger de forma segura"""
+        if hasattr(self, '_flush_task'):
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Flush final do buffer
+        await self.flush_buffer()
+
+
+# Utilitários de auditoria pré-definidos
+class AuditUtils:
+    """Utilitários comuns para auditoria"""
+    
+    @staticmethod
+    async def log_user_login(
+        logger: AuditLogger,
+        tenant_id: str,
+        user_id: str,
+        ip_address: str,
+        user_agent: str,
+        success: bool,
+        failure_reason: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Log de login de usuário"""
+        action = "user.login.success" if success else "user.login.failed"
+        severity = AuditSeverity.INFO if success else AuditSeverity.WARNING
+        
+        description = f"Login de usuário {'bem-sucedido' if success else 'falhou'}"
+        if failure_reason:
+            description += f": {failure_reason}"
+        
+        return await logger.log(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            action=action,
+            action_category=AuditActionCategory.AUTHENTICATION,
+            severity=severity,
+            description=description,
+            context={
+                "ip_address": ip_address,
+                "user_agent": user_agent
+            },
+            metadata={
+                "success": success,
+                "failure_reason": failure_reason,
+                **(metadata or {})
+            },
+            tags=["authentication", "login"]
+        )
+    
+    @staticmethod
+    async def log_data_access(
+        logger: AuditLogger,
+        tenant_id: str,
+        user_id: str,
+        resource_type: str,
+        resource_id: str,
+        operation: str,
+        ip_address: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Log de acesso a dados"""
+        return await logger.log(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            action=f"data.access.{operation}",
+            action_category=AuditActionCategory.DATA_ACCESS,
+            severity=AuditSeverity.INFO,
+            description=f"Acesso a {resource_type} {resource_id} ({operation})",
+            context={
+                "ip_address": ip_address
+            },
+            metadata={
+                "operation": operation,
+                **(metadata or {})
+            },
+            resource_type=resource_type,
+            resource_id=resource_id,
+            tags=["data_access", operation]
+        )
+    
+    @staticmethod
+    async def log_data_modification(
+        logger: AuditLogger,
+        tenant_id: str,
+        user_id: str,
+        resource_type: str,
+        resource_id: str,
+        operation: str,
+        changes: Dict[str, Any],
+        ip_address: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Log de modificação de dados"""
+        return await logger.log(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            action=f"data.modification.{operation}",
+            action_category=AuditActionCategory.DATA_MODIFICATION,
+            severity=AuditSeverity.INFO,
+            description=f"Modificação de {resource_type} {resource_id} ({operation})",
+            context={
+                "ip_address": ip_address
+            },
+            metadata={
+                "operation": operation,
+                "changes_summary": list(changes.keys()),
+                **(metadata or {})
+            },
+            resource_type=resource_type,
+            resource_id=resource_id,
+            resource_changes=changes,
+            tags=["data_modification", operation]
+        )
+    
+    @staticmethod
+    async def log_security_event(
+        logger: AuditLogger,
+        tenant_id: str,
+        user_id: Optional[str],
+        event_type: str,
+        description: str,
+        severity: AuditSeverity,
+        ip_address: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Log de evento de segurança"""
+        return await logger.log(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            action=f"security.{event_type}",
+            action_category=AuditActionCategory.SECURITY,
+            severity=severity,
+            description=description,
+            context={
+                "ip_address": ip_address
+            },
+            metadata=metadata or {},
+            tags=["security", event_type]
+        )
+    
+    @staticmethod
+    async def log_billing_event(
+        logger: AuditLogger,
+        tenant_id: str,
+        user_id: Optional[str],
+        event_type: str,
+        description: str,
+        amount: Optional[Decimal] = None,
+        currency: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Log de evento de billing"""
+        meta = metadata or {}
+        if amount is not None:
+            meta["amount"] = str(amount)
+        if currency:
+            meta["currency"] = currency
+        
+        return await logger.log(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            action=f"billing.{event_type}",
+            action_category=AuditActionCategory.BILLING,
+            severity=AuditSeverity.INFO,
+            description=description,
+            metadata=meta,
+            tags=["billing", event_type]
+        )
+
+
+# Middleware para auditoria automática
+class AuditMiddleware:
+    """Middleware para auditoria automática de requisições"""
+    
+    def __init__(self, audit_logger: AuditLogger):
+        self.audit_logger = audit_logger
+    
+    async def process_request(self, request, handler):
+        """Processa requisição e loga automaticamente"""
+        start_time = time.time_ns()
+        
+        try:
+            # Executa handler
+            response = await handler(request)
+            
+            # Log de sucesso
+            processing_time = (time.time_ns() - start_time) // 1_000_000
+            
+            await self.audit_logger.log(
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                action="http.request",
+                action_category=AuditActionCategory.SYSTEM,
+                severity=AuditSeverity.INFO,
+                description=f"Requisição {request.method} {request.path}",
+                context={
+                    "ip_address": request.remote_ip,
+                    "user_agent": request.headers.get("User-Agent"),
+                    "session_id": request.session_id,
+                    "request_id": request.request_id,
+                    "service_name": "api_gateway"
+                },
+                metadata={
+                    "method": request.method,
+                    "path": request.path,
+                    "status_code": response.status_code,
+                    "processing_time_ms": processing_time
+                },
+                tags=["http", "request", request.method.lower()]
+            )
+            
+            return response
+            
+        except Exception as e:
+            # Log de erro
+            processing_time = (time.time_ns() - start_time) // 1_000_000
+            
+            await self.audit_logger.log(
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                action="http.request.error",
+                action_category=AuditActionCategory.SYSTEM,
+                severity=AuditSeverity.HIGH,
+                description=f"Erro na requisição {request.method} {request.path}: {str(e)}",
+                context={
+                    "ip_address": request.remote_ip,
+                    "user_agent": request.headers.get("User-Agent"),
+                    "session_id": request.session_id,
+                    "request_id": request.request_id,
+                    "service_name": "api_gateway"
+                },
+                metadata={
+                    "method": request.method,
+                    "path": request.path,
+                    "error": str(e),
+                    "error_type": e.__class__.__name__,
+                    "processing_time_ms": processing_time
+                },
+                tags=["http", "request", "error", request.method.lower()]
+            )
+            
+            raise

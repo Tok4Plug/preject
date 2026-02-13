@@ -1,0 +1,643 @@
+# app/models/flow_state.py
+"""
+Modelo de FlowState - Estado dos fluxos de conversação multi-bot.
+Máquina de estados imutável com histórico completo.
+"""
+
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text, Enum
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+import enum
+
+from app.database import Base
+
+
+class FlowStateStatus(enum.Enum):
+    """Status do fluxo."""
+    ACTIVE = "active"                # Fluxo ativo, aguardando interação
+    PAUSED = "paused"               # Fluxo pausado (usuário saiu temporariamente)
+    COMPLETED = "completed"         # Fluxo concluído com sucesso
+    ABANDONED = "abandoned"         # Fluxo abandonado pelo usuário
+    FAILED = "failed"               # Fluxo falhou (erro, timeout)
+    EXPIRED = "expired"             # Fluxo expirado (inativo por muito tempo)
+    BLOCKED = "blocked"             # Fluxo bloqueado (antifraude, etc.)
+
+
+class FlowStepType(enum.Enum):
+    """Tipo de passo no fluxo."""
+    MESSAGE = "message"             # Mensagem do bot
+    QUESTION = "question"           # Pergunta ao usuário
+    CHOICE = "choice"               # Escolha múltipla
+    INPUT = "input"                 # Entrada do usuário
+    ACTION = "action"               # Ação do sistema
+    PAYMENT = "payment"             # Passo de pagamento
+    REDIRECT = "redirect"           # Redirecionamento
+    CONDITION = "condition"         # Condição (if/else)
+    WAIT = "wait"                   # Espera (timer, webhook)
+    END = "end"                     # Fim do fluxo
+
+
+class FlowState(Base):
+    """
+    Estado do fluxo - máquina de estados imutável.
+    
+    Princípios:
+    1. Imutabilidade: Cada interação gera novo estado, mantendo histórico
+    2. Multi-bot: Estado específico por bot e usuário
+    3. Isolamento por tenant
+    4. Máquina de estados finita (FSM)
+    5. Alta concorrência com otimização de leitura
+    """
+    
+    __tablename__ = "flow_states"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    state_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # fs_xxx
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Contexto
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.users.id"), nullable=False, index=True)
+    bot_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.bots.id"), nullable=False, index=True)
+    flow_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # ID do fluxo definido no Flow Engine
+    
+    # Hierarquia de estados
+    parent_state_id: Mapped[Optional[str]] = mapped_column(String(50), ForeignKey("saas.flow_states.state_id"), index=True)
+    root_state_id: Mapped[Optional[str]] = mapped_column(String(50), index=True)  # Estado raiz do fluxo
+    
+    # Estado atual
+    status: Mapped[FlowStateStatus] = mapped_column(Enum(FlowStateStatus), nullable=False, default=FlowStateStatus.ACTIVE, index=True)
+    current_step: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # ID do passo atual no fluxo
+    current_step_type: Mapped[FlowStepType] = mapped_column(Enum(FlowStepType), nullable=False, default=FlowStepType.MESSAGE)
+    
+    # Dados do estado
+    state_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Dados persistentes do fluxo
+    context_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Dados temporários da sessão
+    step_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Dados específicos do passo
+    
+    # Histórico do fluxo
+    step_history: Mapped[List[Dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)  # Histórico de passos
+    transition_history: Mapped[List[Dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)  # Histórico de transições
+    
+    # Controle de progresso
+    steps_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_steps: Mapped[Optional[int]] = mapped_column(Integer)
+    progress_percentage: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    
+    # Variáveis do fluxo
+    variables: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Variáveis definidas pelo usuário
+    flags: Mapped[List[str]] = mapped_column(JSONB, nullable=False, default=list)  # Flags ativas
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    tags: Mapped[List[str]] = mapped_column(JSONB, nullable=False, default=list, index=True)  # Tags para busca
+    
+    # Timestamps e validade
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_interaction_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="flow_states")
+    user: Mapped["User"] = relationship(back_populates="flow_states")
+    bot: Mapped["Bot"] = relationship(back_populates="flow_states")
+    parent_state: Mapped[Optional["FlowState"]] = relationship(remote_side=[state_id])
+    child_states: Mapped[List["FlowState"]] = relationship(back_populates="parent_state", cascade="all, delete-orphan")
+    payment_intent: Mapped[Optional["PaymentIntent"]] = relationship(back_populates="flow_state")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="flow_state", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_flow_states_tenant_user_bot', 'tenant_id', 'user_id', 'bot_id', 'status'),
+        Index('ix_flow_states_flow_status', 'flow_id', 'status', 'last_interaction_at'),
+        Index('ix_flow_states_expires_status', 'expires_at', 'status'),
+        Index('ix_flow_states_created', 'created_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<FlowState(id='{self.id}', state_id='{self.state_id}', user='{self.user_id}', flow='{self.flow_id}', step='{self.current_step}', status='{self.status.value}')>"
+    
+    @classmethod
+    def generate_state_id(cls) -> str:
+        """Gera um ID único para o estado."""
+        timestamp = int(datetime.utcnow().timestamp() * 1000)
+        random_str = uuid.uuid4().hex[:8]
+        return f"fs_{timestamp}_{random_str}"
+    
+    @classmethod
+    def create_initial_state(
+        cls,
+        tenant_id: str,
+        user_id: str,
+        bot_id: str,
+        flow_id: str,
+        initial_step: str = "start",
+        initial_data: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> "FlowState":
+        """Cria estado inicial para um novo fluxo."""
+        state_id = cls.generate_state_id()
+        
+        return cls(
+            state_id=state_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            bot_id=bot_id,
+            flow_id=flow_id,
+            root_state_id=state_id,  # É o estado raiz
+            current_step=initial_step,
+            current_step_type=FlowStepType.MESSAGE,
+            state_data=initial_data or {},
+            metadata=metadata or {},
+            expires_at=datetime.utcnow() + timedelta(hours=24)  # Expira em 24h por padrão
+        )
+    
+    def to_dict(self, include_history: bool = False) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "state_id": self.state_id,
+            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
+            "bot_id": self.bot_id,
+            "flow_id": self.flow_id,
+            "parent_state_id": self.parent_state_id,
+            "root_state_id": self.root_state_id,
+            "status": self.status.value,
+            "current_step": self.current_step,
+            "current_step_type": self.current_step_type.value,
+            "state_data": self.state_data,
+            "context_data": self.context_data,
+            "step_data": self.step_data,
+            "steps_completed": self.steps_completed,
+            "total_steps": self.total_steps,
+            "progress_percentage": self.progress_percentage,
+            "variables": self.variables,
+            "flags": self.flags,
+            "metadata": self.metadata,
+            "tags": self.tags,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "last_interaction_at": self.last_interaction_at.isoformat() if self.last_interaction_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "is_active": self.is_active,
+            "is_expired": self.is_expired,
+            "is_completed": self.is_completed,
+            "has_parent": self.has_parent,
+            "is_root": self.is_root,
+            "time_since_last_interaction_seconds": self.time_since_last_interaction_seconds,
+            "time_remaining_seconds": self.time_remaining_seconds
+        }
+        
+        if include_history:
+            data["step_history"] = self.step_history[-10:]  # Últimos 10 passos
+            data["transition_history"] = self.transition_history[-10:]  # Últimas 10 transições
+        
+        return data
+    
+    @property
+    def is_active(self) -> bool:
+        """Verifica se o fluxo está ativo."""
+        return self.status == FlowStateStatus.ACTIVE and not self.is_expired
+    
+    @property
+    def is_expired(self) -> bool:
+        """Verifica se o fluxo expirou."""
+        if self.status == FlowStateStatus.EXPIRED:
+            return True
+        
+        if self.expires_at and datetime.utcnow() > self.expires_at:
+            return True
+        
+        return False
+    
+    @property
+    def is_completed(self) -> bool:
+        """Verifica se o fluxo foi concluído."""
+        return self.status in [
+            FlowStateStatus.COMPLETED,
+            FlowStateStatus.ABANDONED,
+            FlowStateStatus.FAILED,
+            FlowStateStatus.EXPIRED,
+            FlowStateStatus.BLOCKED
+        ]
+    
+    @property
+    def has_parent(self) -> bool:
+        """Verifica se tem um estado pai."""
+        return self.parent_state_id is not None
+    
+    @property
+    def is_root(self) -> bool:
+        """Verifica se é o estado raiz do fluxo."""
+        return self.root_state_id == self.state_id
+    
+    @property
+    def time_since_last_interaction_seconds(self) -> int:
+        """Retorna segundos desde a última interação."""
+        now = datetime.utcnow()
+        return int((now - self.last_interaction_at).total_seconds())
+    
+    @property
+    def time_remaining_seconds(self) -> Optional[int]:
+        """Retorna segundos restantes até expiração."""
+        if not self.expires_at:
+            return None
+        
+        now = datetime.utcnow()
+        if now > self.expires_at:
+            return 0
+        
+        return int((self.expires_at - now).total_seconds())
+    
+    def update_last_interaction(self):
+        """Atualiza o timestamp da última interação."""
+        self.last_interaction_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        # Se está inativo há muito tempo, pode estender expiração
+        if self.expires_at and self.time_since_last_interaction_seconds > 3600:  # 1 hora
+            self.expires_at = datetime.utcnow() + timedelta(hours=1)
+    
+    def transition_to_step(
+        self,
+        new_step: str,
+        step_type: FlowStepType,
+        step_data: Optional[Dict[str, Any]] = None,
+        transition_data: Optional[Dict[str, Any]] = None
+    ) -> "FlowState":
+        """
+        Transiciona para um novo passo, criando um novo estado.
+        
+        Princípio de imutabilidade: Cada transição cria um novo estado.
+        """
+        # Cria novo estado baseado no atual
+        new_state = FlowState(
+            state_id=self.generate_state_id(),
+            tenant_id=self.tenant_id,
+            user_id=self.user_id,
+            bot_id=self.bot_id,
+            flow_id=self.flow_id,
+            parent_state_id=self.state_id,
+            root_state_id=self.root_state_id or self.state_id,
+            status=FlowStateStatus.ACTIVE,
+            current_step=new_step,
+            current_step_type=step_type,
+            state_data=self.state_data.copy(),  # Copia dados persistentes
+            context_data=self.context_data.copy(),  # Copia contexto
+            step_data=step_data or {},
+            step_history=self.step_history.copy() + [{
+                "step": self.current_step,
+                "step_type": self.current_step_type.value,
+                "step_data": self.step_data,
+                "timestamp": self.last_interaction_at.isoformat(),
+                "duration_seconds": self.time_since_last_interaction_seconds
+            }],
+            transition_history=self.transition_history.copy() + [{
+                "from_step": self.current_step,
+                "to_step": new_step,
+                "transition_data": transition_data or {},
+                "timestamp": datetime.utcnow().isoformat()
+            }],
+            steps_completed=self.steps_completed + 1,
+            total_steps=self.total_steps,
+            progress_percentage=self._calculate_progress(),
+            variables=self.variables.copy(),
+            flags=self.flags.copy(),
+            metadata=self.metadata.copy(),
+            tags=self.tags.copy(),
+            expires_at=self.expires_at,
+            last_interaction_at=datetime.utcnow()
+        )
+        
+        return new_state
+    
+    def _calculate_progress(self) -> float:
+        """Calcula porcentagem de progresso."""
+        if not self.total_steps or self.total_steps <= 0:
+            return 0.0
+        
+        return min(100.0, (self.steps_completed / self.total_steps) * 100)
+    
+    def set_variable(self, name: str, value: Any):
+        """Define uma variável no estado."""
+        self.variables[name] = value
+        self.updated_at = datetime.utcnow()
+    
+    def get_variable(self, name: str, default: Any = None) -> Any:
+        """Obtém uma variável do estado."""
+        return self.variables.get(name, default)
+    
+    def add_flag(self, flag: str):
+        """Adiciona uma flag ao estado."""
+        if flag not in self.flags:
+            self.flags.append(flag)
+            self.updated_at = datetime.utcnow()
+    
+    def remove_flag(self, flag: str):
+        """Remove uma flag do estado."""
+        if flag in self.flags:
+            self.flags.remove(flag)
+            self.updated_at = datetime.utcnow()
+    
+    def has_flag(self, flag: str) -> bool:
+        """Verifica se uma flag está ativa."""
+        return flag in self.flags
+    
+    def complete(self, completion_data: Optional[Dict[str, Any]] = None):
+        """Marca o fluxo como concluído com sucesso."""
+        if self.is_completed:
+            return
+        
+        self.status = FlowStateStatus.COMPLETED
+        self.completed_at = datetime.utcnow()
+        self.progress_percentage = 100.0
+        
+        if completion_data:
+            self.metadata["completion_data"] = completion_data
+        
+        self.updated_at = datetime.utcnow()
+    
+    def abandon(self, reason: str = "user_abandoned"):
+        """Marca o fluxo como abandonado."""
+        if self.is_completed:
+            return
+        
+        self.status = FlowStateStatus.ABANDONED
+        self.completed_at = datetime.utcnow()
+        self.metadata["abandon_reason"] = reason
+        self.updated_at = datetime.utcnow()
+    
+    def fail(self, error_reason: str, error_code: Optional[str] = None):
+        """Marca o fluxo como falhado."""
+        if self.is_completed:
+            return
+        
+        self.status = FlowStateStatus.FAILED
+        self.completed_at = datetime.utcnow()
+        
+        error_data = {
+            "reason": error_reason,
+            "code": error_code,
+            "failed_at": datetime.utcnow().isoformat()
+        }
+        
+        if "errors" not in self.metadata:
+            self.metadata["errors"] = []
+        
+        self.metadata["errors"].append(error_data)
+        self.updated_at = datetime.utcnow()
+    
+    def expire(self):
+        """Marca o fluxo como expirado."""
+        if self.is_completed:
+            return
+        
+        self.status = FlowStateStatus.EXPIRED
+        self.completed_at = datetime.utcnow()
+        self.expires_at = datetime.utcnow()  # Garante que está no passado
+        self.updated_at = datetime.utcnow()
+    
+    def block(self, reason: str, blocked_by: str):
+        """Bloqueia o fluxo."""
+        if self.is_completed:
+            return
+        
+        self.status = FlowStateStatus.BLOCKED
+        self.completed_at = datetime.utcnow()
+        
+        block_data = {
+            "reason": reason,
+            "blocked_by": blocked_by,
+            "blocked_at": datetime.utcnow().isoformat()
+        }
+        
+        self.metadata["block"] = block_data
+        self.updated_at = datetime.utcnow()
+    
+    def pause(self, reason: Optional[str] = None):
+        """Pausa o fluxo."""
+        if self.status != FlowStateStatus.ACTIVE:
+            return
+        
+        self.status = FlowStateStatus.PAUSED
+        
+        if reason:
+            if "pause_log" not in self.metadata:
+                self.metadata["pause_log"] = []
+            
+            self.metadata["pause_log"].append({
+                "paused_at": datetime.utcnow().isoformat(),
+                "reason": reason
+            })
+        
+        self.updated_at = datetime.utcnow()
+    
+    def resume(self):
+        """Retoma um fluxo pausado."""
+        if self.status != FlowStateStatus.PAUSED:
+            return
+        
+        self.status = FlowStateStatus.ACTIVE
+        self.last_interaction_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def extend_expiration(self, additional_hours: int = 24):
+        """Estende o tempo de expiração."""
+        if not self.expires_at:
+            self.expires_at = datetime.utcnow() + timedelta(hours=additional_hours)
+        else:
+            self.expires_at = self.expires_at + timedelta(hours=additional_hours)
+        
+        self.updated_at = datetime.utcnow()
+    
+    def get_step_history_summary(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """Retorna resumo do histórico de passos."""
+        return self.step_history[-limit:] if self.step_history else []
+    
+    def get_full_history(self) -> Dict[str, Any]:
+        """Retorna histórico completo do fluxo."""
+        # Busca todos os estados relacionados (caminho completo)
+        states = self._get_ancestors() + [self]
+        
+        return {
+            "flow_id": self.flow_id,
+            "root_state_id": self.root_state_id,
+            "current_state_id": self.state_id,
+            "total_states": len(states),
+            "states": [state.to_dict(include_history=False) for state in states],
+            "step_history": self.step_history,
+            "transition_history": self.transition_history
+        }
+    
+    def _get_ancestors(self) -> List["FlowState"]:
+        """Obtém todos os estados ancestrais."""
+        ancestors = []
+        current = self.parent_state
+        
+        while current:
+            ancestors.insert(0, current)  # Insere no início para manter ordem
+            current = current.parent_state
+        
+        return ancestors
+
+
+class FlowDefinition(Base):
+    """
+    Definição de fluxo - template ou configuração de fluxo.
+    
+    Armazenado separadamente para reutilização e versionamento.
+    """
+    
+    __tablename__ = "flow_definitions"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    flow_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)  # ID do fluxo
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Identificação
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    category: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    
+    # Definição do fluxo
+    flow_config: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Configuração do fluxo
+    steps: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Definição dos passos
+    variables_schema: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Schema das variáveis
+    
+    # Versionamento
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    is_latest: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    previous_version_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    tags: Mapped[List[str]] = mapped_column(JSONB, nullable=False, default=list, index=True)
+    
+    # Estatísticas
+    usage_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    avg_completion_time_seconds: Mapped[Optional[float]] = mapped_column(Float)
+    completion_rate: Mapped[Optional[float]] = mapped_column(Float)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship()
+    instances: Mapped[List["FlowState"]] = relationship(back_populates="flow_definition")
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_flow_definitions_tenant_active', 'tenant_id', 'is_active', 'is_latest'),
+        Index('ix_flow_definitions_category', 'category', 'is_active'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<FlowDefinition(id='{self.id}', flow_id='{self.flow_id}', name='{self.name}', version={self.version})>"
+    
+    def to_dict(self, include_steps: bool = False) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "flow_id": self.flow_id,
+            "tenant_id": self.tenant_id,
+            "name": self.name,
+            "description": self.description,
+            "category": self.category,
+            "version": self.version,
+            "is_active": self.is_active,
+            "is_latest": self.is_latest,
+            "previous_version_id": self.previous_version_id,
+            "metadata": self.metadata,
+            "tags": self.tags,
+            "usage_count": self.usage_count,
+            "avg_completion_time_seconds": self.avg_completion_time_seconds,
+            "completion_rate": self.completion_rate,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
+            "step_count": len(self.steps) if self.steps else 0
+        }
+        
+        if include_steps:
+            data["steps"] = self.steps
+            data["flow_config"] = self.flow_config
+            data["variables_schema"] = self.variables_schema
+        
+        return data
+    
+    def increment_usage(self):
+        """Incrementa contador de uso."""
+        self.usage_count += 1
+        self.updated_at = datetime.utcnow()
+    
+    def create_new_version(self) -> "FlowDefinition":
+        """Cria uma nova versão do fluxo."""
+        new_flow = FlowDefinition(
+            flow_id=self.flow_id,
+            tenant_id=self.tenant_id,
+            name=self.name,
+            description=self.description,
+            category=self.category,
+            flow_config=self.flow_config.copy(),
+            steps=self.steps.copy(),
+            variables_schema=self.variables_schema.copy(),
+            version=self.version + 1,
+            is_active=False,  # Nova versão começa inativa
+            is_latest=True,
+            previous_version_id=self.id,
+            metadata=self.metadata.copy(),
+            tags=self.tags.copy(),
+            usage_count=0  # Reinicia contador de uso
+        )
+        
+        # Marca versão atual como não mais a mais recente
+        self.is_latest = False
+        
+        return new_flow
+    
+    def publish(self):
+        """Publica o fluxo (torna ativo)."""
+        self.is_active = True
+        self.published_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def unpublish(self):
+        """Despublica o fluxo."""
+        self.is_active = False
+        self.updated_at = datetime.utcnow()
+    
+    def get_step(self, step_id: str) -> Optional[Dict[str, Any]]:
+        """Obtém definição de um passo específico."""
+        return self.steps.get(step_id)
+    
+    def get_initial_step(self) -> Optional[str]:
+        """Obtém o passo inicial do fluxo."""
+        if not self.steps:
+            return None
+        
+        # Procura por passo marcado como inicial
+        for step_id, step_def in self.steps.items():
+            if step_def.get("is_initial", False):
+                return step_id
+        
+        # Se não encontrou, usa o primeiro passo
+        return next(iter(self.steps.keys()))
+
+
+# Adiciona as relações de volta nos modelos
+FlowState.flow_definition = relationship("FlowDefinition", back_populates="instances")
+FlowState.flow_definition_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.flow_definitions.id"), index=True)
+
+Tenant.flow_states = relationship("FlowState", back_populates="tenant", cascade="all, delete-orphan")
+User.flow_states = relationship("FlowState", back_populates="user", cascade="all, delete-orphan")
+Bot.flow_states = relationship("FlowState", back_populates="bot", cascade="all, delete-orphan")

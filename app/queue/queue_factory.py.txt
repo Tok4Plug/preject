@@ -1,0 +1,78 @@
+"""
+Factory para criar instâncias de fila baseadas na configuração.
+"""
+
+from typing import Optional
+
+from .base import BaseQueue, DeadLetterQueue, QueueMetrics
+from .config import QueueConfig, QueueBackend, get_queue_settings
+from .dead_letter_queue import DatabaseDeadLetterQueue
+from .queue_metrics import QueueMetricsImpl
+from .implementations import RedisQueue, InMemoryQueue
+
+from ..core.metrics_engine import MetricsEngine
+
+
+class QueueFactory:
+    """Factory para criar instâncias de fila"""
+    
+    @staticmethod
+    def create_queue(
+        queue_name: str,
+        metrics_engine: Optional[MetricsEngine] = None,
+        db_session_factory=None
+    ) -> BaseQueue:
+        """
+        Cria uma instância de fila baseada na configuração.
+        
+        Args:
+            queue_name: Nome da fila
+            metrics_engine: Instância do MetricsEngine (opcional)
+            db_session_factory: Factory para sessões de banco (para DLQ)
+        
+        Returns:
+            Instância de BaseQueue configurada
+        """
+        settings = get_queue_settings()
+        config = settings.get_queue_config(queue_name)
+        
+        # Cria sistema de métricas
+        metrics = None
+        if metrics_engine:
+            metrics = QueueMetricsImpl(metrics_engine)
+        
+        # Cria dead letter queue se habilitado
+        dead_letter_queue = None
+        if config.dead_letter_queue and db_session_factory:
+            dead_letter_queue = DatabaseDeadLetterQueue(db_session_factory)
+        
+        # Cria fila baseada no backend
+        if config.backend == QueueBackend.REDIS:
+            return RedisQueue(
+                redis_url=settings.redis_url,
+                config=config,
+                dead_letter_queue=dead_letter_queue,
+                metrics=metrics
+            )
+        
+        elif config.backend == QueueBackend.MEMORY:
+            return InMemoryQueue(
+                config=config,
+                dead_letter_queue=dead_letter_queue,
+                metrics=metrics
+            )
+        
+        else:
+            raise ValueError(f"Backend não suportado: {config.backend}")
+    
+    @staticmethod
+    def get_default_queue(
+        metrics_engine: Optional[MetricsEngine] = None,
+        db_session_factory=None
+    ) -> BaseQueue:
+        """Cria uma fila padrão para uso geral"""
+        return QueueFactory.create_queue(
+            queue_name="default",
+            metrics_engine=metrics_engine,
+            db_session_factory=db_session_factory
+        )

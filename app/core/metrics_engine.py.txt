@@ -1,0 +1,1424 @@
+"""
+Metrics Engine - Sistema de métricas internas para observabilidade, KPIs e alertas
+
+Princípios:
+1. Métricas sem dependência de providers externos
+2. Isolamento absoluto por tenant
+3. Tipos ricos (counters, gauges, histograms, summaries)
+4. Performance otimizada para alta escala
+5. Pronto para integração com Prometheus/OpenTelemetry
+"""
+
+import time
+import asyncio
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Any, Tuple, Callable, Set, Union
+from collections import defaultdict, deque
+import json
+import statistics
+import hashlib
+import uuid
+
+from app.models.tenant import Tenant
+from app.core.audit_logger import AuditLogger, AuditSeverity, AuditActionCategory
+
+
+class MetricType(Enum):
+    """Tipos de métricas suportadas"""
+    COUNTER = "counter"      # Só aumenta (ex: requisições totais)
+    GAUGE = "gauge"          # Pode subir e descer (ex: memória usada)
+    HISTOGRAM = "histogram"  # Distribuição de valores
+    SUMMARY = "summary"      # Percentis calculados
+    RATE = "rate"            # Taxa por período
+
+
+class MetricAggregation(Enum):
+    """Tipos de agregação de métricas"""
+    SUM = "sum"
+    AVG = "avg"
+    MIN = "min"
+    MAX = "max"
+    COUNT = "count"
+    P50 = "p50"
+    P90 = "p90"
+    P95 = "p95"
+    P99 = "p99"
+    STDDEV = "stddev"
+
+
+@dataclass
+class MetricLabel:
+    """Label para segmentação de métricas"""
+    name: str
+    value: str
+    
+    def __hash__(self):
+        return hash((self.name, self.value))
+    
+    def __eq__(self, other):
+        return self.name == other.name and self.value == other.value
+
+
+@dataclass
+class MetricSample:
+    """Amostra individual de métrica"""
+    timestamp: datetime
+    value: float
+    labels: List[MetricLabel] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "value": self.value,
+            "labels": {l.name: l.value for l in self.labels}
+        }
+
+
+@dataclass
+class MetricSeries:
+    """Série temporal de métricas com mesmos labels"""
+    metric_name: str
+    metric_type: MetricType
+    labels: List[MetricLabel]
+    samples: List[MetricSample] = field(default_factory=list)
+    retention_days: int = 7
+    
+    def __post_init__(self):
+        # Garante ordenação por timestamp
+        self.samples.sort(key=lambda x: x.timestamp)
+    
+    def add_sample(self, sample: MetricSample) -> None:
+        """Adiciona amostra à série"""
+        self.samples.append(sample)
+        self.samples.sort(key=lambda x: x.timestamp)
+        
+        # Limpa amostras antigas
+        cutoff = datetime.utcnow() - timedelta(days=self.retention_days)
+        self.samples = [s for s in self.samples if s.timestamp > cutoff]
+    
+    def get_aggregation(self, agg: MetricAggregation, window_minutes: Optional[int] = None) -> float:
+        """Calcula agregação sobre a série"""
+        values = self._get_values_in_window(window_minutes)
+        
+        if not values:
+            return 0.0
+        
+        if agg == MetricAggregation.SUM:
+            return sum(values)
+        elif agg == MetricAggregation.AVG:
+            return statistics.mean(values)
+        elif agg == MetricAggregation.MIN:
+            return min(values)
+        elif agg == MetricAggregation.MAX:
+            return max(values)
+        elif agg == MetricAggregation.COUNT:
+            return len(values)
+        elif agg == MetricAggregation.P50:
+            return statistics.quantiles(values, n=100)[49]
+        elif agg == MetricAggregation.P90:
+            return statistics.quantiles(values, n=100)[89]
+        elif agg == MetricAggregation.P95:
+            return statistics.quantiles(values, n=100)[94]
+        elif agg == MetricAggregation.P99:
+            return statistics.quantiles(values, n=100)[98]
+        elif agg == MetricAggregation.STDDEV:
+            return statistics.stdev(values) if len(values) > 1 else 0.0
+        
+        return 0.0
+    
+    def _get_values_in_window(self, window_minutes: Optional[int]) -> List[float]:
+        """Obtém valores dentro da janela temporal"""
+        if not window_minutes:
+            return [s.value for s in self.samples]
+        
+        cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
+        return [s.value for s in self.samples if s.timestamp > cutoff]
+    
+    def get_recent_samples(self, limit: int = 100) -> List[MetricSample]:
+        """Obtém amostras mais recentes"""
+        return sorted(self.samples, key=lambda x: x.timestamp, reverse=True)[:limit]
+    
+    def to_dict(self, include_samples: bool = False) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        data = {
+            "metric_name": self.metric_name,
+            "metric_type": self.metric_type.value,
+            "labels": {l.name: l.value for l in self.labels},
+            "sample_count": len(self.samples),
+            "retention_days": self.retention_days
+        }
+        
+        if include_samples and self.samples:
+            data["samples"] = [s.to_dict() for s in self.get_recent_samples(100)]
+        
+        return data
+
+
+@dataclass
+class MetricDefinition:
+    """Definição de uma métrica"""
+    name: str
+    description: str
+    metric_type: MetricType
+    unit: str = ""  # Ex: "ms", "bytes", "req/s"
+    labels: List[str] = field(default_factory=list)  # Labels esperados
+    default_labels: Dict[str, str] = field(default_factory=dict)
+    retention_days: int = 7
+    aggregation_windows: List[int] = field(default_factory=lambda: [1, 5, 15, 60])  # minutos
+    alert_thresholds: Dict[str, float] = field(default_factory=dict)
+    
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def validate_labels(self, labels: Dict[str, str]) -> bool:
+        """Valida se labels fornecidos são compatíveis"""
+        provided_keys = set(labels.keys())
+        expected_keys = set(self.labels)
+        
+        # Todos os labels obrigatórios devem estar presentes
+        return expected_keys.issubset(provided_keys)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "type": self.metric_type.value,
+            "unit": self.unit,
+            "labels": self.labels,
+            "default_labels": self.default_labels,
+            "retention_days": self.retention_days,
+            "aggregation_windows": self.aggregation_windows,
+            "alert_thresholds": self.alert_thresholds,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat()
+        }
+
+
+@dataclass
+class AlertRule:
+    """Regra de alerta baseada em métricas"""
+    alert_id: str
+    name: str
+    description: str
+    metric_name: str
+    condition: str  # Ex: "value > 100", "rate(5m) > 10"
+    severity: str  # "critical", "warning", "info"
+    labels: Dict[str, str] = field(default_factory=dict)
+    for_duration: str = "5m"  # Duração que a condição deve persistir
+    annotations: Dict[str, str] = field(default_factory=dict)  # Mensagens do alerta
+    enabled: bool = True
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_by: str = "system"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "alert_id": self.alert_id,
+            "name": self.name,
+            "description": self.description,
+            "metric_name": self.metric_name,
+            "condition": self.condition,
+            "severity": self.severity,
+            "labels": self.labels,
+            "for_duration": self.for_duration,
+            "annotations": self.annotations,
+            "enabled": self.enabled,
+            "created_at": self.created_at.isoformat(),
+            "created_by": self.created_by
+        }
+
+
+@dataclass
+class ActiveAlert:
+    """Alerta ativo no sistema"""
+    alert_id: str
+    rule_name: str
+    severity: str
+    metric_name: str
+    current_value: float
+    threshold: float
+    labels: Dict[str, str]
+    started_at: datetime
+    annotations: Dict[str, str]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "alert_id": self.alert_id,
+            "rule_name": self.rule_name,
+            "severity": self.severity,
+            "metric_name": self.metric_name,
+            "current_value": self.current_value,
+            "threshold": self.threshold,
+            "labels": self.labels,
+            "started_at": self.started_at.isoformat(),
+            "duration_seconds": (datetime.utcnow() - self.started_at).total_seconds(),
+            "annotations": self.annotations
+        }
+
+
+class MetricsRegistry:
+    """Registro global de definições de métricas"""
+    
+    def __init__(self):
+        self._definitions: Dict[str, MetricDefinition] = {}
+        self._default_metrics = [
+            self._create_http_requests_metric(),
+            self._create_response_time_metric(),
+            self._create_error_rate_metric(),
+            self._create_concurrent_requests_metric(),
+            self._create_memory_usage_metric(),
+            self._create_cpu_usage_metric(),
+            self._create_database_queries_metric()
+        ]
+        
+        # Registra métricas padrão
+        for metric in self._default_metrics:
+            self.register(metric)
+    
+    def _create_http_requests_metric(self) -> MetricDefinition:
+        """Cria métrica padrão de requisições HTTP"""
+        return MetricDefinition(
+            name="http_requests_total",
+            description="Total de requisições HTTP",
+            metric_type=MetricType.COUNTER,
+            unit="requests",
+            labels=["method", "path", "status_code", "tenant_id", "service"],
+            default_labels={"service": "core"}
+        )
+    
+    def _create_response_time_metric(self) -> MetricDefinition:
+        """Cria métrica padrão de tempo de resposta"""
+        return MetricDefinition(
+            name="http_response_time_ms",
+            description="Tempo de resposta HTTP em milissegundos",
+            metric_type=MetricType.HISTOGRAM,
+            unit="milliseconds",
+            labels=["method", "path", "status_code", "tenant_id", "service"],
+            default_labels={"service": "core"},
+            aggregation_windows=[1, 5, 15, 60]
+        )
+    
+    def _create_error_rate_metric(self) -> MetricDefinition:
+        """Cria métrica padrão de taxa de erro"""
+        return MetricDefinition(
+            name="http_error_rate",
+            description="Taxa de erro HTTP (status >= 400)",
+            metric_type=MetricType.RATE,
+            unit="errors/second",
+            labels=["method", "path", "tenant_id", "service"],
+            default_labels={"service": "core"},
+            alert_thresholds={"warning": 0.05, "critical": 0.1}
+        )
+    
+    def _create_concurrent_requests_metric(self) -> MetricDefinition:
+        """Cria métrica padrão de requisições concorrentes"""
+        return MetricDefinition(
+            name="concurrent_requests",
+            description="Requisições HTTP concorrentes",
+            metric_type=MetricType.GAUGE,
+            unit="requests",
+            labels=["tenant_id", "service"],
+            default_labels={"service": "core"}
+        )
+    
+    def _create_memory_usage_metric(self) -> MetricDefinition:
+        """Cria métrica padrão de uso de memória"""
+        return MetricDefinition(
+            name="memory_usage_bytes",
+            description="Uso de memória em bytes",
+            metric_type=MetricType.GAUGE,
+            unit="bytes",
+            labels=["tenant_id", "service"],
+            default_labels={"service": "core"}
+        )
+    
+    def _create_cpu_usage_metric(self) -> MetricDefinition:
+        """Cria métrica padrão de uso de CPU"""
+        return MetricDefinition(
+            name="cpu_usage_percent",
+            description="Uso de CPU em percentual",
+            metric_type=MetricType.GAUGE,
+            unit="percent",
+            labels=["tenant_id", "service"],
+            default_labels={"service": "core"}
+        )
+    
+    def _create_database_queries_metric(self) -> MetricDefinition:
+        """Cria métrica padrão de queries de banco"""
+        return MetricDefinition(
+            name="database_queries_total",
+            description="Total de queries no banco de dados",
+            metric_type=MetricType.COUNTER,
+            unit="queries",
+            labels=["operation", "table", "tenant_id", "service"],
+            default_labels={"service": "core"}
+        )
+    
+    def register(self, definition: MetricDefinition) -> bool:
+        """Registra nova definição de métrica"""
+        if definition.name in self._definitions:
+            return False
+        
+        self._definitions[definition.name] = definition
+        return True
+    
+    def get(self, name: str) -> Optional[MetricDefinition]:
+        """Obtém definição por nome"""
+        return self._definitions.get(name)
+    
+    def list(self) -> List[MetricDefinition]:
+        """Lista todas as definições"""
+        return list(self._definitions.values())
+    
+    def exists(self, name: str) -> bool:
+        """Verifica se métrica existe"""
+        return name in self._definitions
+
+
+class MetricsStorage:
+    """Armazenamento de métricas com isolamento por tenant"""
+    
+    def __init__(self):
+        # Estrutura: tenant_id -> metric_name -> label_hash -> MetricSeries
+        self._storage: Dict[str, Dict[str, Dict[str, MetricSeries]]] = defaultdict(
+            lambda: defaultdict(dict)
+        )
+        
+        # Cache para performance
+        self._cache: Dict[str, MetricSeries] = {}
+        self._cache_lock = threading.Lock()
+        self._cleanup_interval = 300  # 5 minutos
+        
+        # Inicia thread de limpeza
+        self._start_cleanup_thread()
+    
+    def _start_cleanup_thread(self):
+        """Inicia thread para limpeza periódica"""
+        def cleanup_worker():
+            while True:
+                time.sleep(self._cleanup_interval)
+                self._cleanup_old_data()
+        
+        thread = threading.Thread(target=cleanup_worker, daemon=True)
+        thread.start()
+    
+    def _cleanup_old_data(self):
+        """Remove dados antigos de todas as séries"""
+        with self._cache_lock:
+            for tenant in self._storage.values():
+                for metric_dict in tenant.values():
+                    for series in list(metric_dict.values()):
+                        # Remove séries vazias
+                        if not series.samples:
+                            metric_dict.pop(series.metric_name, None)
+            
+            # Limpa cache
+            self._cache.clear()
+    
+    def _get_label_hash(self, labels: List[MetricLabel]) -> str:
+        """Gera hash único para conjunto de labels"""
+        label_str = json.dumps(
+            sorted([(l.name, l.value) for l in labels]),
+            sort_keys=True
+        )
+        return hashlib.md5(label_str.encode()).hexdigest()
+    
+    def store_sample(
+        self,
+        tenant_id: str,
+        metric_name: str,
+        metric_type: MetricType,
+        value: float,
+        labels: Dict[str, str],
+        timestamp: Optional[datetime] = None
+    ) -> None:
+        """Armazena amostra de métrica"""
+        if not tenant_id:
+            tenant_id = "system"
+        
+        timestamp = timestamp or datetime.utcnow()
+        
+        # Converte labels
+        metric_labels = [MetricLabel(k, v) for k, v in labels.items()]
+        label_hash = self._get_label_hash(metric_labels)
+        
+        # Obtém ou cria série
+        with self._cache_lock:
+            cache_key = f"{tenant_id}:{metric_name}:{label_hash}"
+            
+            if cache_key in self._cache:
+                series = self._cache[cache_key]
+            else:
+                series = MetricSeries(
+                    metric_name=metric_name,
+                    metric_type=metric_type,
+                    labels=metric_labels
+                )
+                self._storage[tenant_id][metric_name][label_hash] = series
+                self._cache[cache_key] = series
+            
+            # Adiciona amostra
+            sample = MetricSample(
+                timestamp=timestamp,
+                value=value,
+                labels=metric_labels
+            )
+            series.add_sample(sample)
+    
+    def get_series(
+        self,
+        tenant_id: str,
+        metric_name: str,
+        labels_filter: Optional[Dict[str, str]] = None
+    ) -> List[MetricSeries]:
+        """Obtém séries que correspondem aos filtros"""
+        if tenant_id not in self._storage:
+            return []
+        
+        if metric_name not in self._storage[tenant_id]:
+            return []
+        
+        series_dict = self._storage[tenant_id][metric_name]
+        
+        if not labels_filter:
+            return list(series_dict.values())
+        
+        # Filtra por labels
+        filtered = []
+        for series in series_dict.values():
+            series_labels = {l.name: l.value for l in series.labels}
+            
+            match = True
+            for key, value in labels_filter.items():
+                if series_labels.get(key) != value:
+                    match = False
+                    break
+            
+            if match:
+                filtered.append(series)
+        
+        return filtered
+    
+    def get_aggregation(
+        self,
+        tenant_id: str,
+        metric_name: str,
+        aggregation: MetricAggregation,
+        labels_filter: Optional[Dict[str, str]] = None,
+        window_minutes: Optional[int] = None
+    ) -> float:
+        """Calcula agregação sobre métricas filtradas"""
+        series_list = self.get_series(tenant_id, metric_name, labels_filter)
+        
+        if not series_list:
+            return 0.0
+        
+        # Para counter, soma todas as séries
+        if series_list[0].metric_type == MetricType.COUNTER:
+            total = 0.0
+            for series in series_list:
+                total += series.get_aggregation(aggregation, window_minutes)
+            return total
+        
+        # Para outros tipos, calcula agregação apropriada
+        if aggregation == MetricAggregation.SUM:
+            return sum(s.get_aggregation(MetricAggregation.SUM, window_minutes) for s in series_list)
+        elif aggregation == MetricAggregation.AVG:
+            values = []
+            for series in series_list:
+                values.extend([s.value for s in series.samples])
+            
+            if not values:
+                return 0.0
+            return statistics.mean(values)
+        elif aggregation == MetricAggregation.MAX:
+            return max((s.get_aggregation(MetricAggregation.MAX, window_minutes) for s in series_list), default=0.0)
+        elif aggregation == MetricAggregation.MIN:
+            return min((s.get_aggregation(MetricAggregation.MIN, window_minutes) for s in series_list), default=0.0)
+        
+        return 0.0
+    
+    def delete_tenant_data(self, tenant_id: str) -> int:
+        """Remove todos os dados de um tenant"""
+        if tenant_id not in self._storage:
+            return 0
+        
+        # Conta séries removidas
+        count = 0
+        for metric_dict in self._storage[tenant_id].values():
+            count += len(metric_dict)
+        
+        # Remove dados
+        del self._storage[tenant_id]
+        
+        # Limpa cache
+        with self._cache_lock:
+            cache_keys_to_remove = [
+                k for k in self._cache.keys()
+                if k.startswith(f"{tenant_id}:")
+            ]
+            for key in cache_keys_to_remove:
+                self._cache.pop(key, None)
+        
+        return count
+    
+    def export_tenant_data(
+        self,
+        tenant_id: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Exporta dados de métricas para um tenant"""
+        if tenant_id not in self._storage:
+            return {}
+        
+        export_data = {}
+        
+        for metric_name, series_dict in self._storage[tenant_id].items():
+            metric_series = []
+            
+            for series in series_dict.values():
+                # Filtra amostras por data
+                filtered_samples = [
+                    s for s in series.samples
+                    if start_date <= s.timestamp <= end_date
+                ]
+                
+                if filtered_samples:
+                    metric_series.append({
+                        "labels": {l.name: l.value for l in series.labels},
+                        "samples": [s.to_dict() for s in filtered_samples]
+                    })
+            
+            if metric_series:
+                export_data[metric_name] = metric_series
+        
+        return export_data
+
+
+class AlertManager:
+    """Gerenciador de alertas baseados em métricas"""
+    
+    def __init__(self, audit_logger: AuditLogger):
+        self.audit_logger = audit_logger
+        self._rules: Dict[str, AlertRule] = {}
+        self._active_alerts: Dict[str, ActiveAlert] = {}
+        self._alert_history: Dict[str, List[ActiveAlert]] = defaultdict(list)
+        self._evaluation_interval = 60  # Avalia alertas a cada 60 segundos
+        
+        # Inicia thread de avaliação
+        self._start_evaluation_thread()
+    
+    def _start_evaluation_thread(self):
+        """Inicia thread para avaliação periódica de alertas"""
+        def evaluation_worker():
+            while True:
+                time.sleep(self._evaluation_interval)
+                asyncio.run(self.evaluate_alerts())
+        
+        thread = threading.Thread(target=evaluation_worker, daemon=True)
+        thread.start()
+    
+    def add_rule(self, rule: AlertRule) -> bool:
+        """Adiciona regra de alerta"""
+        if rule.alert_id in self._rules:
+            return False
+        
+        self._rules[rule.alert_id] = rule
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id="system",
+            user_id=rule.created_by,
+            action="alert_rule.created",
+            action_category=AuditActionCategory.SYSTEM,
+            severity=AuditSeverity.INFO,
+            description=f"Regra de alerta '{rule.name}' criada",
+            metadata={
+                "alert_id": rule.alert_id,
+                "metric_name": rule.metric_name,
+                "severity": rule.severity
+            },
+            tags=["alerts", "monitoring"]
+        ))
+        
+        return True
+    
+    def remove_rule(self, alert_id: str, removed_by: str) -> bool:
+        """Remove regra de alerta"""
+        rule = self._rules.pop(alert_id, None)
+        if not rule:
+            return False
+        
+        # Remove alertas ativos desta regra
+        active_keys = [
+            k for k, alert in self._active_alerts.items()
+            if alert.alert_id == alert_id
+        ]
+        for key in active_keys:
+            del self._active_alerts[key]
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id="system",
+            user_id=removed_by,
+            action="alert_rule.deleted",
+            action_category=AuditActionCategory.SYSTEM,
+            severity=AuditSeverity.INFO,
+            description=f"Regra de alerta '{rule.name}' removida",
+            metadata={"alert_id": alert_id},
+            tags=["alerts", "monitoring"]
+        ))
+        
+        return True
+    
+    async def evaluate_alerts(self) -> Dict[str, List[ActiveAlert]]:
+        """Avalia todas as regras de alerta"""
+        # Esta é uma implementação simplificada
+        # Em produção, seria mais complexa com parsing de condições
+        new_alerts = {}
+        resolved_alerts = []
+        
+        for rule_id, rule in self._rules.items():
+            if not rule.enabled:
+                continue
+            
+            # Verifica se alerta já está ativo
+            active_key = f"{rule_id}:{hash(str(rule.labels))}"
+            is_active = active_key in self._active_alerts
+            
+            # Aqui seria feita a avaliação real da métrica
+            # Por simplicidade, vamos simular
+            should_alert = False  # Lógica de avaliação real aqui
+            
+            if should_alert and not is_active:
+                # Cria novo alerta
+                alert = ActiveAlert(
+                    alert_id=rule_id,
+                    rule_name=rule.name,
+                    severity=rule.severity,
+                    metric_name=rule.metric_name,
+                    current_value=0.0,  # Valor real da métrica
+                    threshold=0.0,      # Threshold real
+                    labels=rule.labels,
+                    started_at=datetime.utcnow(),
+                    annotations=rule.annotations
+                )
+                
+                self._active_alerts[active_key] = alert
+                new_alerts[active_key] = alert
+                
+                # Log de alerta
+                await self.audit_logger.log(
+                    tenant_id="system",
+                    user_id="system",
+                    action="alert.fired",
+                    action_category=AuditActionCategory.SYSTEM,
+                    severity=AuditSeverity.HIGH if rule.severity == "critical" else AuditSeverity.WARNING,
+                    description=f"Alerta '{rule.name}' disparado",
+                    metadata=alert.to_dict(),
+                    tags=["alerts", rule.severity]
+                )
+            
+            elif not should_alert and is_active:
+                # Resolve alerta
+                alert = self._active_alerts.pop(active_key)
+                resolved_alerts.append(alert)
+                
+                # Armazena no histórico
+                self._alert_history[rule_id].append(alert)
+                
+                # Limita histórico
+                if len(self._alert_history[rule_id]) > 100:
+                    self._alert_history[rule_id] = self._alert_history[rule_id][-100:]
+        
+        return {
+            "new_alerts": list(new_alerts.values()),
+            "resolved_alerts": resolved_alerts
+        }
+    
+    def get_active_alerts(self) -> List[ActiveAlert]:
+        """Obtém alertas ativos"""
+        return list(self._active_alerts.values())
+    
+    def get_alert_history(
+        self,
+        rule_id: Optional[str] = None,
+        limit: int = 50
+    ) -> List[ActiveAlert]:
+        """Obtém histórico de alertas"""
+        if rule_id:
+            return self._alert_history.get(rule_id, [])[-limit:]
+        
+        # Todos os alertas
+        all_alerts = []
+        for alerts in self._alert_history.values():
+            all_alerts.extend(alerts)
+        
+        all_alerts.sort(key=lambda x: x.started_at, reverse=True)
+        return all_alerts[:limit]
+    
+    def acknowledge_alert(
+        self,
+        alert_key: str,
+        acknowledged_by: str,
+        comment: Optional[str] = None
+    ) -> bool:
+        """Reconhece um alerta ativo"""
+        if alert_key not in self._active_alerts:
+            return False
+        
+        alert = self._active_alerts[alert_key]
+        
+        # Log de reconhecimento
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id="system",
+            user_id=acknowledged_by,
+            action="alert.acknowledged",
+            action_category=AuditActionCategory.SYSTEM,
+            severity=AuditSeverity.INFO,
+            description=f"Alerta '{alert.rule_name}' reconhecido",
+            metadata={
+                "alert_key": alert_key,
+                "rule_name": alert.rule_name,
+                "severity": alert.severity,
+                "comment": comment
+            },
+            tags=["alerts", "acknowledgement"]
+        ))
+        
+        return True
+
+
+class MetricsEngine:
+    """
+    Engine principal de métricas e observabilidade
+    """
+    
+    def __init__(
+        self,
+        audit_logger: AuditLogger,
+        export_enabled: bool = True
+    ):
+        self.audit_logger = audit_logger
+        self.export_enabled = export_enabled
+        
+        # Componentes
+        self.registry = MetricsRegistry()
+        self.storage = MetricsStorage()
+        self.alert_manager = AlertManager(audit_logger)
+        
+        # Estatísticas
+        self._stats = {
+            "metrics_received": 0,
+            "alerts_fired": 0,
+            "storage_size": 0
+        }
+        
+        # Inicia exportadores se habilitado
+        if export_enabled:
+            self._exporters = self._initialize_exporters()
+    
+    def _initialize_exporters(self) -> Dict[str, Any]:
+        """Inicializa exportadores para sistemas externos"""
+        exporters = {}
+        
+        # Exemplo: Inicializaria Prometheus, OpenTelemetry, etc.
+        # Por simplicidade, retornamos dicionário vazio
+        return exporters
+    
+    async def record_metric(
+        self,
+        tenant_id: str,
+        metric_name: str,
+        value: float,
+        labels: Optional[Dict[str, str]] = None,
+        metric_type: Optional[MetricType] = None
+    ) -> bool:
+        """
+        Registra uma métrica
+        
+        Args:
+            tenant_id: ID do tenant
+            metric_name: Nome da métrica
+            value: Valor da métrica
+            labels: Labels para segmentação
+            metric_type: Tipo da métrica (se None, tenta inferir do registro)
+        
+        Returns:
+            True se registrado com sucesso
+        """
+        try:
+            labels = labels or {}
+            
+            # Obtém definição da métrica
+            definition = self.registry.get(metric_name)
+            
+            if not definition:
+                # Se métrica não existe, cria definição padrão
+                metric_type = metric_type or MetricType.GAUGE
+                definition = MetricDefinition(
+                    name=metric_name,
+                    description=f"Métrica automática: {metric_name}",
+                    metric_type=metric_type
+                )
+                self.registry.register(definition)
+            else:
+                metric_type = definition.metric_type
+            
+            # Valida labels
+            if not definition.validate_labels(labels):
+                # Adiciona labels faltantes com valores padrão
+                for label_name in definition.labels:
+                    if label_name not in labels:
+                        labels[label_name] = definition.default_labels.get(label_name, "unknown")
+            
+            # Adiciona tenant_id aos labels se não presente
+            if "tenant_id" not in labels:
+                labels["tenant_id"] = tenant_id
+            
+            # Armazena métrica
+            self.storage.store_sample(
+                tenant_id=tenant_id,
+                metric_name=metric_name,
+                metric_type=metric_type,
+                value=float(value),
+                labels=labels
+            )
+            
+            # Atualiza estatísticas
+            self._stats["metrics_received"] += 1
+            
+            # Log de auditoria para métricas importantes
+            if metric_name in ["http_error_rate", "memory_usage_bytes", "cpu_usage_percent"]:
+                await self.audit_logger.log(
+                    tenant_id=tenant_id,
+                    user_id="system",
+                    action="metric.recorded",
+                    action_category=AuditActionCategory.SYSTEM,
+                    severity=AuditSeverity.INFO,
+                    description=f"Métrica '{metric_name}' registrada",
+                    metadata={
+                        "value": value,
+                        "labels": labels,
+                        "metric_type": metric_type.value
+                    },
+                    tags=["metrics", metric_name]
+                )
+            
+            return True
+            
+        except Exception as e:
+            print(f"Erro ao registrar métrica: {e}")
+            return False
+    
+    async def increment_counter(
+        self,
+        tenant_id: str,
+        counter_name: str,
+        value: float = 1.0,
+        labels: Optional[Dict[str, str]] = None
+    ) -> bool:
+        """Incrementa um contador"""
+        return await self.record_metric(
+            tenant_id=tenant_id,
+            metric_name=counter_name,
+            value=value,
+            labels=labels,
+            metric_type=MetricType.COUNTER
+        )
+    
+    async def set_gauge(
+        self,
+        tenant_id: str,
+        gauge_name: str,
+        value: float,
+        labels: Optional[Dict[str, str]] = None
+    ) -> bool:
+        """Define valor de um gauge"""
+        return await self.record_metric(
+            tenant_id=tenant_id,
+            metric_name=gauge_name,
+            value=value,
+            labels=labels,
+            metric_type=MetricType.GAUGE
+        )
+    
+    async def record_histogram(
+        self,
+        tenant_id: str,
+        histogram_name: str,
+        value: float,
+        labels: Optional[Dict[str, str]] = None
+    ) -> bool:
+        """Registra valor em um histograma"""
+        return await self.record_metric(
+            tenant_id=tenant_id,
+            metric_name=histogram_name,
+            value=value,
+            labels=labels,
+            metric_type=MetricType.HISTOGRAM
+        )
+    
+    async def get_metric_value(
+        self,
+        tenant_id: str,
+        metric_name: str,
+        aggregation: MetricAggregation = MetricAggregation.AVG,
+        labels_filter: Optional[Dict[str, str]] = None,
+        window_minutes: Optional[int] = None
+    ) -> float:
+        """Obtém valor agregado de uma métrica"""
+        return self.storage.get_aggregation(
+            tenant_id=tenant_id,
+            metric_name=metric_name,
+            aggregation=aggregation,
+            labels_filter=labels_filter,
+            window_minutes=window_minutes
+        )
+    
+    async def get_metric_series(
+        self,
+        tenant_id: str,
+        metric_name: str,
+        labels_filter: Optional[Dict[str, str]] = None,
+        limit_samples: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Obtém séries de métricas com amostras"""
+        series_list = self.storage.get_series(tenant_id, metric_name, labels_filter)
+        
+        result = []
+        for series in series_list[:10]:  # Limita a 10 séries
+            series_data = series.to_dict(include_samples=True)
+            
+            # Limita amostras
+            if "samples" in series_data:
+                series_data["samples"] = series_data["samples"][:limit_samples]
+            
+            result.append(series_data)
+        
+        return result
+    
+    async def get_tenant_metrics_summary(
+        self,
+        tenant_id: str,
+        window_minutes: int = 60
+    ) -> Dict[str, Any]:
+        """Obtém resumo de métricas para um tenant"""
+        summary = {
+            "tenant_id": tenant_id,
+            "window_minutes": window_minutes,
+            "timestamp": datetime.utcnow().isoformat(),
+            "metrics": {}
+        }
+        
+        # Métricas importantes para monitoramento
+        important_metrics = [
+            "http_requests_total",
+            "http_response_time_ms",
+            "http_error_rate",
+            "concurrent_requests",
+            "database_queries_total"
+        ]
+        
+        for metric_name in important_metrics:
+            definition = self.registry.get(metric_name)
+            if not definition:
+                continue
+            
+            if definition.metric_type == MetricType.COUNTER:
+                value = await self.get_metric_value(
+                    tenant_id=tenant_id,
+                    metric_name=metric_name,
+                    aggregation=MetricAggregation.SUM,
+                    window_minutes=window_minutes
+                )
+                summary["metrics"][metric_name] = {
+                    "value": value,
+                    "unit": definition.unit,
+                    "type": definition.metric_type.value
+                }
+            
+            elif definition.metric_type in [MetricType.GAUGE, MetricType.HISTOGRAM]:
+                value = await self.get_metric_value(
+                    tenant_id=tenant_id,
+                    metric_name=metric_name,
+                    aggregation=MetricAggregation.AVG,
+                    window_minutes=window_minutes
+                )
+                summary["metrics"][metric_name] = {
+                    "value": value,
+                    "unit": definition.unit,
+                    "type": definition.metric_type.value
+                }
+        
+        return summary
+    
+    async def create_alert_rule(
+        self,
+        name: str,
+        description: str,
+        metric_name: str,
+        condition: str,
+        severity: str,
+        labels: Optional[Dict[str, str]] = None,
+        created_by: str = "system"
+    ) -> str:
+        """Cria nova regra de alerta"""
+        alert_id = f"alert_{uuid.uuid4().hex[:16]}"
+        
+        rule = AlertRule(
+            alert_id=alert_id,
+            name=name,
+            description=description,
+            metric_name=metric_name,
+            condition=condition,
+            severity=severity,
+            labels=labels or {},
+            created_by=created_by
+        )
+        
+        self.alert_manager.add_rule(rule)
+        return alert_id
+    
+    async def get_system_health(self) -> Dict[str, Any]:
+        """Obtém saúde do sistema baseada em métricas"""
+        now = datetime.utcnow()
+        
+        # Coleta métricas do sistema
+        system_metrics = {}
+        
+        # Exemplo: Verifica taxa de erro
+        error_rate = await self.get_metric_value(
+            tenant_id="system",
+            metric_name="http_error_rate",
+            aggregation=MetricAggregation.AVG,
+            window_minutes=5
+        )
+        
+        # Exemplo: Verifica tempo de resposta
+        response_time = await self.get_metric_value(
+            tenant_id="system",
+            metric_name="http_response_time_ms",
+            aggregation=MetricAggregation.P95,
+            window_minutes=5
+        )
+        
+        # Determina status
+        status = "healthy"
+        if error_rate > 0.1:  # 10% de erro
+            status = "unhealthy"
+        elif response_time > 5000:  # 5 segundos
+            status = "degraded"
+        
+        return {
+            "status": status,
+            "timestamp": now.isoformat(),
+            "metrics": {
+                "error_rate": error_rate,
+                "response_time_p95": response_time
+            },
+            "active_alerts": len(self.alert_manager.get_active_alerts())
+        }
+    
+    async def export_metrics(
+        self,
+        format: str = "prometheus",
+        tenant_id: Optional[str] = None
+    ) -> str:
+        """Exporta métricas em formato específico"""
+        if format == "prometheus":
+            return self._export_prometheus_format(tenant_id)
+        elif format == "json":
+            return self._export_json_format(tenant_id)
+        else:
+            return ""
+    
+    def _export_prometheus_format(self, tenant_id: Optional[str]) -> str:
+        """Exporta métricas em formato Prometheus"""
+        # Implementação simplificada
+        lines = []
+        
+        for metric_name, definition in self.registry._definitions.items():
+            lines.append(f"# HELP {metric_name} {definition.description}")
+            lines.append(f"# TYPE {metric_name} {definition.metric_type.value}")
+            
+            # Aqui iriam as séries reais
+            # Por simplicidade, retornamos exemplo
+            lines.append(f'{metric_name}{{tenant="demo"}} 123.45')
+        
+        return "\n".join(lines)
+    
+    def _export_json_format(self, tenant_id: Optional[str]) -> str:
+        """Exporta métricas em formato JSON"""
+        export_data = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "metrics": []
+        }
+        
+        for metric_name, definition in self.registry._definitions.items():
+            metric_data = definition.to_dict()
+            export_data["metrics"].append(metric_data)
+        
+        return json.dumps(export_data, indent=2)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Obtém estatísticas do engine"""
+        return {
+            **self._stats,
+            "registered_metrics": len(self.registry._definitions),
+            "active_alerts": len(self.alert_manager.get_active_alerts()),
+            "storage_tenants": len(self.storage._storage)
+        }
+    
+    async def cleanup_tenant_data(self, tenant_id: str) -> int:
+        """Limpa dados de métricas de um tenant"""
+        count = self.storage.delete_tenant_data(tenant_id)
+        
+        # Log de auditoria
+        await self.audit_logger.log(
+            tenant_id="system",
+            user_id="system",
+            action="metrics.tenant_cleaned",
+            action_category=AuditActionCategory.SYSTEM,
+            severity=AuditSeverity.INFO,
+            description=f"Dados de métricas do tenant {tenant_id} limpos",
+            metadata={
+                "tenant_id": tenant_id,
+                "metrics_removed": count
+            },
+            tags=["metrics", "cleanup"]
+        )
+        
+        return count
+
+
+# Middleware para métricas HTTP automáticas
+class MetricsMiddleware:
+    """Middleware para coletar métricas HTTP automaticamente"""
+    
+    def __init__(self, metrics_engine: MetricsEngine):
+        self.metrics = metrics_engine
+    
+    async def process_request(self, request, handler):
+        """Processa requisição e coleta métricas"""
+        start_time = time.time()
+        
+        try:
+            # Incrementa contador de requisições concorrentes
+            await self.metrics.set_gauge(
+                tenant_id=request.tenant_id,
+                gauge_name="concurrent_requests",
+                value=1,  # Seria incrementado/decrementado em produção
+                labels={
+                    "method": request.method,
+                    "path": request.path,
+                    "tenant_id": request.tenant_id
+                }
+            )
+            
+            # Executa handler
+            response = await handler(request)
+            
+            # Calcula tempo de resposta
+            response_time = (time.time() - start_time) * 1000  # ms
+            
+            # Registra métricas
+            await self.metrics.increment_counter(
+                tenant_id=request.tenant_id,
+                counter_name="http_requests_total",
+                labels={
+                    "method": request.method,
+                    "path": request.path,
+                    "status_code": str(response.status_code),
+                    "tenant_id": request.tenant_id
+                }
+            )
+            
+            await self.metrics.record_histogram(
+                tenant_id=request.tenant_id,
+                histogram_name="http_response_time_ms",
+                value=response_time,
+                labels={
+                    "method": request.method,
+                    "path": request.path,
+                    "status_code": str(response.status_code),
+                    "tenant_id": request.tenant_id
+                }
+            )
+            
+            # Registra taxa de erro se status >= 400
+            if response.status_code >= 400:
+                await self.metrics.increment_counter(
+                    tenant_id=request.tenant_id,
+                    counter_name="http_errors_total",
+                    labels={
+                        "method": request.method,
+                        "path": request.path,
+                        "status_code": str(response.status_code),
+                        "tenant_id": request.tenant_id
+                    }
+                )
+            
+            return response
+            
+        except Exception as e:
+            # Registra erro
+            response_time = (time.time() - start_time) * 1000
+            
+            await self.metrics.increment_counter(
+                tenant_id=request.tenant_id,
+                counter_name="http_requests_total",
+                labels={
+                    "method": request.method,
+                    "path": request.path,
+                    "status_code": "500",
+                    "tenant_id": request.tenant_id
+                }
+            )
+            
+            await self.metrics.record_histogram(
+                tenant_id=request.tenant_id,
+                histogram_name="http_response_time_ms",
+                value=response_time,
+                labels={
+                    "method": request.method,
+                    "path": request.path,
+                    "status_code": "500",
+                    "tenant_id": request.tenant_id
+                }
+            )
+            
+            await self.metrics.increment_counter(
+                tenant_id=request.tenant_id,
+                counter_name="http_errors_total",
+                labels={
+                    "method": request.method,
+                    "path": request.path,
+                    "status_code": "500",
+                    "tenant_id": request.tenant_id
+                }
+            )
+            
+            raise
+
+
+# Utilitários de métricas comuns
+class MetricsUtils:
+    """Utilitários para métricas comuns"""
+    
+    @staticmethod
+    async def record_database_query(
+        metrics_engine: MetricsEngine,
+        tenant_id: str,
+        operation: str,
+        table: str,
+        duration_ms: float,
+        success: bool = True
+    ) -> None:
+        """Registra métrica de query de banco de dados"""
+        await metrics_engine.increment_counter(
+            tenant_id=tenant_id,
+            counter_name="database_queries_total",
+            labels={
+                "operation": operation,
+                "table": table,
+                "success": str(success),
+                "tenant_id": tenant_id
+            }
+        )
+        
+        await metrics_engine.record_histogram(
+            tenant_id=tenant_id,
+            histogram_name="database_query_duration_ms",
+            value=duration_ms,
+            labels={
+                "operation": operation,
+                "table": table,
+                "success": str(success),
+                "tenant_id": tenant_id
+            }
+        )
+    
+    @staticmethod
+    async def record_cache_operation(
+        metrics_engine: MetricsEngine,
+        tenant_id: str,
+        operation: str,
+        cache_name: str,
+        duration_ms: float,
+        hit: Optional[bool] = None
+    ) -> None:
+        """Registra métrica de operação de cache"""
+        labels = {
+            "operation": operation,
+            "cache": cache_name,
+            "tenant_id": tenant_id
+        }
+        
+        if hit is not None:
+            labels["hit"] = str(hit)
+        
+        await metrics_engine.increment_counter(
+            tenant_id=tenant_id,
+            counter_name="cache_operations_total",
+            labels=labels
+        )
+        
+        await metrics_engine.record_histogram(
+            tenant_id=tenant_id,
+            histogram_name="cache_operation_duration_ms",
+            value=duration_ms,
+            labels=labels
+        )
+    
+    @staticmethod
+    async def record_external_api_call(
+        metrics_engine: MetricsEngine,
+        tenant_id: str,
+        service: str,
+        endpoint: str,
+        duration_ms: float,
+        status_code: int
+    ) -> None:
+        """Registra métrica de chamada a API externa"""
+        await metrics_engine.increment_counter(
+            tenant_id=tenant_id,
+            counter_name="external_api_calls_total",
+            labels={
+                "service": service,
+                "endpoint": endpoint,
+                "status_code": str(status_code),
+                "tenant_id": tenant_id
+            }
+        )
+        
+        await metrics_engine.record_histogram(
+            tenant_id=tenant_id,
+            histogram_name="external_api_call_duration_ms",
+            value=duration_ms,
+            labels={
+                "service": service,
+                "endpoint": endpoint,
+                "status_code": str(status_code),
+                "tenant_id": tenant_id
+            }
+        )
+        
+        if status_code >= 400:
+            await metrics_engine.increment_counter(
+                tenant_id=tenant_id,
+                counter_name="external_api_errors_total",
+                labels={
+                    "service": service,
+                    "endpoint": endpoint,
+                    "status_code": str(status_code),
+                    "tenant_id": tenant_id
+                }
+            )

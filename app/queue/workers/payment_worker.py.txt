@@ -1,0 +1,525 @@
+"""
+Worker especializado para processamento de tarefas de pagamento.
+Integra com BillingEngine, PaymentEngine, EntitlementEngine e Antifraud.
+"""
+
+import logging
+import time
+from datetime import datetime
+from typing import Any, Dict, Optional, List
+from dataclasses import asdict
+
+from ...core.billing_engine import BillingEngine
+from ...core.payment_engine import PaymentEngine
+from ...core.entitlement_engine import EntitlementEngine
+from ...core.antifraud import AntifraudEngine
+from ...core.audit_logger import AuditLogger
+from ...core.metrics_engine import MetricsEngine
+from ...core.webhook_processor import WebhookProcessor
+from ...models.payment_intent import PaymentIntent, PaymentIntentStatus
+from ...models.invoice import Invoice, InvoiceStatus
+from ...models.entitlement import Entitlement, EntitlementScope
+from ...queue import BaseWorker, BaseTask, PaymentWebhookTask, PaymentIntentUpdateTask
+from ...queue.tasks import TaskFactory
+
+logger = logging.getLogger(__name__)
+
+
+class PaymentWorker(BaseWorker):
+    """
+    Worker para processamento de tarefas relacionadas a pagamentos.
+    Processa webhooks de pagamento, atualizações de intent e faturamento.
+    """
+    
+    def __init__(
+        self,
+        queue,
+        worker_id: str,
+        billing_engine: BillingEngine,
+        payment_engine: PaymentEngine,
+        entitlement_engine: EntitlementEngine,
+        antifraud_engine: AntifraudEngine,
+        webhook_processor: WebhookProcessor,
+        tenant_id: Optional[str] = None,
+        audit_logger: Optional[AuditLogger] = None,
+        metrics_engine: Optional[MetricsEngine] = None
+    ):
+        super().__init__(
+            queue=queue,
+            worker_id=worker_id,
+            tenant_id=tenant_id,
+            audit_logger=audit_logger,
+            metrics_engine=metrics_engine
+        )
+        
+        self.billing_engine = billing_engine
+        self.payment_engine = payment_engine
+        self.entitlement_engine = entitlement_engine
+        self.antifraud_engine = antifraud_engine
+        self.webhook_processor = webhook_processor
+        
+        logger.info(f"PaymentWorker {worker_id} initialized")
+    
+    async def process_task(self, task: BaseTask) -> Any:
+        """Processa uma tarefa de pagamento baseada no tipo"""
+        
+        if task.task_type == "payment_webhook":
+            return await self._process_payment_webhook(task)
+        elif task.task_type == "payment_intent_update":
+            return await self._process_payment_intent_update(task)
+        elif task.task_type == "invoice_generation":
+            return await self._process_invoice_generation(task)
+        else:
+            raise ValueError(f"Tipo de tarefa não suportada: {task.task_type}")
+    
+    async def _process_payment_webhook(self, task: PaymentWebhookTask) -> Dict[str, Any]:
+        """
+        Processa webhook de pagamento de um provider.
+        Fluxo completo: validação → antifraude → processamento → fatura → acesso
+        """
+        
+        start_time = time.time()
+        tenant_id = task.metadata.tenant_id
+        provider = task.payload["provider"]
+        event_data = task.payload["event_data"]
+        
+        logger.info(
+            f"Processing payment webhook from {provider}",
+            extra={
+                "tenant_id": tenant_id,
+                "provider": provider,
+                "event_id": event_data.get("id"),
+                "task_id": str(task.metadata.task_id)
+            }
+        )
+        
+        try:
+            # 1. Processamento idempotente do webhook
+            webhook_result = await self.webhook_processor.process(
+                tenant_id=tenant_id,
+                provider=provider,
+                event_data=event_data,
+                task_metadata=task.metadata
+            )
+            
+            if not webhook_result.get("should_process", True):
+                logger.info(
+                    f"Webhook already processed or filtered",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "provider": provider,
+                        "event_id": event_data.get("id")
+                    }
+                )
+                return webhook_result
+            
+            # 2. Análise anti-fraude
+            antifraud_result = await self.antifraud_engine.analyze_payment_event(
+                tenant_id=tenant_id,
+                provider=provider,
+                event_data=event_data,
+                webhook_result=webhook_result
+            )
+            
+            if antifraud_result.get("block", False):
+                logger.warning(
+                    f"Payment blocked by antifraud",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "provider": provider,
+                        "reason": antifraud_result.get("reason"),
+                        "score": antifraud_result.get("score")
+                    }
+                )
+                
+                # Atualiza intent com motivo de bloqueio
+                payment_intent_id = webhook_result.get("payment_intent_id")
+                if payment_intent_id:
+                    await self.payment_engine.update_intent_status(
+                        tenant_id=tenant_id,
+                        intent_id=payment_intent_id,
+                        status=PaymentIntentStatus.FAILED,
+                        metadata={
+                            "antifraud_blocked": True,
+                            "reason": antifraud_result.get("reason"),
+                            "score": antifraud_result.get("score")
+                        }
+                    )
+                
+                return {
+                    "status": "blocked",
+                    "reason": antifraud_result.get("reason"),
+                    "antifraud_score": antifraud_result.get("score")
+                }
+            
+            # 3. Processa pagamento no motor de pagamento
+            payment_result = await self.payment_engine.process_payment(
+                tenant_id=tenant_id,
+                provider=provider,
+                event_data=event_data,
+                antifraud_data=antifraud_result
+            )
+            
+            if not payment_result.get("success"):
+                logger.error(
+                    f"Payment processing failed",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "provider": provider,
+                        "error": payment_result.get("error")
+                    }
+                )
+                return payment_result
+            
+            payment_intent_id = payment_result.get("payment_intent_id")
+            payment_status = payment_result.get("status")
+            
+            # 4. Atualiza fatura no billing engine
+            billing_result = await self.billing_engine.process_payment(
+                tenant_id=tenant_id,
+                payment_intent_id=payment_intent_id,
+                payment_data=payment_result
+            )
+            
+            if not billing_result.get("success"):
+                logger.error(
+                    f"Billing processing failed",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "payment_intent_id": payment_intent_id,
+                        "error": billing_result.get("error")
+                    }
+                )
+            
+            # 5. Concede acesso se pagamento confirmado
+            entitlement_result = None
+            if payment_status == "paid" and billing_result.get("success"):
+                entitlement_result = await self._grant_access_from_payment(
+                    tenant_id=tenant_id,
+                    payment_result=payment_result,
+                    billing_result=billing_result
+                )
+            
+            # 6. Registra auditoria completa
+            if self.audit_logger:
+                await self.audit_logger.log(
+                    action="payment_webhook_processed",
+                    resource_type="payment",
+                    resource_id=payment_intent_id,
+                    tenant_id=tenant_id,
+                    details={
+                        "provider": provider,
+                        "payment_status": payment_status,
+                        "antifraud_score": antifraud_result.get("score"),
+                        "billing_success": billing_result.get("success"),
+                        "entitlement_granted": entitlement_result.get("success") if entitlement_result else False,
+                        "processing_time_ms": (time.time() - start_time) * 1000
+                    }
+                )
+            
+            logger.info(
+                f"Payment webhook processed successfully",
+                extra={
+                    "tenant_id": tenant_id,
+                    "payment_intent_id": payment_intent_id,
+                    "status": payment_status,
+                    "processing_time": time.time() - start_time
+                }
+            )
+            
+            return {
+                "status": "success",
+                "payment_intent_id": payment_intent_id,
+                "payment_status": payment_status,
+                "antifraud_score": antifraud_result.get("score"),
+                "billing_result": billing_result,
+                "entitlement_result": entitlement_result,
+                "processing_time_ms": (time.time() - start_time) * 1000
+            }
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing payment webhook: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "provider": provider,
+                    "task_id": str(task.metadata.task_id)
+                },
+                exc_info=True
+            )
+            
+            if self.metrics_engine:
+                await self.metrics_engine.increment_counter(
+                    name="payment_webhook_errors",
+                    tenant_id=tenant_id,
+                    tags={"provider": provider, "error_type": type(e).__name__}
+                )
+            
+            raise
+    
+    async def _process_payment_intent_update(self, task: PaymentIntentUpdateTask) -> Dict[str, Any]:
+        """Processa atualização de intent de pagamento"""
+        
+        tenant_id = task.metadata.tenant_id
+        payment_intent_id = task.payload["payment_intent_id"]
+        updates = task.payload["updates"]
+        
+        logger.info(
+            f"Updating payment intent {payment_intent_id}",
+            extra={
+                "tenant_id": tenant_id,
+                "payment_intent_id": payment_intent_id,
+                "updates": list(updates.keys())
+            }
+        )
+        
+        try:
+            # Atualiza intent
+            result = await self.payment_engine.update_intent(
+                tenant_id=tenant_id,
+                intent_id=payment_intent_id,
+                updates=updates
+            )
+            
+            # Se status foi atualizado para paid, concede acesso
+            if updates.get("status") == PaymentIntentStatus.PAID:
+                await self._grant_access_from_intent(tenant_id, payment_intent_id)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                f"Error updating payment intent: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "payment_intent_id": payment_intent_id
+                }
+            )
+            raise
+    
+    async def _process_invoice_generation(self, task: BaseTask) -> Dict[str, Any]:
+        """Processa geração de fatura"""
+        
+        tenant_id = task.metadata.tenant_id
+        user_id = task.payload["user_id"]
+        amount = task.payload["amount"]
+        currency = task.payload["currency"]
+        
+        logger.info(
+            f"Generating invoice for user {user_id}",
+            extra={
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "amount": amount,
+                "currency": currency
+            }
+        )
+        
+        try:
+            result = await self.billing_engine.generate_invoice(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                amount=amount,
+                currency=currency,
+                metadata=task.payload.get("metadata", {})
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                f"Error generating invoice: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "user_id": user_id
+                }
+            )
+            raise
+    
+    async def _grant_access_from_payment(
+        self,
+        tenant_id: str,
+        payment_result: Dict[str, Any],
+        billing_result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Concede acesso baseado em pagamento confirmado"""
+        
+        payment_intent_id = payment_result.get("payment_intent_id")
+        user_id = payment_result.get("user_id")
+        offer_id = payment_result.get("offer_id")
+        
+        if not user_id or not offer_id:
+            logger.warning(
+                f"Cannot grant access: missing user_id or offer_id",
+                extra={
+                    "tenant_id": tenant_id,
+                    "payment_intent_id": payment_intent_id
+                }
+            )
+            return {"success": False, "error": "Missing user_id or offer_id"}
+        
+        try:
+            # Obtém informações da oferta
+            # (Em implementação real, buscar do banco ou cache)
+            entitlement_type = f"offer_{offer_id}"
+            
+            # Concede acesso
+            entitlement_result = await self.entitlement_engine.grant(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                entitlement_type=entitlement_type,
+                scope=EntitlementScope.GLOBAL,
+                metadata={
+                    "source": "payment",
+                    "payment_intent_id": payment_intent_id,
+                    "offer_id": offer_id,
+                    "granted_at": datetime.utcnow().isoformat()
+                }
+            )
+            
+            if entitlement_result.get("success"):
+                logger.info(
+                    f"Access granted for payment {payment_intent_id}",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "payment_intent_id": payment_intent_id,
+                        "entitlement_id": entitlement_result.get("entitlement_id")
+                    }
+                )
+            else:
+                logger.error(
+                    f"Failed to grant access for payment {payment_intent_id}",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "error": entitlement_result.get("error")
+                    }
+                )
+            
+            return entitlement_result
+            
+        except Exception as e:
+            logger.error(
+                f"Error granting access from payment: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "payment_intent_id": payment_intent_id,
+                    "user_id": user_id
+                }
+            )
+            return {"success": False, "error": str(e)}
+    
+    async def _grant_access_from_intent(
+        self,
+        tenant_id: str,
+        payment_intent_id: str
+    ) -> Dict[str, Any]:
+        """Concede acesso baseado em intent atualizado para paid"""
+        
+        try:
+            # Obtém intent do banco
+            # (Em implementação real, buscar do banco)
+            intent = None  # await self.payment_engine.get_intent(...)
+            
+            if not intent:
+                logger.warning(
+                    f"Payment intent not found: {payment_intent_id}",
+                    extra={"tenant_id": tenant_id}
+                )
+                return {"success": False, "error": "Intent not found"}
+            
+            # Concede acesso
+            return await self._grant_access_from_payment(
+                tenant_id=tenant_id,
+                payment_result={
+                    "payment_intent_id": payment_intent_id,
+                    "user_id": intent.user_id,
+                    "offer_id": intent.offer_id
+                },
+                billing_result={"success": True}
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error granting access from intent: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "payment_intent_id": payment_intent_id
+                }
+            )
+            return {"success": False, "error": str(e)}
+
+
+class PaymentWorkerManager:
+    """Gerencia múltiplos workers de pagamento"""
+    
+    def __init__(self, queue, **dependencies):
+        self.queue = queue
+        self.dependencies = dependencies
+        self.workers: Dict[str, PaymentWorker] = {}
+        self.worker_tasks: Dict[str, asyncio.Task] = {}
+    
+    async def start_worker(
+        self,
+        worker_id: str,
+        tenant_id: Optional[str] = None,
+        concurrency: int = 3
+    ) -> PaymentWorker:
+        """Inicia um worker de pagamento"""
+        
+        worker = PaymentWorker(
+            queue=self.queue,
+            worker_id=worker_id,
+            tenant_id=tenant_id,
+            **self.dependencies
+        )
+        
+        self.workers[worker_id] = worker
+        
+        # Inicia worker em background
+        task = asyncio.create_task(
+            worker.start("payment_webhook_queue", concurrency)
+        )
+        self.worker_tasks[worker_id] = task
+        
+        logger.info(f"PaymentWorker {worker_id} started")
+        return worker
+    
+    async def stop_worker(self, worker_id: str):
+        """Para um worker de pagamento"""
+        
+        if worker_id in self.workers:
+            await self.workers[worker_id].stop()
+            del self.workers[worker_id]
+        
+        if worker_id in self.worker_tasks:
+            self.worker_tasks[worker_id].cancel()
+            try:
+                await self.worker_tasks[worker_id]
+            except asyncio.CancelledError:
+                pass
+            del self.worker_tasks[worker_id]
+        
+        logger.info(f"PaymentWorker {worker_id} stopped")
+    
+    async def stop_all(self):
+        """Para todos os workers"""
+        
+        for worker_id in list(self.workers.keys()):
+            await self.stop_worker(worker_id)
+        
+        logger.info("All payment workers stopped")
+    
+    def get_worker_stats(self) -> Dict[str, Any]:
+        """Retorna estatísticas de todos os workers"""
+        
+        stats = {}
+        for worker_id, worker in self.workers.items():
+            stats[worker_id] = worker.get_stats()
+        
+        return {
+            "total_workers": len(self.workers),
+            "workers": stats,
+            "timestamp": datetime.utcnow().isoformat()
+        }

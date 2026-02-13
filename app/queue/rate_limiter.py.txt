@@ -1,0 +1,636 @@
+"""
+Rate Limiter para filas distribuídas.
+Limita requisições por tenant, fila e tipo de operação.
+"""
+
+import asyncio
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Any, Tuple, List
+from dataclasses import dataclass, field
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+
+class RateLimitStrategy(Enum):
+    """Estratégias de rate limiting"""
+    FIXED_WINDOW = "fixed_window"
+    SLIDING_WINDOW = "sliding_window"
+    TOKEN_BUCKET = "token_bucket"
+    LEAKY_BUCKET = "leaky_bucket"
+
+
+class RateLimitAction(Enum):
+    """Ações ao exceder rate limit"""
+    REJECT = "reject"          # Rejeita imediatamente
+    DELAY = "delay"            # Atrasa a requisição
+    QUEUE = "queue"            # Coloca em fila interna
+    THROTTLE = "throttle"      # Limita velocidade
+
+
+@dataclass
+class RateLimitConfig:
+    """Configuração de rate limiting"""
+    
+    # Limites
+    max_requests: int = 100            # Máximo de requisições
+    window_seconds: int = 60           # Janela de tempo em segundos
+    
+    # Estratégia
+    strategy: RateLimitStrategy = RateLimitStrategy.SLIDING_WINDOW
+    
+    # Ação
+    action: RateLimitAction = RateLimitAction.REJECT
+    delay_seconds: float = 0.5         # Para ação DELAY
+    max_queue_size: int = 1000         # Para ação QUEUE
+    
+    # Token Bucket específico
+    tokens_per_second: float = 10.0    # Para TOKEN_BUCKET
+    max_tokens: int = 100              # Para TOKEN_BUCKET
+    
+    # Burst allowance
+    burst_multiplier: float = 1.5      # Multiplicador para bursts
+    
+    def __post_init__(self):
+        """Validação pós-inicialização"""
+        if self.max_requests <= 0:
+            raise ValueError("max_requests deve ser positivo")
+        
+        if self.window_seconds <= 0:
+            raise ValueError("window_seconds deve ser positivo")
+        
+        if self.tokens_per_second <= 0:
+            raise ValueError("tokens_per_second deve ser positivo")
+        
+        if self.max_tokens <= 0:
+            raise ValueError("max_tokens deve ser positivo")
+
+
+@dataclass
+class RateLimitMetrics:
+    """Métricas de rate limiting"""
+    total_requests: int = 0
+    allowed_requests: int = 0
+    rejected_requests: int = 0
+    delayed_requests: int = 0
+    queued_requests: int = 0
+    current_queue_size: int = 0
+    last_request_time: Optional[datetime] = None
+    
+    def rejection_rate(self) -> float:
+        """Taxa de rejeição"""
+        if self.total_requests == 0:
+            return 0.0
+        return self.rejected_requests / self.total_requests
+    
+    def average_delay(self) -> float:
+        """Atraso médio (se aplicável)"""
+        if self.delayed_requests == 0:
+            return 0.0
+        # Em implementação real, calcularia o atraso real
+        return 0.0
+
+
+class RateLimiter:
+    """
+    Rate Limiter distribuído para controle de requisições.
+    """
+    
+    def __init__(
+        self,
+        identifier: str,
+        config: Optional[RateLimitConfig] = None
+    ):
+        self.identifier = identifier
+        self.config = config or RateLimitConfig()
+        
+        # Estado
+        self.metrics = RateLimitMetrics()
+        
+        # Dependendo da estratégia
+        if self.config.strategy == RateLimitStrategy.FIXED_WINDOW:
+            self._current_window_start = datetime.utcnow()
+            self._window_requests = 0
+            
+        elif self.config.strategy == RateLimitStrategy.SLIDING_WINDOW:
+            self._request_timestamps: List[datetime] = []
+            
+        elif self.config.strategy == RateLimitStrategy.TOKEN_BUCKET:
+            self._tokens = self.config.max_tokens
+            self._last_refill = time.time()
+            
+        elif self.config.strategy == RateLimitStrategy.LEAKY_BUCKET:
+            self._queue_size = 0
+            self._last_leak = time.time()
+        
+        # Para ação QUEUE
+        self._request_queue = asyncio.Queue(maxsize=self.config.max_queue_size)
+        self._queue_processor_task: Optional[asyncio.Task] = None
+        
+        # Lock para thread safety
+        self._lock = asyncio.Lock()
+        
+        logger.info(f"RateLimiter '{identifier}' inicializado")
+    
+    async def is_allowed(
+        self,
+        tenant_id: Optional[str] = None,
+        cost: int = 1
+    ) -> Tuple[bool, Optional[float], Dict[str, Any]]:
+        """
+        Verifica se uma requisição é permitida.
+        
+        Args:
+            tenant_id: ID do tenant (para logging)
+            cost: Custo da requisição em "tokens"
+            
+        Returns:
+            Tuple (permitido, atraso_seconds, metadata)
+        """
+        
+        async with self._lock:
+            self.metrics.total_requests += 1
+            self.metrics.last_request_time = datetime.utcnow()
+            
+            allowed = False
+            delay = None
+            metadata = {
+                "strategy": self.config.strategy.value,
+                "identifier": self.identifier,
+                "tenant_id": tenant_id,
+                "cost": cost,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            try:
+                if self.config.strategy == RateLimitStrategy.FIXED_WINDOW:
+                    allowed, delay = await self._check_fixed_window(cost)
+                    
+                elif self.config.strategy == RateLimitStrategy.SLIDING_WINDOW:
+                    allowed, delay = await self._check_sliding_window(cost)
+                    
+                elif self.config.strategy == RateLimitStrategy.TOKEN_BUCKET:
+                    allowed, delay = await self._check_token_bucket(cost)
+                    
+                elif self.config.strategy == RateLimitStrategy.LEAKY_BUCKET:
+                    allowed, delay = await self._check_leaky_bucket(cost)
+                
+                metadata.update({
+                    "allowed": allowed,
+                    "delay": delay,
+                    "current_usage": await self._get_current_usage()
+                })
+                
+                if allowed:
+                    self.metrics.allowed_requests += 1
+                    
+                    if delay and delay > 0:
+                        self.metrics.delayed_requests += 1
+                        metadata["action"] = "delayed"
+                    
+                    return True, delay, metadata
+                
+                else:
+                    self.metrics.rejected_requests += 1
+                    metadata["action"] = "rejected"
+                    
+                    # Aplica ação configurada
+                    if self.config.action == RateLimitAction.QUEUE:
+                        queued = await self._add_to_queue(tenant_id, cost)
+                        if queued:
+                            self.metrics.queued_requests += 1
+                            metadata["action"] = "queued"
+                            return False, None, metadata
+                    
+                    return False, None, metadata
+                    
+            except Exception as e:
+                logger.error(f"Erro no rate limiter {self.identifier}: {str(e)}")
+                # Fail open - em caso de erro, permite a requisição
+                return True, None, metadata
+    
+    async def _check_fixed_window(self, cost: int) -> Tuple[bool, Optional[float]]:
+        """Verifica limite usando janela fixa"""
+        
+        now = datetime.utcnow()
+        window_duration = timedelta(seconds=self.config.window_seconds)
+        
+        # Reseta janela se necessário
+        if now - self._current_window_start >= window_duration:
+            self._current_window_start = now
+            self._window_requests = 0
+        
+        # Verifica limite com burst allowance
+        max_allowed = int(self.config.max_requests * self.config.burst_multiplier)
+        
+        if self._window_requests + cost <= max_allowed:
+            self._window_requests += cost
+            return True, None
+        
+        # Calcula quando a próxima janela começa
+        next_window_start = self._current_window_start + window_duration
+        delay = (next_window_start - now).total_seconds()
+        
+        if self.config.action == RateLimitAction.DELAY:
+            return False, max(delay, self.config.delay_seconds)
+        
+        return False, None
+    
+    async def _check_sliding_window(self, cost: int) -> Tuple[bool, Optional[float]]:
+        """Verifica limite usando janela deslizante"""
+        
+        now = datetime.utcnow()
+        cutoff = now - timedelta(seconds=self.config.window_seconds)
+        
+        # Remove timestamps antigos
+        self._request_timestamps = [
+            ts for ts in self._request_timestamps if ts > cutoff
+        ]
+        
+        # Verifica limite
+        if len(self._request_timestamps) + cost <= self.config.max_requests:
+            # Adiciona timestamps para cada "custo"
+            for _ in range(cost):
+                self._request_timestamps.append(now)
+            return True, None
+        
+        # Calcula quando espaço estará disponível
+        if self._request_timestamps:
+            oldest_allowed = self._request_timestamps[0] + timedelta(seconds=self.config.window_seconds)
+            delay = max(0.0, (oldest_allowed - now).total_seconds())
+            
+            if self.config.action == RateLimitAction.DELAY:
+                return False, max(delay, self.config.delay_seconds)
+        
+        return False, None
+    
+    async def _check_token_bucket(self, cost: int) -> Tuple[bool, Optional[float]]:
+        """Verifica limite usando token bucket"""
+        
+        now = time.time()
+        elapsed = now - self._last_refill
+        
+        # Recarrega tokens
+        new_tokens = elapsed * self.config.tokens_per_second
+        self._tokens = min(self._tokens + new_tokens, self.config.max_tokens)
+        self._last_refill = now
+        
+        # Verifica tokens suficientes
+        if self._tokens >= cost:
+            self._tokens -= cost
+            return True, None
+        
+        # Calcula quanto tempo esperar por tokens
+        tokens_needed = cost - self._tokens
+        wait_time = tokens_needed / self.config.tokens_per_second
+        
+        if self.config.action == RateLimitAction.DELAY:
+            return False, max(wait_time, self.config.delay_seconds)
+        
+        return False, None
+    
+    async def _check_leaky_bucket(self, cost: int) -> Tuple[bool, Optional[float]]:
+        """Verifica limite usando leaky bucket"""
+        
+        now = time.time()
+        elapsed = now - self._last_leak
+        
+        # Vaza tokens do bucket
+        leak_amount = elapsed * (self.config.max_requests / self.config.window_seconds)
+        self._queue_size = max(0, self._queue_size - leak_amount)
+        self._last_leak = now
+        
+        # Verifica se há espaço no bucket
+        if self._queue_size + cost <= self.config.max_requests:
+            self._queue_size += cost
+            
+            # Calcula tempo de processamento estimado
+            if self.config.tokens_per_second > 0:
+                process_time = cost / self.config.tokens_per_second
+                return True, process_time
+            
+            return True, None
+        
+        # Bucket cheio
+        if self.config.action == RateLimitAction.DELAY:
+            # Estimativa de quando haverá espaço
+            overflow = (self._queue_size + cost) - self.config.max_requests
+            leak_rate = self.config.max_requests / self.config.window_seconds
+            wait_time = overflow / leak_rate
+            
+            return False, max(wait_time, self.config.delay_seconds)
+        
+        return False, None
+    
+    async def _add_to_queue(self, tenant_id: Optional[str], cost: int) -> bool:
+        """Adiciona requisição à fila interna"""
+        
+        if self._queue_processor_task is None:
+            self._start_queue_processor()
+        
+        try:
+            item = {
+                "tenant_id": tenant_id,
+                "cost": cost,
+                "timestamp": datetime.utcnow(),
+                "event": asyncio.Event()
+            }
+            
+            # Tenta adicionar à fila sem bloquear
+            try:
+                self._request_queue.put_nowait(item)
+                self.metrics.current_queue_size = self._request_queue.qsize()
+                return True
+                
+            except asyncio.QueueFull:
+                return False
+                
+        except Exception as e:
+            logger.error(f"Erro ao adicionar à fila: {str(e)}")
+            return False
+    
+    def _start_queue_processor(self):
+        """Inicia processador da fila"""
+        
+        async def process_queue():
+            while True:
+                try:
+                    item = await self._request_queue.get()
+                    
+                    # Espera até que a requisição possa ser processada
+                    while True:
+                        async with self._lock:
+                            # Verifica se pode processar agora
+                            if self.config.strategy == RateLimitStrategy.TOKEN_BUCKET:
+                                allowed, _ = await self._check_token_bucket(item["cost"])
+                            else:
+                                allowed, _ = await self._check_sliding_window(item["cost"])
+                            
+                            if allowed:
+                                # Sinaliza que a requisição pode prosseguir
+                                item["event"].set()
+                                self._request_queue.task_done()
+                                self.metrics.current_queue_size = self._request_queue.qsize()
+                                break
+                        
+                        # Espera um pouco antes de tentar novamente
+                        await asyncio.sleep(0.1)
+                        
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Erro no processador de fila: {str(e)}")
+                    await asyncio.sleep(1)
+        
+        self._queue_processor_task = asyncio.create_task(process_queue())
+    
+    async def _get_current_usage(self) -> Dict[str, Any]:
+        """Retorna uso atual"""
+        
+        if self.config.strategy == RateLimitStrategy.FIXED_WINDOW:
+            return {
+                "current_requests": self._window_requests,
+                "window_start": self._current_window_start.isoformat(),
+                "max_requests": self.config.max_requests
+            }
+        
+        elif self.config.strategy == RateLimitStrategy.SLIDING_WINDOW:
+            return {
+                "current_requests": len(self._request_timestamps),
+                "max_requests": self.config.max_requests
+            }
+        
+        elif self.config.strategy == RateLimitStrategy.TOKEN_BUCKET:
+            return {
+                "current_tokens": self._tokens,
+                "max_tokens": self.config.max_tokens,
+                "tokens_per_second": self.config.tokens_per_second
+            }
+        
+        elif self.config.strategy == RateLimitStrategy.LEAKY_BUCKET:
+            return {
+                "queue_size": self._queue_size,
+                "max_requests": self.config.max_requests
+            }
+        
+        return {}
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Retorna status do rate limiter"""
+        
+        return {
+            "identifier": self.identifier,
+            "strategy": self.config.strategy.value,
+            "action": self.config.action.value,
+            "metrics": {
+                "total_requests": self.metrics.total_requests,
+                "allowed_requests": self.metrics.allowed_requests,
+                "rejected_requests": self.metrics.rejected_requests,
+                "delayed_requests": self.metrics.delayed_requests,
+                "queued_requests": self.metrics.queued_requests,
+                "rejection_rate": self.metrics.rejection_rate(),
+                "current_queue_size": self.metrics.current_queue_size,
+                "last_request_time": self.metrics.last_request_time.isoformat() if self.metrics.last_request_time else None
+            },
+            "config": self.config.__dict__,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    async def shutdown(self):
+        """Desliga o rate limiter"""
+        
+        if self._queue_processor_task:
+            self._queue_processor_task.cancel()
+            try:
+                await self._queue_processor_task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.info(f"RateLimiter '{self.identifier}' desligado")
+
+
+class RateLimitManager:
+    """Gerencia múltiplos rate limiters"""
+    
+    def __init__(self):
+        self.limiters: Dict[str, RateLimiter] = {}
+        self._default_limiter: Optional[RateLimiter] = None
+    
+    def register(
+        self,
+        identifier: str,
+        config: Optional[RateLimitConfig] = None,
+        is_default: bool = False
+    ) -> RateLimiter:
+        """Registra um rate limiter"""
+        
+        limiter = RateLimiter(identifier, config)
+        self.limiters[identifier] = limiter
+        
+        if is_default:
+            self._default_limiter = limiter
+        
+        return limiter
+    
+    def get(self, identifier: str) -> Optional[RateLimiter]:
+        """Obtém um rate limiter"""
+        return self.limiters.get(identifier)
+    
+    def get_default(self) -> Optional[RateLimiter]:
+        """Obtém o rate limiter padrão"""
+        return self._default_limiter
+    
+    async def is_allowed(
+        self,
+        identifier: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        cost: int = 1
+    ) -> Tuple[bool, Optional[float], Dict[str, Any]]:
+        """
+        Verifica se uma requisição é permitida.
+        
+        Args:
+            identifier: ID do rate limiter (None para padrão)
+            tenant_id: ID do tenant
+            cost: Custo da requisição
+            
+        Returns:
+            Tuple (permitido, atraso, metadata)
+        """
+        
+        limiter = self.get(identifier) if identifier else self._default_limiter
+        
+        if not limiter:
+            # Sem rate limiting
+            return True, None, {"reason": "no_limiter"}
+        
+        return await limiter.is_allowed(tenant_id, cost)
+    
+    def get_all_status(self) -> Dict[str, Any]:
+        """Retorna status de todos os rate limiters"""
+        
+        status = {}
+        for identifier, limiter in self.limiters.items():
+            status[identifier] = limiter.get_status()
+        
+        return {
+            "total_limiters": len(self.limiters),
+            "limiters": status,
+            "default_limiter": self._default_limiter.identifier if self._default_limiter else None,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    
+    async def shutdown_all(self):
+        """Desliga todos os rate limiters"""
+        
+        for limiter in self.limiters.values():
+            await limiter.shutdown()
+        
+        logger.info(f"Todos os {len(self.limiters)} rate limiters desligados")
+
+
+# Fábrica para criar rate limiters comuns
+def create_queue_rate_limiter(
+    queue_name: str,
+    max_per_minute: int = 1000
+) -> RateLimiter:
+    """Cria rate limiter para uma fila específica"""
+    
+    config = RateLimitConfig(
+        max_requests=max_per_minute,
+        window_seconds=60,
+        strategy=RateLimitStrategy.SLIDING_WINDOW,
+        action=RateLimitAction.DELAY,
+        delay_seconds=0.1
+    )
+    
+    return RateLimiter(f"queue_{queue_name}", config)
+
+
+def create_tenant_rate_limiter(
+    tenant_id: str,
+    max_per_hour: int = 10000
+) -> RateLimiter:
+    """Cria rate limiter para um tenant específico"""
+    
+    config = RateLimitConfig(
+        max_requests=max_per_hour,
+        window_seconds=3600,
+        strategy=RateLimitStrategy.TOKEN_BUCKET,
+        tokens_per_second=max_per_hour / 3600,
+        max_tokens=max_per_hour,
+        action=RateLimitAction.REJECT
+    )
+    
+    return RateLimiter(f"tenant_{tenant_id}", config)
+
+
+# Decorator para uso fácil
+def rate_limit(
+    identifier: str,
+    max_requests: int = 100,
+    window_seconds: int = 60,
+    cost: int = 1
+):
+    """
+    Decorator para aplicar rate limiting a uma função.
+    
+    Exemplo:
+        @rate_limit("publish_api", max_requests=1000, window_seconds=60)
+        async def publish_message(...):
+            ...
+    """
+    
+    def decorator(func):
+        limiter = RateLimiter(
+            identifier,
+            RateLimitConfig(
+                max_requests=max_requests,
+                window_seconds=window_seconds
+            )
+        )
+        
+        async def wrapper(*args, **kwargs):
+            allowed, delay, metadata = await limiter.is_allowed(cost=cost)
+            
+            if not allowed:
+                raise RateLimitExceededError(
+                    identifier=identifier,
+                    max_requests=max_requests,
+                    window_seconds=window_seconds,
+                    metadata=metadata
+                )
+            
+            if delay and delay > 0:
+                await asyncio.sleep(delay)
+            
+            return await func(*args, **kwargs)
+        
+        # Expõe o rate limiter para controle
+        wrapper.rate_limiter = limiter
+        
+        return wrapper
+    
+    return decorator
+
+
+class RateLimitExceededError(Exception):
+    """Exceção quando rate limit é excedido"""
+    
+    def __init__(
+        self,
+        identifier: str,
+        max_requests: int,
+        window_seconds: int,
+        metadata: Dict[str, Any]
+    ):
+        super().__init__(
+            f"Rate limit exceeded for '{identifier}': "
+            f"{max_requests} requests per {window_seconds} seconds"
+        )
+        self.identifier = identifier
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.metadata = metadata

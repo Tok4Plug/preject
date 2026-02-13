@@ -1,0 +1,1169 @@
+# app/core/entitlement_resolver.py
+"""
+Resolvedor de permissões (READ-SIDE).
+Otimizado para leituras rápidas, cache distribuído e consultas em alta escala.
+Nunca escreve no banco - apenas consulta e resolve permissões baseado em entitlements ativos.
+"""
+
+import enum
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Set, Any, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+import json
+import hashlib
+
+import redis.asyncio as redis
+from redis.asyncio import Redis
+
+from app.core.audit_logger import audit_logger
+from app.models.entitlement import Entitlement, EntitlementStatus, EntitlementScope
+from app.utils.cryptography import hash_data
+from app.utils.circuit_breaker import CircuitBreaker, CircuitBreakerState
+from app.utils.rate_limiter import RateLimiter
+
+logger = logging.getLogger(__name__)
+
+
+class AccessDecision(Enum):
+    """Decisão de acesso."""
+    GRANTED = "granted"
+    DENIED = "denied"
+    SUSPENDED = "suspended"
+    EXPIRED = "expired"
+    NOT_FOUND = "not_found"
+
+
+class ResolutionStrategy(Enum):
+    """Estratégias de resolução de permissões."""
+    STRICT = "strict"  # Apenas entitlements ativos
+    LENIENT = "lenient"  # Inclui suspensos com aviso
+    CACHED = "cached"  # Usa apenas cache, falha rápido se não estiver
+    HYBRID = "hybrid"  # Cache primeiro, depois banco
+
+
+@dataclass
+class AccessCheck:
+    """Dados para verificação de acesso."""
+    user_id: int
+    bot_id: str
+    offer_id: Optional[str] = None
+    feature_id: Optional[str] = None
+    required_scope: Optional[EntitlementScope] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    
+    def get_cache_key(self) -> str:
+        """Gera chave de cache única para esta verificação."""
+        components = [
+            str(self.user_id),
+            self.bot_id,
+            self.offer_id or "",
+            self.feature_id or "",
+            self.required_scope.value if self.required_scope else "",
+            hash_data(json.dumps(self.context, sort_keys=True))
+        ]
+        return f"access_check:{hashlib.md5(':'.join(components).encode()).hexdigest()}"
+    
+    def get_fingerprint(self) -> str:
+        """Gera fingerprint para rate limiting."""
+        return f"{self.user_id}:{self.bot_id}"
+
+
+@dataclass
+class AccessResolution:
+    """Resultado da resolução de acesso."""
+    decision: AccessDecision
+    granted: bool
+    check: AccessCheck
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    resolved_in_ms: float = 0.0
+    cache_hit: bool = False
+    circuit_breaker_state: Optional[str] = None
+    matched_entitlements: List[Dict[str, Any]] = field(default_factory=list)
+    denied_reason: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "decision": self.decision.value,
+            "granted": self.granted,
+            "check": {
+                "user_id": self.check.user_id,
+                "bot_id": self.check.bot_id,
+                "offer_id": self.check.offer_id,
+                "feature_id": self.check.feature_id,
+                "required_scope": self.check.required_scope.value if self.check.required_scope else None,
+                "context": self.check.context
+            },
+            "timestamp": self.timestamp.isoformat(),
+            "resolved_in_ms": self.resolved_in_ms,
+            "cache_hit": self.cache_hit,
+            "circuit_breaker_state": self.circuit_breaker_state,
+            "matched_entitlements": self.matched_entitlements,
+            "denied_reason": self.denied_reason,
+            "metadata": self.metadata
+        }
+
+
+class EntitlementResolver:
+    """
+    Resolvedor de permissões - lado de leitura otimizado.
+    Stateless, com cache distribuído, circuit breaker e rate limiting.
+    """
+    
+    def __init__(
+        self,
+        redis_client: Optional[Redis] = None,
+        cache_ttl: int = 300,  # 5 minutos
+        circuit_breaker_failures: int = 10,
+        circuit_breaker_reset: int = 60,  # 60 segundos
+        rate_limit_per_minute: int = 1000
+    ):
+        self.redis_client = redis_client
+        self.cache_ttl = cache_ttl
+        
+        # Circuit breaker para proteção do banco de dados
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=circuit_breaker_failures,
+            reset_timeout=circuit_breaker_reset,
+            name="entitlement_resolver_db"
+        )
+        
+        # Rate limiter para prevenir abuso
+        self.rate_limiter = RateLimiter(
+            requests_per_minute=rate_limit_per_minute,
+            redis_client=redis_client
+        )
+        
+        # Cache de resoluções em memória (fallback quando Redis não disponível)
+        self._memory_cache: Dict[str, Tuple[AccessResolution, datetime]] = {}
+        
+        # Estatísticas
+        self._stats = {
+            "total_checks": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "circuit_breaker_trips": 0,
+            "rate_limited": 0,
+            "avg_resolution_time_ms": 0.0
+        }
+    
+    async def check_access(
+        self,
+        user_id: int,
+        bot_id: str,
+        offer_id: Optional[str] = None,
+        feature_id: Optional[str] = None,
+        required_scope: Optional[EntitlementScope] = None,
+        context: Optional[Dict[str, Any]] = None,
+        strategy: ResolutionStrategy = ResolutionStrategy.HYBRID,
+        bypass_rate_limit: bool = False
+    ) -> AccessResolution:
+        """
+        Verifica se o usuário tem acesso.
+        Método principal do EntitlementResolver.
+        
+        Args:
+            user_id: ID do usuário
+            bot_id: ID do bot
+            offer_id: ID específico da oferta (opcional)
+            feature_id: ID específico da feature (opcional)
+            required_scope: Scope requerido (opcional)
+            context: Contexto adicional
+            strategy: Estratégia de resolução
+            bypass_rate_limit: Ignorar rate limiting (para uso interno)
+            
+        Returns:
+            AccessResolution com decisão e detalhes
+        """
+        start_time = datetime.utcnow()
+        
+        # Criar objeto de verificação
+        check = AccessCheck(
+            user_id=user_id,
+            bot_id=bot_id,
+            offer_id=offer_id,
+            feature_id=feature_id,
+            required_scope=required_scope,
+            context=context or {}
+        )
+        
+        # Atualizar estatísticas
+        self._stats["total_checks"] += 1
+        
+        try:
+            # 1. Verificar rate limiting (exceto para bypass interno)
+            if not bypass_rate_limit:
+                is_allowed, rate_limit_info = await self._check_rate_limit(check)
+                if not is_allowed:
+                    self._stats["rate_limited"] += 1
+                    resolution_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+                    
+                    return AccessResolution(
+                        decision=AccessDecision.DENIED,
+                        granted=False,
+                        check=check,
+                        resolved_in_ms=resolution_time,
+                        denied_reason="rate_limited",
+                        metadata={"rate_limit_info": rate_limit_info}
+                    )
+            
+            # 2. Executar com circuit breaker
+            async with self.circuit_breaker:
+                # 3. Aplicar estratégia de resolução
+                if strategy == ResolutionStrategy.CACHED:
+                    resolution = await self._resolve_cached_only(check)
+                elif strategy == ResolutionStrategy.STRICT:
+                    resolution = await self._resolve_strict(check)
+                elif strategy == ResolutionStrategy.LENIENT:
+                    resolution = await self._resolve_lenient(check)
+                else:  # HYBRID (padrão)
+                    resolution = await self._resolve_hybrid(check)
+            
+            # 4. Calcular tempo de resolução
+            resolution.resolved_in_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+            
+            # 5. Atualizar estatísticas de tempo médio
+            self._update_avg_resolution_time(resolution.resolved_in_ms)
+            
+            # 6. Registrar auditoria para decisões importantes
+            if resolution.decision in [AccessDecision.DENIED, AccessDecision.SUSPENDED]:
+                await self._audit_access_denial(resolution)
+            
+            # 7. Atualizar cache se foi miss
+            if not resolution.cache_hit and self.redis_client:
+                await self._cache_resolution(check, resolution)
+            
+            logger.debug(
+                f"Access check - User: {user_id}, Bot: {bot_id}, "
+                f"Decision: {resolution.decision.value}, "
+                f"Cache: {resolution.cache_hit}, "
+                f"Time: {resolution.resolved_in_ms:.2f}ms"
+            )
+            
+            return resolution
+            
+        except Exception as e:
+            logger.error(
+                f"Error checking access - User: {user_id}, Bot: {bot_id}, Error: {e}",
+                exc_info=True
+            )
+            
+            # Fallback para decisão negativa em caso de erro
+            resolution_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+            
+            return AccessResolution(
+                decision=AccessDecision.DENIED,
+                granted=False,
+                check=check,
+                resolved_in_ms=resolution_time,
+                denied_reason=f"resolution_error: {str(e)}",
+                circuit_breaker_state=self.circuit_breaker.state.value,
+                metadata={"error": str(e)}
+            )
+    
+    async def _check_rate_limit(
+        self,
+        check: AccessCheck
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """
+        Aplica rate limiting baseado no fingerprint da verificação.
+        """
+        try:
+            fingerprint = check.get_fingerprint()
+            is_allowed, metadata = await self.rate_limiter.is_allowed(
+                key=f"access_check:{fingerprint}",
+                max_requests=100,  # 100 verificações por minuto por user+bot
+                window_seconds=60
+            )
+            
+            return is_allowed, metadata
+            
+        except Exception as e:
+            logger.error(f"Error checking rate limit: {e}")
+            # Em caso de erro no rate limiter, permitir a requisição
+            return True, None
+    
+    async def _resolve_cached_only(self, check: AccessCheck) -> AccessResolution:
+        """
+        Estratégia CACHED: usa apenas cache, falha rápido se não estiver.
+        """
+        # Tentar obter do cache
+        cached_resolution = await self._get_cached_resolution(check)
+        
+        if cached_resolution:
+            self._stats["cache_hits"] += 1
+            
+            # Atualizar timestamp e retornar
+            cached_resolution.timestamp = datetime.utcnow()
+            cached_resolution.cache_hit = True
+            
+            return cached_resolution
+        
+        # Cache miss - retornar negado
+        self._stats["cache_misses"] += 1
+        
+        return AccessResolution(
+            decision=AccessDecision.DENIED,
+            granted=False,
+            check=check,
+            cache_hit=False,
+            denied_reason="not_cached",
+            metadata={"strategy": "cached_only"}
+        )
+    
+    async def _resolve_strict(self, check: AccessCheck) -> AccessResolution:
+        """
+        Estratégia STRICT: apenas entitlements ativos, ignora cache.
+        """
+        # Buscar diretamente do banco
+        entitlements = await self._fetch_entitlements_from_db(check)
+        
+        # Filtrar apenas ativos
+        active_entitlements = [
+            e for e in entitlements
+            if e["status"] == EntitlementStatus.ACTIVE.value
+        ]
+        
+        # Verificar se atende aos critérios
+        has_access, matched = self._evaluate_entitlements(
+            entitlements=active_entitlements,
+            check=check
+        )
+        
+        decision = self._determine_decision(has_access, matched, check)
+        
+        return AccessResolution(
+            decision=decision,
+            granted=has_access,
+            check=check,
+            cache_hit=False,
+            matched_entitlements=matched,
+            denied_reason=None if has_access else "no_active_entitlement",
+            metadata={"strategy": "strict", "total_entitlements": len(entitlements)}
+        )
+    
+    async def _resolve_lenient(self, check: AccessCheck) -> AccessResolution:
+        """
+        Estratégia LENIENT: inclui entitlements suspensos (com aviso).
+        """
+        # Buscar do banco
+        entitlements = await self._fetch_entitlements_from_db(check)
+        
+        # Incluir ativos e suspensos
+        valid_entitlements = [
+            e for e in entitlements
+            if e["status"] in [
+                EntitlementStatus.ACTIVE.value,
+                EntitlementStatus.SUSPENDED.value
+            ]
+        ]
+        
+        # Verificar se atende aos critérios
+        has_access, matched = self._evaluate_entitlements(
+            entitlements=valid_entitlements,
+            check=check
+        )
+        
+        # Se o único entitlement encontrado está suspenso, decisão é SUSPENDED
+        if matched and all(e["status"] == EntitlementStatus.SUSPENDED.value for e in matched):
+            decision = AccessDecision.SUSPENDED
+            has_access = False
+        else:
+            decision = self._determine_decision(has_access, matched, check)
+        
+        return AccessResolution(
+            decision=decision,
+            granted=has_access,
+            check=check,
+            cache_hit=False,
+            matched_entitlements=matched,
+            denied_reason=None if has_access else "no_valid_entitlement",
+            metadata={
+                "strategy": "lenient",
+                "total_entitlements": len(entitlements),
+                "includes_suspended": any(e["status"] == EntitlementStatus.SUSPENDED.value for e in matched)
+            }
+        )
+    
+    async def _resolve_hybrid(self, check: AccessCheck) -> AccessResolution:
+        """
+        Estratégia HYBRID: cache primeiro, depois banco.
+        """
+        # 1. Tentar cache primeiro
+        cached_resolution = await self._get_cached_resolution(check)
+        
+        if cached_resolution:
+            self._stats["cache_hits"] += 1
+            cached_resolution.cache_hit = True
+            cached_resolution.timestamp = datetime.utcnow()
+            return cached_resolution
+        
+        self._stats["cache_misses"] += 1
+        
+        # 2. Se não tem cache, buscar do banco
+        entitlements = await self._fetch_entitlements_from_db(check)
+        
+        # 3. Aplicar lógica STRICT (apenas ativos)
+        active_entitlements = [
+            e for e in entitlements
+            if e["status"] == EntitlementStatus.ACTIVE.value
+        ]
+        
+        has_access, matched = self._evaluate_entitlements(
+            entitlements=active_entitlements,
+            check=check
+        )
+        
+        decision = self._determine_decision(has_access, matched, check)
+        
+        resolution = AccessResolution(
+            decision=decision,
+            granted=has_access,
+            check=check,
+            cache_hit=False,
+            matched_entitlements=matched,
+            denied_reason=None if has_access else "no_active_entitlement",
+            metadata={
+                "strategy": "hybrid",
+                "total_entitlements": len(entitlements),
+                "cache_miss": True
+            }
+        )
+        
+        return resolution
+    
+    async def _get_cached_resolution(
+        self,
+        check: AccessCheck
+    ) -> Optional[AccessResolution]:
+        """
+        Obtém resolução do cache (Redis ou memória).
+        """
+        cache_key = check.get_cache_key()
+        
+        # Tentar Redis primeiro
+        if self.redis_client:
+            try:
+                cached_data = await self.redis_client.get(cache_key)
+                if cached_data:
+                    data = json.loads(cached_data)
+                    
+                    # Converter strings de volta para objetos
+                    check_data = data["check"]
+                    check_obj = AccessCheck(
+                        user_id=check_data["user_id"],
+                        bot_id=check_data["bot_id"],
+                        offer_id=check_data.get("offer_id"),
+                        feature_id=check_data.get("feature_id"),
+                        required_scope=EntitlementScope(check_data["required_scope"]) if check_data.get("required_scope") else None,
+                        context=check_data.get("context", {})
+                    )
+                    
+                    return AccessResolution(
+                        decision=AccessDecision(data["decision"]),
+                        granted=data["granted"],
+                        check=check_obj,
+                        timestamp=datetime.fromisoformat(data["timestamp"]),
+                        resolved_in_ms=data["resolved_in_ms"],
+                        cache_hit=False,  # Será marcado como True pelo caller
+                        matched_entitlements=data.get("matched_entitlements", []),
+                        denied_reason=data.get("denied_reason"),
+                        metadata=data.get("metadata", {})
+                    )
+            except Exception as e:
+                logger.error(f"Error getting from Redis cache: {e}")
+        
+        # Fallback para cache em memória
+        if cache_key in self._memory_cache:
+            resolution, cached_at = self._memory_cache[cache_key]
+            
+            # Verificar se não expirou (TTL de memória: 60 segundos)
+            if (datetime.utcnow() - cached_at).seconds < 60:
+                return resolution
+        
+        return None
+    
+    async def _cache_resolution(
+        self,
+        check: AccessCheck,
+        resolution: AccessResolution
+    ) -> None:
+        """
+        Armazena resolução no cache.
+        """
+        cache_key = check.get_cache_key()
+        
+        # Preparar dados para cache
+        cache_data = {
+            "decision": resolution.decision.value,
+            "granted": resolution.granted,
+            "check": {
+                "user_id": check.user_id,
+                "bot_id": check.bot_id,
+                "offer_id": check.offer_id,
+                "feature_id": check.feature_id,
+                "required_scope": check.required_scope.value if check.required_scope else None,
+                "context": check.context
+            },
+            "timestamp": resolution.timestamp.isoformat(),
+            "resolved_in_ms": resolution.resolved_in_ms,
+            "matched_entitlements": resolution.matched_entitlements,
+            "denied_reason": resolution.denied_reason,
+            "metadata": resolution.metadata
+        }
+        
+        # Tentar Redis primeiro
+        if self.redis_client:
+            try:
+                await self.redis_client.setex(
+                    cache_key,
+                    self.cache_ttl,
+                    json.dumps(cache_data)
+                )
+                return
+            except Exception as e:
+                logger.error(f"Error caching in Redis: {e}")
+        
+        # Fallback para cache em memória
+        self._memory_cache[cache_key] = (resolution, datetime.utcnow())
+    
+    async def _fetch_entitlements_from_db(
+        self,
+        check: AccessCheck
+    ) -> List[Dict[str, Any]]:
+        """
+        Busca entitlements do banco de dados.
+        """
+        try:
+            # Construir filtros baseados no check
+            filters = {
+                "user_id": check.user_id,
+                "bot_id": check.bot_id
+            }
+            
+            # Se temos offer_id específico, filtrar por ele
+            if check.offer_id:
+                filters["offer_id"] = check.offer_id
+            
+            # Buscar entitlements do banco
+            entitlements = await Entitlement.filter(**filters)
+            
+            # Converter para dict
+            return [
+                {
+                    "id": e.id,
+                    "user_id": e.user_id,
+                    "bot_id": e.bot_id,
+                    "offer_id": e.offer_id,
+                    "status": e.status,
+                    "scope": e.scope.value,
+                    "type": e.type.value,
+                    "granted_at": e.granted_at.isoformat() if e.granted_at else None,
+                    "expires_at": e.expires_at.isoformat() if e.expires_at else None,
+                    "metadata": e.metadata or {}
+                }
+                for e in entitlements
+            ]
+            
+        except Exception as e:
+            logger.error(f"Error fetching entitlements from DB: {e}")
+            
+            # Se o circuit breaker não estiver aberto, contar como falha
+            if self.circuit_breaker.state != CircuitBreakerState.OPEN:
+                self.circuit_breaker.record_failure()
+            
+            raise
+    
+    def _evaluate_entitlements(
+        self,
+        entitlements: List[Dict[str, Any]],
+        check: AccessCheck
+    ) -> Tuple[bool, List[Dict[str, Any]]]:
+        """
+        Avalia se os entitlements atendem aos requisitos do check.
+        """
+        matched_entitlements = []
+        
+        for entitlement in entitlements:
+            if self._entitlement_matches_check(entitlement, check):
+                matched_entitlements.append(entitlement)
+        
+        # Se temos offer_id específico, precisa ter pelo menos um match
+        if check.offer_id:
+            has_access = len(matched_entitlements) > 0
+        else:
+            # Se não tem offer_id específico, qualquer entitlement ativo concede acesso ao bot
+            has_access = len(entitlements) > 0
+        
+        return has_access, matched_entitlements
+    
+    def _entitlement_matches_check(
+        self,
+        entitlement: Dict[str, Any],
+        check: AccessCheck
+    ) -> bool:
+        """
+        Verifica se um entitlement específico atende aos critérios do check.
+        """
+        # 1. Verificar se não está expirado
+        if entitlement.get("expires_at"):
+            expires_at = datetime.fromisoformat(entitlement["expires_at"])
+            if expires_at < datetime.utcnow():
+                return False
+        
+        # 2. Verificar scope se especificado
+        if check.required_scope:
+            entitlement_scope = EntitlementScope(entitlement["scope"])
+            if entitlement_scope != check.required_scope:
+                return False
+        
+        # 3. Verificar offer_id se especificado
+        if check.offer_id and entitlement["offer_id"] != check.offer_id:
+            return False
+        
+        # 4. Verificar feature_id se especificado
+        if check.feature_id:
+            # Em produção, isso verificaria se o entitlement inclui a feature específica
+            # Por enquanto, assumir que se tem acesso ao bot, tem acesso a todas as features
+            pass
+        
+        return True
+    
+    def _determine_decision(
+        self,
+        has_access: bool,
+        matched_entitlements: List[Dict[str, Any]],
+        check: AccessCheck
+    ) -> AccessDecision:
+        """
+        Determina a decisão final baseada no resultado da avaliação.
+        """
+        if not has_access:
+            return AccessDecision.DENIED
+        
+        if not matched_entitlements:
+            # Acesso concedido mas sem match específico (acesso geral ao bot)
+            return AccessDecision.GRANTED
+        
+        # Verificar status dos matched entitlements
+        statuses = {e["status"] for e in matched_entitlements}
+        
+        if EntitlementStatus.ACTIVE.value in statuses:
+            return AccessDecision.GRANTED
+        elif EntitlementStatus.SUSPENDED.value in statuses:
+            return AccessDecision.SUSPENDED
+        elif EntitlementStatus.REVOKED.value in statuses:
+            return AccessDecision.DENIED
+        else:
+            return AccessDecision.DENIED
+    
+    async def _audit_access_denial(self, resolution: AccessResolution) -> None:
+        """
+        Registra auditoria para negações de acesso importantes.
+        """
+        try:
+            if resolution.decision == AccessDecision.DENIED:
+                await audit_logger.log_async(
+                    resource_type="access_check",
+                    resource_id=f"{resolution.check.user_id}:{resolution.check.bot_id}",
+                    action="denied",
+                    actor="system",
+                    description=f"Acesso negado: {resolution.denied_reason or 'no_entitlement'}",
+                    metadata=resolution.to_dict()
+                )
+            elif resolution.decision == AccessDecision.SUSPENDED:
+                await audit_logger.log_async(
+                    resource_type="access_check",
+                    resource_id=f"{resolution.check.user_id}:{resolution.check.bot_id}",
+                    action="suspended_access",
+                    actor="system",
+                    description=f"Acesso suspenso detectado",
+                    metadata=resolution.to_dict()
+                )
+                
+        except Exception as e:
+            logger.error(f"Error auditing access denial: {e}")
+    
+    def _update_avg_resolution_time(self, new_time_ms: float) -> None:
+        """Atualiza estatísticas de tempo médio de resolução."""
+        total_checks = self._stats["total_checks"]
+        current_avg = self._stats["avg_resolution_time_ms"]
+        
+        # Fórmula de média móvel
+        new_avg = ((current_avg * (total_checks - 1)) + new_time_ms) / total_checks
+        self._stats["avg_resolution_time_ms"] = new_avg
+    
+    async def batch_check_access(
+        self,
+        checks: List[AccessCheck],
+        strategy: ResolutionStrategy = ResolutionStrategy.HYBRID
+    ) -> Dict[str, AccessResolution]:
+        """
+        Verifica acesso em lote para múltiplos checks.
+        Otimizado com pipeline Redis e queries agrupadas.
+        
+        Args:
+            checks: Lista de AccessCheck
+            strategy: Estratégia de resolução
+            
+        Returns:
+            Dict com cache_key -> AccessResolution
+        """
+        results = {}
+        
+        # Para cada check, verificar cache primeiro
+        cache_misses = []
+        cache_keys = []
+        
+        for check in checks:
+            cache_key = check.get_cache_key()
+            cache_keys.append(cache_key)
+            
+            cached_resolution = await self._get_cached_resolution(check)
+            if cached_resolution:
+                cached_resolution.cache_hit = True
+                cached_resolution.timestamp = datetime.utcnow()
+                results[cache_key] = cached_resolution
+            else:
+                cache_misses.append((cache_key, check))
+        
+        # Processar cache misses em lote se houver muitos
+        if cache_misses:
+            if len(cache_misses) > 10:
+                # Agrupar por user_id para queries otimizadas
+                checks_by_user: Dict[int, List[Tuple[str, AccessCheck]]] = {}
+                
+                for cache_key, check in cache_misses:
+                    if check.user_id not in checks_by_user:
+                        checks_by_user[check.user_id] = []
+                    checks_by_user[check.user_id].append((cache_key, check))
+                
+                # Processar cada usuário em paralelo
+                import asyncio
+                tasks = []
+                
+                for user_id, user_checks in checks_by_user.items():
+                    task = self._process_user_batch(user_checks, strategy)
+                    tasks.append(task)
+                
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Consolidar resultados
+                for batch_result in batch_results:
+                    if isinstance(batch_result, Exception):
+                        logger.error(f"Error in batch processing: {batch_result}")
+                        continue
+                    
+                    results.update(batch_result)
+                
+            else:
+                # Processar individualmente se poucos misses
+                for cache_key, check in cache_misses:
+                    resolution = await self.check_access(
+                        user_id=check.user_id,
+                        bot_id=check.bot_id,
+                        offer_id=check.offer_id,
+                        feature_id=check.feature_id,
+                        required_scope=check.required_scope,
+                        context=check.context,
+                        strategy=strategy,
+                        bypass_rate_limit=True  # Já aplicamos rate limiting individualmente
+                    )
+                    results[cache_key] = resolution
+        
+        return results
+    
+    async def _process_user_batch(
+        self,
+        user_checks: List[Tuple[str, AccessCheck]],
+        strategy: ResolutionStrategy
+    ) -> Dict[str, AccessResolution]:
+        """
+        Processa lote de checks para um único usuário de forma otimizada.
+        """
+        results = {}
+        
+        if not user_checks:
+            return results
+        
+        # Pegar primeiro check como referência
+        first_cache_key, first_check = user_checks[0]
+        user_id = first_check.user_id
+        
+        try:
+            # Buscar todos os entitlements do usuário de uma vez
+            all_entitlements = await Entitlement.filter(user_id=user_id)
+            
+            # Converter para dict
+            entitlements_dict = {}
+            for e in all_entitlements:
+                key = f"{e.bot_id}:{e.offer_id or ''}"
+                if key not in entitlements_dict:
+                    entitlements_dict[key] = []
+                
+                entitlements_dict[key].append({
+                    "id": e.id,
+                    "user_id": e.user_id,
+                    "bot_id": e.bot_id,
+                    "offer_id": e.offer_id,
+                    "status": e.status,
+                    "scope": e.scope.value,
+                    "type": e.type.value,
+                    "granted_at": e.granted_at.isoformat() if e.granted_at else None,
+                    "expires_at": e.expires_at.isoformat() if e.expires_at else None,
+                    "metadata": e.metadata or {}
+                })
+            
+            # Processar cada check
+            for cache_key, check in user_checks:
+                start_time = datetime.utcnow()
+                
+                # Obter entitlements relevantes para este check
+                relevant_key = f"{check.bot_id}:{check.offer_id or ''}"
+                relevant_entitlements = entitlements_dict.get(relevant_key, [])
+                
+                # Aplicar lógica de resolução
+                if strategy == ResolutionStrategy.STRICT:
+                    active_entitlements = [
+                        e for e in relevant_entitlements
+                        if e["status"] == EntitlementStatus.ACTIVE.value
+                    ]
+                    has_access, matched = self._evaluate_entitlements(active_entitlements, check)
+                else:
+                    has_access, matched = self._evaluate_entitlements(relevant_entitlements, check)
+                
+                decision = self._determine_decision(has_access, matched, check)
+                resolution_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+                
+                resolution = AccessResolution(
+                    decision=decision,
+                    granted=has_access,
+                    check=check,
+                    resolved_in_ms=resolution_time,
+                    cache_hit=False,
+                    matched_entitlements=matched,
+                    denied_reason=None if has_access else "no_entitlement",
+                    metadata={
+                        "strategy": strategy.value,
+                        "batch_processed": True,
+                        "total_user_entitlements": len(all_entitlements)
+                    }
+                )
+                
+                results[cache_key] = resolution
+                
+                # Cache individual
+                await self._cache_resolution(check, resolution)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error processing user batch for user {user_id}: {e}")
+            
+            # Fallback: negar todos os checks deste usuário
+            for cache_key, check in user_checks:
+                resolution = AccessResolution(
+                    decision=AccessDecision.DENIED,
+                    granted=False,
+                    check=check,
+                    resolved_in_ms=0.0,
+                    cache_hit=False,
+                    denied_reason="batch_processing_error",
+                    metadata={"error": str(e)}
+                )
+                results[cache_key] = resolution
+            
+            return results
+    
+    async def get_user_access_summary(
+        self,
+        user_id: int,
+        bot_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Retorna resumo completo de acesso do usuário.
+        Otimizado para dashboards admin.
+        
+        Args:
+            user_id: ID do usuário
+            bot_id: Filtrar por bot (opcional)
+            
+        Returns:
+            Dict com resumo de acesso
+        """
+        try:
+            # Buscar todos os entitlements do usuário
+            filters = {"user_id": user_id}
+            if bot_id:
+                filters["bot_id"] = bot_id
+            
+            entitlements = await Entitlement.filter(**filters)
+            
+            # Agrupar por bot e status
+            summary = {
+                "user_id": user_id,
+                "total_entitlements": len(entitlements),
+                "bots": {},
+                "status_counts": {},
+                "scope_counts": {},
+                "type_counts": {}
+            }
+            
+            for e in entitlements:
+                # Por bot
+                if e.bot_id not in summary["bots"]:
+                    summary["bots"][e.bot_id] = {
+                        "total": 0,
+                        "active": 0,
+                        "suspended": 0,
+                        "revoked": 0,
+                        "offers": set()
+                    }
+                
+                bot_summary = summary["bots"][e.bot_id]
+                bot_summary["total"] += 1
+                
+                if e.status == EntitlementStatus.ACTIVE.value:
+                    bot_summary["active"] += 1
+                elif e.status == EntitlementStatus.SUSPENDED.value:
+                    bot_summary["suspended"] += 1
+                elif e.status == EntitlementStatus.REVOKED.value:
+                    bot_summary["revoked"] += 1
+                
+                if e.offer_id:
+                    bot_summary["offers"].add(e.offer_id)
+                
+                # Contagens gerais
+                summary["status_counts"][e.status] = summary["status_counts"].get(e.status, 0) + 1
+                summary["scope_counts"][e.scope.value] = summary["scope_counts"].get(e.scope.value, 0) + 1
+                summary["type_counts"][e.type.value] = summary["type_counts"].get(e.type.value, 0) + 1
+            
+            # Converter sets para lists
+            for bot_id, bot_summary in summary["bots"].items():
+                bot_summary["offers"] = list(bot_summary["offers"])
+            
+            # Adicionar estatísticas de cache
+            summary["resolver_stats"] = self.get_stats()
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Error getting user access summary for user {user_id}: {e}")
+            return {"error": str(e)}
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Retorna estatísticas do resolver."""
+        return {
+            **self._stats,
+            "circuit_breaker_state": self.circuit_breaker.state.value,
+            "circuit_breaker_failures": self.circuit_breaker.failure_count,
+            "memory_cache_size": len(self._memory_cache),
+            "cache_ttl": self.cache_ttl
+        }
+    
+    async def clear_cache(
+        self,
+        user_id: Optional[int] = None,
+        bot_id: Optional[str] = None,
+        pattern: Optional[str] = None
+    ) -> int:
+        """
+        Limpa cache do resolver.
+        
+        Args:
+            user_id: Limpar cache de um usuário específico
+            bot_id: Limpar cache de um bot específico
+            pattern: Pattern customizado para Redis
+            
+        Returns:
+            Número de itens removidos
+        """
+        cleared_count = 0
+        
+        # Limpar Redis cache
+        if self.redis_client:
+            try:
+                if pattern:
+                    redis_pattern = pattern
+                elif user_id and bot_id:
+                    redis_pattern = f"access_check:*{user_id}:{bot_id}*"
+                elif user_id:
+                    redis_pattern = f"access_check:*{user_id}:*"
+                elif bot_id:
+                    redis_pattern = f"access_check:*:{bot_id}:*"
+                else:
+                    redis_pattern = "access_check:*"
+                
+                # Buscar e deletar keys
+                keys = []
+                async for key in self.redis_client.scan_iter(match=redis_pattern):
+                    keys.append(key)
+                
+                if keys:
+                    deleted = await self.redis_client.delete(*keys)
+                    cleared_count += deleted
+                    
+            except Exception as e:
+                logger.error(f"Error clearing Redis cache: {e}")
+        
+        # Limpar cache em memória
+        if user_id or bot_id or pattern:
+            # Não implementado para filtros complexos em memória
+            # Em produção, teríamos estrutura mais sofisticada
+            pass
+        else:
+            cleared_count += len(self._memory_cache)
+            self._memory_cache.clear()
+        
+        logger.info(f"Cleared {cleared_count} cache entries")
+        return cleared_count
+    
+    async def warmup_cache(
+        self,
+        user_ids: List[int],
+        bot_ids: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Pré-carrega cache para usuários e bots específicos.
+        Útil para picos de tráfego antecipados.
+        
+        Args:
+            user_ids: Lista de user IDs
+            bot_ids: Lista de bot IDs
+            
+        Returns:
+            Estatísticas do warmup
+        """
+        start_time = datetime.utcnow()
+        warmed_count = 0
+        error_count = 0
+        
+        try:
+            # Buscar todos os entitlements para os usuários e bots especificados
+            # Isso assume que não há muitos dados - em produção, fazer paginado
+            entitlements = await Entitlement.filter(
+                user_id__in=user_ids,
+                bot_id__in=bot_ids
+            )
+            
+            # Agrupar por user_id:bot_id
+            grouped_entitlements = {}
+            for e in entitlements:
+                key = f"{e.user_id}:{e.bot_id}"
+                if key not in grouped_entitlements:
+                    grouped_entitlements[key] = []
+                
+                grouped_entitlements[key].append({
+                    "id": e.id,
+                    "offer_id": e.offer_id,
+                    "status": e.status,
+                    "scope": e.scope.value,
+                    "type": e.type.value,
+                    "granted_at": e.granted_at.isoformat() if e.granted_at else None,
+                    "expires_at": e.expires_at.isoformat() if e.expires_at else None,
+                    "metadata": e.metadata or {}
+                })
+            
+            # Criar e cache resoluções para cada combinação user:bot
+            for key, ents in grouped_entitlements.items():
+                user_id_str, bot_id_str = key.split(":")
+                user_id = int(user_id_str)
+                bot_id = bot_id_str
+                
+                # Criar check genérico (sem offer_id específico)
+                check = AccessCheck(
+                    user_id=user_id,
+                    bot_id=bot_id
+                )
+                
+                # Avaliar entitlements
+                has_access, matched = self._evaluate_entitlements(ents, check)
+                decision = self._determine_decision(has_access, matched, check)
+                
+                # Criar resolução
+                resolution = AccessResolution(
+                    decision=decision,
+                    granted=has_access,
+                    check=check,
+                    resolved_in_ms=0.0,
+                    cache_hit=False,
+                    matched_entitlements=matched,
+                    denied_reason=None if has_access else "no_entitlement",
+                    metadata={"warmed": True}
+                )
+                
+                # Cache
+                await self._cache_resolution(check, resolution)
+                warmed_count += 1
+            
+            duration = (datetime.utcnow() - start_time).total_seconds()
+            
+            return {
+                "success": True,
+                "warmed_count": warmed_count,
+                "error_count": error_count,
+                "duration_seconds": duration,
+                "entitlements_processed": len(entitlements),
+                "user_bot_combinations": len(grouped_entitlements)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error warming up cache: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "warmed_count": warmed_count,
+                "error_count": error_count,
+                "duration_seconds": (datetime.utcnow() - start_time).total_seconds()
+            }
+
+
+# Factory para criação do EntitlementResolver
+def create_entitlement_resolver(
+    redis_url: Optional[str] = None,
+    cache_ttl: int = 300,
+    circuit_breaker_failures: int = 10,
+    circuit_breaker_reset: int = 60,
+    rate_limit_per_minute: int = 1000
+) -> EntitlementResolver:
+    """
+    Cria uma instância configurada do EntitlementResolver.
+    
+    Args:
+        redis_url: URL do Redis (opcional)
+        cache_ttl: TTL do cache em segundos
+        circuit_breaker_failures: Limite de falhas para abrir circuit breaker
+        circuit_breaker_reset: Tempo para resetar circuit breaker
+        rate_limit_per_minute: Limite de requisições por minuto
+        
+    Returns:
+        EntitlementResolver configurado
+    """
+    redis_client = None
+    if redis_url:
+        try:
+            redis_client = redis.from_url(redis_url)
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis: {e}")
+    
+    return EntitlementResolver(
+        redis_client=redis_client,
+        cache_ttl=cache_ttl,
+        circuit_breaker_failures=circuit_breaker_failures,
+        circuit_breaker_reset=circuit_breaker_reset,
+        rate_limit_per_minute=rate_limit_per_minute
+    )
+
+
+# Singleton para uso global (opcional)
+_entitlement_resolver_instance: Optional[EntitlementResolver] = None
+
+def get_entitlement_resolver() -> EntitlementResolver:
+    """Retorna instância singleton do EntitlementResolver."""
+    global _entitlement_resolver_instance
+    if _entitlement_resolver_instance is None:
+        _entitlement_resolver_instance = create_entitlement_resolver()
+    return _entitlement_resolver_instance

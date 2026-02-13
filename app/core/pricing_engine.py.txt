@@ -1,0 +1,1446 @@
+"""
+Pricing Engine - Sistema de precificação dinâmica com regras complexas, overrides e multi-moeda
+
+Princípios:
+1. Preços dinâmicos baseados em regras hierárquicas
+2. Suporte a overrides por tenant, usuário, grupo, região
+3. Cálculos complexos (tiered, volume, promocionais)
+4. Isolamento absoluto por tenant
+5. Cache agressivo para alta performance
+"""
+
+import json
+import math
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
+from enum import Enum
+from typing import Dict, List, Optional, Any, Tuple, Union, Callable, Set
+from decimal import Decimal, ROUND_HALF_UP
+import uuid
+import hashlib
+from functools import lru_cache
+
+from app.models.tenant import Tenant
+from app.models.user import User
+from app.core.audit_logger import AuditLogger, AuditSeverity, AuditActionCategory
+from app.utils.cryptography import generate_secure_hash
+from app.core.plan_catalog import PlanPrice, BillingPeriodUnit
+
+
+class PricingRuleType(Enum):
+    """Tipos de regras de precificação"""
+    PERCENTAGE_DISCOUNT = "percentage_discount"      # Desconto percentual
+    FIXED_DISCOUNT = "fixed_discount"                # Desconto fixo
+    FIXED_PRICE = "fixed_price"                      # Preço fixo
+    MULTIPLIER = "multiplier"                        # Multiplicador
+    TIERED = "tiered"                                # Precificação por faixa
+    VOLUME = "volume"                                # Desconto por volume
+    PROMOTIONAL = "promotional"                      # Promocional
+    SEASONAL = "seasonal"                            # Sazonal
+    GEOGRAPHIC = "geographic"                        # Geográfico
+    LOYALTY = "loyalty"                              # Fidelidade
+    BUNDLE = "bundle"                                # Pacote
+
+
+class PricingRuleScope(Enum):
+    """Escopo de aplicação da regra"""
+    GLOBAL = "global"                # Aplica a todos
+    TENANT = "tenant"                # Aplica a um tenant específico
+    USER_GROUP = "user_group"        # Aplica a um grupo de usuários
+    USER = "user"                    # Aplica a um usuário específico
+    PLAN = "plan"                    # Aplica a um plano específico
+    REGION = "region"                # Aplica a uma região
+    CHANNEL = "channel"              # Aplica a um canal de venda
+
+
+class PricingConditionOperator(Enum):
+    """Operadores para condições"""
+    EQUALS = "equals"
+    NOT_EQUALS = "not_equals"
+    GREATER_THAN = "greater_than"
+    GREATER_THAN_OR_EQUAL = "greater_than_or_equal"
+    LESS_THAN = "less_than"
+    LESS_THAN_OR_EQUAL = "less_than_or_equal"
+    IN = "in"
+    NOT_IN = "not_in"
+    CONTAINS = "contains"
+    STARTS_WITH = "starts_with"
+    ENDS_WITH = "ends_with"
+    BETWEEN = "between"
+    MATCHES_REGEX = "matches_regex"
+
+
+class PricingAdjustmentType(Enum):
+    """Tipos de ajustes no cálculo"""
+    BASE_PRICE = "base_price"
+    PERCENTAGE_DISCOUNT = "percentage_discount"
+    FIXED_DISCOUNT = "fixed_discount"
+    MULTIPLIER = "multiplier"
+    TAX = "tax"
+    FEE = "fee"
+    ROUNDING = "rounding"
+    MINIMUM = "minimum"
+    MAXIMUM = "maximum"
+
+
+@dataclass
+class PricingCondition:
+    """Condição para aplicação de regra de precificação"""
+    field: str                    # Campo a ser avaliado (ex: "user.country", "plan.category")
+    operator: PricingConditionOperator
+    value: Any                    # Valor(s) para comparação
+    
+    def evaluate(self, context: Dict[str, Any]) -> bool:
+        """Avalia se condição é verdadeira no contexto"""
+        field_value = self._get_nested_value(context, self.field)
+        
+        if self.operator == PricingConditionOperator.EQUALS:
+            return field_value == self.value
+        elif self.operator == PricingConditionOperator.NOT_EQUALS:
+            return field_value != self.value
+        elif self.operator == PricingConditionOperator.GREATER_THAN:
+            return self._compare(field_value, self.value) > 0
+        elif self.operator == PricingConditionOperator.GREATER_THAN_OR_EQUAL:
+            return self._compare(field_value, self.value) >= 0
+        elif self.operator == PricingConditionOperator.LESS_THAN:
+            return self._compare(field_value, self.value) < 0
+        elif self.operator == PricingConditionOperator.LESS_THAN_OR_EQUAL:
+            return self._compare(field_value, self.value) <= 0
+        elif self.operator == PricingConditionOperator.IN:
+            return field_value in self.value
+        elif self.operator == PricingConditionOperator.NOT_IN:
+            return field_value not in self.value
+        elif self.operator == PricingConditionOperator.CONTAINS:
+            return self.value in field_value if isinstance(field_value, (list, str)) else False
+        elif self.operator == PricingConditionOperator.STARTS_WITH:
+            return field_value.startswith(self.value) if isinstance(field_value, str) else False
+        elif self.operator == PricingConditionOperator.ENDS_WITH:
+            return field_value.endswith(self.value) if isinstance(field_value, str) else False
+        elif self.operator == PricingConditionOperator.BETWEEN:
+            return self.value[0] <= field_value <= self.value[1]
+        elif self.operator == PricingConditionOperator.MATCHES_REGEX:
+            return bool(re.match(self.value, str(field_value)))
+        
+        return False
+    
+    def _get_nested_value(self, obj: Dict[str, Any], path: str) -> Any:
+        """Obtém valor aninhado usando dot notation"""
+        keys = path.split('.')
+        value = obj
+        
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key)
+            elif hasattr(value, key):
+                value = getattr(value, key)
+            else:
+                return None
+        
+        return value
+    
+    def _compare(self, a: Any, b: Any) -> int:
+        """Compara dois valores de forma segura"""
+        try:
+            if isinstance(a, (int, float, Decimal)) and isinstance(b, (int, float, Decimal)):
+                a_dec = Decimal(str(a))
+                b_dec = Decimal(str(b))
+                return (a_dec > b_dec) - (a_dec < b_dec)
+            else:
+                # Tenta comparar como strings
+                return (str(a) > str(b)) - (str(a) < str(b))
+        except:
+            return 0
+
+
+@dataclass
+class PricingRule:
+    """Regra de precificação completa"""
+    rule_id: str
+    name: str
+    description: str
+    rule_type: PricingRuleType
+    scope: PricingRuleScope
+    scope_value: str                    # Valor do escopo (tenant_id, user_group, etc.)
+    
+    # Parâmetros da regra
+    parameters: Dict[str, Any]          # Parâmetros específicos do tipo
+    
+    # Condições
+    conditions: List[PricingCondition] = field(default_factory=list)
+    
+    # Validade
+    valid_from: Optional[datetime] = None
+    valid_to: Optional[datetime] = None
+    
+    # Limites de uso
+    max_uses: Optional[int] = None      # Usos totais
+    max_uses_per_user: Optional[int] = None  # Usos por usuário
+    current_uses: int = 0               # Contador de usos atual
+    
+    # Ordem e prioridade
+    priority: int = 100                 # Menor número = maior prioridade
+    is_cumulative: bool = True          # Pode ser acumulada com outras regras?
+    is_exclusive: bool = False          # Exclusiva (anula outras regras)
+    
+    # Metadados
+    tags: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_by: str = "system"
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    is_active: bool = True
+    
+    def matches_context(self, context: Dict[str, Any]) -> bool:
+        """Verifica se regra se aplica ao contexto"""
+        # Verifica se está ativa
+        if not self.is_active:
+            return False
+        
+        # Verifica validade temporal
+        now = datetime.utcnow()
+        if self.valid_from and now < self.valid_from:
+            return False
+        if self.valid_to and now > self.valid_to:
+            return False
+        
+        # Verifica escopo
+        if not self._matches_scope(context):
+            return False
+        
+        # Verifica condições
+        for condition in self.conditions:
+            if not condition.evaluate(context):
+                return False
+        
+        # Verifica limites de uso
+        if self.max_uses is not None and self.current_uses >= self.max_uses:
+            return False
+        
+        if self.max_uses_per_user is not None:
+            user_id = context.get("user_id")
+            if user_id:
+                user_uses = self.metadata.get("user_uses", {}).get(user_id, 0)
+                if user_uses >= self.max_uses_per_user:
+                    return False
+        
+        return True
+    
+    def _matches_scope(self, context: Dict[str, Any]) -> bool:
+        """Verifica se regra se aplica ao escopo"""
+        if self.scope == PricingRuleScope.GLOBAL:
+            return True
+        
+        scope_value = context.get(f"{self.scope.value}_id")
+        if not scope_value:
+            # Tenta obter do contexto
+            scope_value = context.get(self.scope.value)
+        
+        return scope_value == self.scope_value
+    
+    def apply(self, base_amount: Decimal, context: Dict[str, Any]) -> Decimal:
+        """Aplica regra ao valor base"""
+        if not self.matches_context(context):
+            return base_amount
+        
+        # Incrementa contadores
+        self.current_uses += 1
+        
+        user_id = context.get("user_id")
+        if user_id and self.max_uses_per_user is not None:
+            user_uses = self.metadata.setdefault("user_uses", {}).get(user_id, 0)
+            self.metadata["user_uses"][user_id] = user_uses + 1
+        
+        # Aplica regra baseada no tipo
+        if self.rule_type == PricingRuleType.PERCENTAGE_DISCOUNT:
+            discount = self.parameters.get("percentage", 0)
+            return base_amount * (Decimal('1') - Decimal(str(discount)) / Decimal('100'))
+        
+        elif self.rule_type == PricingRuleType.FIXED_DISCOUNT:
+            discount = Decimal(str(self.parameters.get("amount", 0)))
+            return max(base_amount - discount, Decimal('0'))
+        
+        elif self.rule_type == PricingRuleType.FIXED_PRICE:
+            return Decimal(str(self.parameters.get("amount", 0)))
+        
+        elif self.rule_type == PricingRuleType.MULTIPLIER:
+            multiplier = Decimal(str(self.parameters.get("multiplier", 1)))
+            return base_amount * multiplier
+        
+        elif self.rule_type == PricingRuleType.TIERED:
+            return self._apply_tiered_pricing(base_amount, context)
+        
+        elif self.rule_type == PricingRuleType.VOLUME:
+            return self._apply_volume_pricing(base_amount, context)
+        
+        elif self.rule_type == PricingRuleType.PROMOTIONAL:
+            return self._apply_promotional_pricing(base_amount, context)
+        
+        # Outros tipos...
+        return base_amount
+    
+    def _apply_tiered_pricing(self, base_amount: Decimal, context: Dict[str, Any]) -> Decimal:
+        """Aplica precificação por faixa (tiered)"""
+        tiers = self.parameters.get("tiers", [])
+        quantity = context.get("quantity", 1)
+        
+        total = Decimal('0')
+        remaining = quantity
+        
+        for tier in sorted(tiers, key=lambda x: x["min_quantity"]):
+            tier_min = tier["min_quantity"]
+            tier_max = tier.get("max_quantity", float('inf'))
+            tier_price = Decimal(str(tier["price"]))
+            
+            if remaining <= 0:
+                break
+            
+            if remaining >= tier_min:
+                tier_qty = min(remaining, tier_max - tier_min + 1) if tier_max != float('inf') else remaining
+                total += tier_price * Decimal(tier_qty)
+                remaining -= tier_qty
+        
+        return total
+    
+    def _apply_volume_pricing(self, base_amount: Decimal, context: Dict[str, Any]) -> Decimal:
+        """Aplica precificação por volume"""
+        volume_breaks = self.parameters.get("volume_breaks", {})
+        quantity = context.get("quantity", 1)
+        
+        # Encontra breakpoint aplicável
+        applicable_break = None
+        for min_qty, discount in sorted(volume_breaks.items(), key=lambda x: int(x[0]), reverse=True):
+            if quantity >= int(min_qty):
+                applicable_break = discount
+                break
+        
+        if applicable_break:
+            discount_pct = Decimal(str(applicable_break))
+            return base_amount * (Decimal('1') - discount_pct / Decimal('100'))
+        
+        return base_amount
+    
+    def _apply_promotional_pricing(self, base_amount: Decimal, context: Dict[str, Any]) -> Decimal:
+        """Aplica precificação promocional"""
+        promo_type = self.parameters.get("type", "percentage")
+        
+        if promo_type == "percentage":
+            discount = Decimal(str(self.parameters.get("discount", 0)))
+            return base_amount * (Decimal('1') - discount / Decimal('100'))
+        
+        elif promo_type == "fixed":
+            discount = Decimal(str(self.parameters.get("discount", 0)))
+            return max(base_amount - discount, Decimal('0'))
+        
+        elif promo_type == "bogo":  # Buy One Get One
+            quantity = context.get("quantity", 1)
+            buy_qty = self.parameters.get("buy_quantity", 1)
+            get_qty = self.parameters.get("get_quantity", 1)
+            
+            if quantity >= buy_qty:
+                free_units = (quantity // (buy_qty + get_qty)) * get_qty
+                paid_units = quantity - free_units
+                unit_price = base_amount / Decimal(quantity)
+                return unit_price * Decimal(paid_units)
+        
+        return base_amount
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "rule_id": self.rule_id,
+            "name": self.name,
+            "description": self.description,
+            "rule_type": self.rule_type.value,
+            "scope": self.scope.value,
+            "scope_value": self.scope_value,
+            "parameters": self.parameters,
+            "conditions": [
+                {
+                    "field": c.field,
+                    "operator": c.operator.value,
+                    "value": c.value
+                }
+                for c in self.conditions
+            ],
+            "valid_from": self.valid_from.isoformat() if self.valid_from else None,
+            "valid_to": self.valid_to.isoformat() if self.valid_to else None,
+            "max_uses": self.max_uses,
+            "max_uses_per_user": self.max_uses_per_user,
+            "current_uses": self.current_uses,
+            "priority": self.priority,
+            "is_cumulative": self.is_cumulative,
+            "is_exclusive": self.is_exclusive,
+            "tags": self.tags,
+            "metadata": self.metadata,
+            "created_at": self.created_at.isoformat(),
+            "created_by": self.created_by,
+            "updated_at": self.updated_at.isoformat(),
+            "is_active": self.is_active
+        }
+
+
+@dataclass
+class PricingAdjustment:
+    """Ajuste individual aplicado ao preço"""
+    adjustment_type: PricingAdjustmentType
+    description: str
+    amount: Decimal
+    rule_id: Optional[str] = None
+    rule_name: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "type": self.adjustment_type.value,
+            "description": self.description,
+            "amount": str(self.amount),
+            "rule_id": self.rule_id,
+            "rule_name": self.rule_name,
+            "metadata": self.metadata
+        }
+
+
+@dataclass
+class PriceOverride:
+    """Solicitação de override de preço"""
+    tenant_id: str
+    plan_id: str
+    currency: str
+    base_amount: Decimal
+    user_id: Optional[str] = None
+    quantity: int = 1
+    billing_period: int = 1
+    billing_period_unit: BillingPeriodUnit = BillingPeriodUnit.MONTH
+    region: Optional[str] = None
+    channel: Optional[str] = None
+    user_group: Optional[str] = None
+    promo_code: Optional[str] = None
+    custom_context: Dict[str, Any] = field(default_factory=dict)
+    proration_days: Optional[int] = None
+    
+    def to_context_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário de contexto"""
+        return {
+            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
+            "plan_id": self.plan_id,
+            "currency": self.currency,
+            "quantity": self.quantity,
+            "billing_period": self.billing_period,
+            "billing_period_unit": self.billing_period_unit.value,
+            "region": self.region,
+            "channel": self.channel,
+            "user_group": self.user_group,
+            "promo_code": self.promo_code,
+            "base_amount": self.base_amount,
+            "proration_days": self.proration_days,
+            **self.custom_context
+        }
+
+
+@dataclass
+class PriceCalculationResult:
+    """Resultado completo do cálculo de preço"""
+    base_amount: Decimal
+    final_amount: Decimal
+    currency: str
+    adjustments: List[PricingAdjustment] = field(default_factory=list)
+    applied_rules: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    calculated_at: datetime = field(default_factory=datetime.utcnow)
+    cache_key: Optional[str] = None
+    
+    def add_adjustment(
+        self,
+        adjustment_type: PricingAdjustmentType,
+        description: str,
+        amount: Decimal,
+        rule_id: Optional[str] = None,
+        rule_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Adiciona ajuste ao resultado"""
+        adjustment = PricingAdjustment(
+            adjustment_type=adjustment_type,
+            description=description,
+            amount=amount,
+            rule_id=rule_id,
+            rule_name=rule_name,
+            metadata=metadata or {}
+        )
+        self.adjustments.append(adjustment)
+        
+        if rule_id and rule_id not in self.applied_rules:
+            self.applied_rules.append(rule_id)
+    
+    def calculate_final(self) -> Decimal:
+        """Calcula valor final com base nos ajustes"""
+        amount = self.base_amount
+        
+        for adjustment in self.adjustments:
+            if adjustment.adjustment_type == PricingAdjustmentType.PERCENTAGE_DISCOUNT:
+                discount = adjustment.amount / Decimal('100')
+                amount -= amount * discount
+            elif adjustment.adjustment_type == PricingAdjustmentType.FIXED_DISCOUNT:
+                amount -= adjustment.amount
+            elif adjustment.adjustment_type == PricingAdjustmentType.MULTIPLIER:
+                amount *= adjustment.amount
+            elif adjustment.adjustment_type == PricingAdjustmentType.TAX:
+                amount += adjustment.amount
+            elif adjustment.adjustment_type == PricingAdjustmentType.FEE:
+                amount += adjustment.amount
+        
+        # Garante que não seja negativo
+        amount = max(amount, Decimal('0'))
+        
+        # Aplica arredondamento monetário
+        amount = amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        
+        self.final_amount = amount
+        return amount
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário"""
+        return {
+            "base_amount": str(self.base_amount),
+            "final_amount": str(self.final_amount),
+            "currency": self.currency,
+            "adjustments": [a.to_dict() for a in self.adjustments],
+            "applied_rules": self.applied_rules,
+            "metadata": self.metadata,
+            "calculated_at": self.calculated_at.isoformat(),
+            "cache_key": self.cache_key,
+            "total_discount": str(self.base_amount - self.final_amount),
+            "discount_percentage": str(
+                ((self.base_amount - self.final_amount) / self.base_amount * Decimal('100'))
+                if self.base_amount > Decimal('0') else Decimal('0')
+            )
+        }
+
+
+class PricingRuleManager:
+    """Gerenciador de regras de precificação"""
+    
+    def __init__(self, audit_logger: AuditLogger):
+        self.audit_logger = audit_logger
+        self._rules: Dict[str, PricingRule] = {}
+        self._rule_index: Dict[str, List[str]] = {}  # scope -> [rule_ids]
+        self._rule_cache: Dict[str, PricingRule] = {}
+        
+        # Carrega regras padrão
+        self._load_default_rules()
+    
+    def _load_default_rules(self):
+        """Carrega regras de precificação padrão do sistema"""
+        # Regra de desconto para primeiras compras
+        first_purchase_rule = PricingRule(
+            rule_id="first_purchase_10pct",
+            name="10% Off First Purchase",
+            description="10% discount on first purchase for new users",
+            rule_type=PricingRuleType.PERCENTAGE_DISCOUNT,
+            scope=PricingRuleScope.USER,
+            scope_value="*",  # Aplica a qualquer usuário
+            parameters={"percentage": 10},
+            conditions=[
+                PricingCondition(
+                    field="user.first_purchase",
+                    operator=PricingConditionOperator.EQUALS,
+                    value=True
+                )
+            ],
+            max_uses_per_user=1,
+            priority=10,
+            tags=["first_purchase", "welcome"]
+        )
+        self.add_rule(first_purchase_rule)
+        
+        # Regra de desconto por volume
+        volume_rule = PricingRule(
+            rule_id="volume_5pct_10plus",
+            name="5% Volume Discount (10+ items)",
+            description="5% discount when purchasing 10 or more items",
+            rule_type=PricingRuleType.VOLUME,
+            scope=PricingRuleScope.GLOBAL,
+            scope_value="",
+            parameters={
+                "volume_breaks": {
+                    "10": 5,    # 5% discount for 10+ items
+                    "50": 10,   # 10% discount for 50+ items
+                    "100": 15   # 15% discount for 100+ items
+                }
+            },
+            conditions=[
+                PricingCondition(
+                    field="quantity",
+                    operator=PricingConditionOperator.GREATER_THAN_OR_EQUAL,
+                    value=10
+                )
+            ],
+            priority=20,
+            tags=["volume", "bulk"]
+        )
+        self.add_rule(volume_rule)
+        
+        # Regra sazonal (ex: Black Friday)
+        black_friday_rule = PricingRule(
+            rule_id="black_friday_20pct",
+            name="Black Friday 20% Off",
+            description="20% discount during Black Friday",
+            rule_type=PricingRuleType.PERCENTAGE_DISCOUNT,
+            scope=PricingRuleScope.GLOBAL,
+            scope_value="",
+            parameters={"percentage": 20},
+            valid_from=datetime(2024, 11, 25),
+            valid_to=datetime(2024, 11, 30),
+            priority=5,
+            tags=["seasonal", "black_friday"]
+        )
+        self.add_rule(black_friday_rule)
+    
+    def add_rule(self, rule: PricingRule) -> bool:
+        """Adiciona nova regra de precificação"""
+        if rule.rule_id in self._rules:
+            return False
+        
+        self._rules[rule.rule_id] = rule
+        
+        # Atualiza índice
+        scope_key = f"{rule.scope.value}:{rule.scope_value}"
+        if scope_key not in self._rule_index:
+            self._rule_index[scope_key] = []
+        
+        self._rule_index[scope_key].append(rule.rule_id)
+        
+        # Invalida cache
+        self._rule_cache.clear()
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id="system",
+            user_id=rule.created_by,
+            action="pricing_rule.created",
+            action_category=AuditActionCategory.CONFIGURATION,
+            severity=AuditSeverity.INFO,
+            description=f"Regra de precificação '{rule.name}' criada",
+            metadata={
+                "rule_id": rule.rule_id,
+                "rule_type": rule.rule_type.value,
+                "scope": rule.scope.value
+            },
+            tags=["pricing", "rule_management"]
+        ))
+        
+        return True
+    
+    def update_rule(self, rule_id: str, updates: Dict[str, Any], updated_by: str) -> bool:
+        """Atualiza regra existente"""
+        rule = self._rules.get(rule_id)
+        if not rule:
+            return False
+        
+        # Aplica updates
+        for key, value in updates.items():
+            if hasattr(rule, key):
+                setattr(rule, key, value)
+        
+        rule.updated_at = datetime.utcnow()
+        
+        # Invalida cache
+        self._rule_cache.clear()
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id="system",
+            user_id=updated_by,
+            action="pricing_rule.updated",
+            action_category=AuditActionCategory.CONFIGURATION,
+            severity=AuditSeverity.INFO,
+            description=f"Regra de precificação '{rule.name}' atualizada",
+            metadata={
+                "rule_id": rule_id,
+                "updates": list(updates.keys())
+            },
+            tags=["pricing", "rule_management"]
+        ))
+        
+        return True
+    
+    def delete_rule(self, rule_id: str, deleted_by: str) -> bool:
+        """Remove regra de precificação"""
+        rule = self._rules.pop(rule_id, None)
+        if not rule:
+            return False
+        
+        # Remove do índice
+        scope_key = f"{rule.scope.value}:{rule.scope_value}"
+        if scope_key in self._rule_index and rule_id in self._rule_index[scope_key]:
+            self._rule_index[scope_key].remove(rule_id)
+        
+        # Invalida cache
+        self._rule_cache.clear()
+        
+        # Log de auditoria
+        asyncio.create_task(self.audit_logger.log(
+            tenant_id="system",
+            user_id=deleted_by,
+            action="pricing_rule.deleted",
+            action_category=AuditActionCategory.CONFIGURATION,
+            severity=AuditSeverity.INFO,
+            description=f"Regra de precificação '{rule.name}' removida",
+            metadata={"rule_id": rule_id},
+            tags=["pricing", "rule_management"]
+        ))
+        
+        return True
+    
+    def get_rule(self, rule_id: str) -> Optional[PricingRule]:
+        """Obtém regra por ID"""
+        return self._rules.get(rule_id)
+    
+    def get_rules_for_context(self, context: Dict[str, Any]) -> List[PricingRule]:
+        """Obtém regras aplicáveis ao contexto"""
+        cache_key = self._generate_context_cache_key(context)
+        
+        if cache_key in self._rule_cache:
+            return self._rule_cache[cache_key]
+        
+        applicable_rules = []
+        
+        # Verifica regras em diferentes escopos
+        scopes_to_check = [
+            f"global:",
+            f"tenant:{context.get('tenant_id')}",
+            f"user_group:{context.get('user_group')}",
+            f"user:{context.get('user_id')}",
+            f"plan:{context.get('plan_id')}",
+            f"region:{context.get('region')}",
+            f"channel:{context.get('channel')}"
+        ]
+        
+        for scope_key in scopes_to_check:
+            rule_ids = self._rule_index.get(scope_key, [])
+            for rule_id in rule_ids:
+                rule = self._rules.get(rule_id)
+                if rule and rule.matches_context(context):
+                    applicable_rules.append(rule)
+        
+        # Ordena por prioridade (menor número = maior prioridade)
+        applicable_rules.sort(key=lambda r: r.priority)
+        
+        # Remove regras excluídas por regras exclusivas
+        filtered_rules = []
+        exclusive_applied = False
+        
+        for rule in applicable_rules:
+            if rule.is_exclusive and not exclusive_applied:
+                filtered_rules = [rule]
+                exclusive_applied = True
+            elif not exclusive_applied or rule.is_cumulative:
+                filtered_rules.append(rule)
+        
+        # Cache resultado
+        self._rule_cache[cache_key] = filtered_rules
+        
+        return filtered_rules
+    
+    def _generate_context_cache_key(self, context: Dict[str, Any]) -> str:
+        """Gera chave de cache para contexto"""
+        relevant_fields = [
+            'tenant_id', 'user_id', 'plan_id', 'quantity', 'currency',
+            'region', 'channel', 'user_group', 'promo_code'
+        ]
+        
+        values = []
+        for field in relevant_fields:
+            value = context.get(field)
+            if value is not None:
+                values.append(f"{field}:{value}")
+        
+        # Adiciona timestamp para invalidar cache baseado em tempo
+        current_hour = datetime.utcnow().strftime("%Y%m%d%H")
+        values.append(f"hour:{current_hour}")
+        
+        return hashlib.md5('|'.join(values).encode()).hexdigest()
+    
+    def list_rules(
+        self,
+        scope: Optional[PricingRuleScope] = None,
+        rule_type: Optional[PricingRuleType] = None,
+        active_only: bool = True
+    ) -> List[PricingRule]:
+        """Lista regras com filtros"""
+        filtered = []
+        
+        for rule in self._rules.values():
+            if active_only and not rule.is_active:
+                continue
+            
+            if scope and rule.scope != scope:
+                continue
+            
+            if rule_type and rule.rule_type != rule_type:
+                continue
+            
+            filtered.append(rule)
+        
+        # Ordena por prioridade e data de criação
+        filtered.sort(key=lambda r: (r.priority, r.created_at))
+        
+        return filtered
+    
+    def export_rules(self) -> List[Dict[str, Any]]:
+        """Exporta todas as regras para formato portável"""
+        return [rule.to_dict() for rule in self._rules.values()]
+    
+    def import_rules(self, rules_data: List[Dict[str, Any]], imported_by: str) -> int:
+        """Importa regras de formato portável"""
+        imported_count = 0
+        
+        for rule_data in rules_data:
+            try:
+                # Converte enums
+                rule_data["rule_type"] = PricingRuleType(rule_data["rule_type"])
+                rule_data["scope"] = PricingRuleScope(rule_data["scope"])
+                
+                # Converte condições
+                conditions = []
+                for cond_data in rule_data.get("conditions", []):
+                    condition = PricingCondition(
+                        field=cond_data["field"],
+                        operator=PricingConditionOperator(cond_data["operator"]),
+                        value=cond_data["value"]
+                    )
+                    conditions.append(condition)
+                rule_data["conditions"] = conditions
+                
+                # Converte datas
+                if rule_data.get("valid_from"):
+                    rule_data["valid_from"] = datetime.fromisoformat(rule_data["valid_from"])
+                if rule_data.get("valid_to"):
+                    rule_data["valid_to"] = datetime.fromisoformat(rule_data["valid_to"])
+                
+                rule_data["created_at"] = datetime.fromisoformat(rule_data["created_at"])
+                rule_data["updated_at"] = datetime.fromisoformat(rule_data["updated_at"])
+                
+                # Cria regra
+                rule = PricingRule(**rule_data)
+                
+                # Adiciona
+                if self.add_rule(rule):
+                    imported_count += 1
+                    
+            except Exception as e:
+                print(f"Erro ao importar regra: {e}")
+                continue
+        
+        return imported_count
+
+
+class PricingEngine:
+    """
+    Motor principal de precificação dinâmica
+    """
+    
+    def __init__(
+        self,
+        rule_manager: PricingRuleManager,
+        audit_logger: AuditLogger
+    ):
+        self.rule_manager = rule_manager
+        self.audit_logger = audit_logger
+        
+        # Cache para cálculos frequentes
+        self._calculation_cache: Dict[str, PriceCalculationResult] = {}
+        self._cache_max_size = 10000
+        self._cache_ttl = 300  # 5 minutos
+        
+        # Estatísticas
+        self._stats = {
+            "calculations": 0,
+            "cache_hits": 0,
+            "rule_applications": 0
+        }
+    
+    async def calculate_price(self, override: PriceOverride) -> PriceCalculationResult:
+        """
+        Calcula preço final com base em override e regras aplicáveis
+        """
+        # Gera chave de cache
+        cache_key = self._generate_cache_key(override)
+        
+        # Verifica cache
+        if cache_key in self._calculation_cache:
+            cached_result = self._calculation_cache[cache_key]
+            
+            # Verifica se cache ainda é válido
+            cache_age = (datetime.utcnow() - cached_result.calculated_at).total_seconds()
+            if cache_age < self._cache_ttl:
+                self._stats["cache_hits"] += 1
+                return cached_result
+        
+        # Cria contexto
+        context = override.to_context_dict()
+        
+        # Inicia cálculo
+        result = PriceCalculationResult(
+            base_amount=override.base_amount,
+            final_amount=override.base_amount,
+            currency=override.currency,
+            cache_key=cache_key
+        )
+        
+        # Aplica regras
+        applicable_rules = self.rule_manager.get_rules_for_context(context)
+        
+        current_amount = override.base_amount
+        
+        for rule in applicable_rules:
+            new_amount = rule.apply(current_amount, context)
+            
+            # Calcula diferença
+            difference = current_amount - new_amount
+            
+            if difference != Decimal('0'):
+                # Adiciona ajuste
+                adjustment_type = PricingAdjustmentType.PERCENTAGE_DISCOUNT if rule.rule_type == PricingRuleType.PERCENTAGE_DISCOUNT else PricingAdjustmentType.FIXED_DISCOUNT
+                
+                result.add_adjustment(
+                    adjustment_type=adjustment_type,
+                    description=rule.description,
+                    amount=difference,
+                    rule_id=rule.rule_id,
+                    rule_name=rule.name,
+                    metadata={
+                        "rule_type": rule.rule_type.value,
+                        "priority": rule.priority
+                    }
+                )
+                
+                current_amount = new_amount
+                self._stats["rule_applications"] += 1
+        
+        # Calcula valor final
+        result.calculate_final()
+        
+        # Aplica impostos e taxas (se configurado)
+        await self._apply_taxes_and_fees(result, context)
+        
+        # Cache resultado
+        if len(self._calculation_cache) >= self._cache_max_size:
+            # Remove entrada mais antiga
+            oldest_key = min(
+                self._calculation_cache.keys(),
+                key=lambda k: self._calculation_cache[k].calculated_at
+            )
+            del self._calculation_cache[oldest_key]
+        
+        self._calculation_cache[cache_key] = result
+        self._stats["calculations"] += 1
+        
+        # Log de auditoria
+        await self.audit_logger.log(
+            tenant_id=override.tenant_id,
+            user_id=override.user_id or "system",
+            action="price.calculated",
+            action_category=AuditActionCategory.BILLING,
+            severity=AuditSeverity.INFO,
+            description=f"Cálculo de preço para plano {override.plan_id}",
+            metadata={
+                "plan_id": override.plan_id,
+                "currency": override.currency,
+                "base_amount": str(override.base_amount),
+                "final_amount": str(result.final_amount),
+                "rules_applied": len(result.applied_rules),
+                "cache_key": cache_key
+            },
+            tags=["pricing", "calculation"]
+        )
+        
+        return result
+    
+    def _generate_cache_key(self, override: PriceOverride) -> str:
+        """Gera chave de cache única para override"""
+        key_parts = [
+            override.tenant_id,
+            override.plan_id,
+            override.currency,
+            str(override.base_amount),
+            str(override.quantity),
+            str(override.billing_period),
+            override.billing_period_unit.value,
+            override.user_id or "",
+            override.region or "",
+            override.channel or "",
+            override.user_group or "",
+            override.promo_code or "",
+            str(override.proration_days or "")
+        ]
+        
+        return hashlib.md5('|'.join(key_parts).encode()).hexdigest()
+    
+    async def _apply_taxes_and_fees(
+        self,
+        result: PriceCalculationResult,
+        context: Dict[str, Any]
+    ) -> None:
+        """Aplica impostos e taxas baseados na região"""
+        region = context.get("region")
+        currency = context.get("currency")
+        amount = result.final_amount
+        
+        # Mapeamento simplificado de taxas por região
+        tax_rates = {
+            "BR": Decimal("6.38"),  # Média de impostos no Brasil
+            "EU": Decimal("20.00"), # VAT padrão Europa
+            "US": Decimal("8.25"),  # Média de sales tax EUA
+            "UK": Decimal("20.00"), # VAT UK
+            "CA": Decimal("13.00"), # HST Canada
+            "AU": Decimal("10.00"), # GST Australia
+        }
+        
+        if region in tax_rates and amount > Decimal('0'):
+            tax_rate = tax_rates[region]
+            tax_amount = amount * (tax_rate / Decimal('100'))
+            
+            result.add_adjustment(
+                adjustment_type=PricingAdjustmentType.TAX,
+                description=f"Taxa {tax_rate}% ({region})",
+                amount=tax_amount,
+                metadata={"region": region, "rate": str(tax_rate)}
+            )
+        
+        # Aplica taxa de processamento se for cartão
+        payment_method = context.get("payment_method")
+        if payment_method in ["credit_card", "debit_card"]:
+            processing_fee = amount * Decimal('0.029') + Decimal('0.30')  # Stripe-like
+            result.add_adjustment(
+                adjustment_type=PricingAdjustmentType.FEE,
+                description="Taxa de processamento",
+                amount=processing_fee,
+                metadata={"payment_method": payment_method}
+            )
+    
+    async def calculate_bulk_prices(
+        self,
+        overrides: List[PriceOverride]
+    ) -> Dict[str, PriceCalculationResult]:
+        """Calcula preços em lote"""
+        results = {}
+        
+        for override in overrides:
+            result = await self.calculate_price(override)
+            results[override.plan_id] = result
+        
+        return results
+    
+    async def simulate_price(
+        self,
+        override: PriceOverride,
+        proposed_rules: List[Dict[str, Any]]
+    ) -> PriceCalculationResult:
+        """
+        Simula preço com regras propostas sem aplicá-las
+        """
+        # Cria cópia do rule manager para simulação
+        sim_rule_manager = PricingRuleManager(self.audit_logger)
+        
+        # Adiciona regras propostas
+        for rule_data in proposed_rules:
+            try:
+                rule = PricingRule(
+                    rule_id=f"sim_{uuid.uuid4().hex[:8]}",
+                    name=rule_data.get("name", "Simulation Rule"),
+                    description=rule_data.get("description", ""),
+                    rule_type=PricingRuleType(rule_data.get("rule_type", "percentage_discount")),
+                    scope=PricingRuleScope(rule_data.get("scope", "global")),
+                    scope_value=rule_data.get("scope_value", ""),
+                    parameters=rule_data.get("parameters", {}),
+                    priority=rule_data.get("priority", 100)
+                )
+                sim_rule_manager.add_rule(rule)
+            except Exception as e:
+                print(f"Erro ao criar regra de simulação: {e}")
+        
+        # Cria engine de simulação
+        sim_engine = PricingEngine(sim_rule_manager, self.audit_logger)
+        
+        # Calcula preço simulado
+        return await sim_engine.calculate_price(override)
+    
+    async def validate_promo_code(
+        self,
+        tenant_id: str,
+        promo_code: str,
+        user_id: Optional[str] = None,
+        plan_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Valida código promocional"""
+        # Em produção, buscaria do banco de dados
+        promo_codes = {
+            "WELCOME10": {
+                "rule_id": "promo_welcome10",
+                "discount": Decimal('10'),
+                "type": "percentage",
+                "valid_until": datetime(2024, 12, 31),
+                "max_uses": 1000,
+                "applicable_plans": ["*"]  # Todos os planos
+            },
+            "SUMMER20": {
+                "rule_id": "promo_summer20",
+                "discount": Decimal('20'),
+                "type": "percentage",
+                "valid_until": datetime(2024, 9, 30),
+                "max_uses": 500,
+                "applicable_plans": ["basic", "pro"]
+            }
+        }
+        
+        promo = promo_codes.get(promo_code.upper())
+        
+        if not promo:
+            return {
+                "valid": False,
+                "error": "Código promocional inválido"
+            }
+        
+        now = datetime.utcnow()
+        if promo["valid_until"] < now:
+            return {
+                "valid": False,
+                "error": "Código promocional expirado"
+            }
+        
+        if plan_id and promo["applicable_plans"] != ["*"]:
+            if plan_id not in promo["applicable_plans"]:
+                return {
+                    "valid": False,
+                    "error": "Código não aplicável a este plano"
+                }
+        
+        return {
+            "valid": True,
+            "promo_code": promo_code,
+            "discount": str(promo["discount"]),
+            "type": promo["type"],
+            "valid_until": promo["valid_until"].isoformat()
+        }
+    
+    async def get_price_breakdown(
+        self,
+        override: PriceOverride,
+        include_taxes: bool = True
+    ) -> Dict[str, Any]:
+        """Obtém detalhamento completo do preço"""
+        result = await self.calculate_price(override)
+        
+        breakdown = {
+            "base_price": str(override.base_amount),
+            "currency": override.currency,
+            "quantity": override.quantity,
+            "billing_period": {
+                "value": override.billing_period,
+                "unit": override.billing_period_unit.value
+            },
+            "adjustments": [],
+            "subtotal": str(result.final_amount),
+            "total": str(result.final_amount)
+        }
+        
+        # Agrupa ajustes por tipo
+        adjustments_by_type = {}
+        for adj in result.adjustments:
+            adj_type = adj.adjustment_type.value
+            if adj_type not in adjustments_by_type:
+                adjustments_by_type[adj_type] = {
+                    "type": adj_type,
+                    "description": adj.description,
+                    "total": Decimal('0'),
+                    "items": []
+                }
+            
+            adjustments_by_type[adj_type]["total"] += adj.amount
+            adjustments_by_type[adj_type]["items"].append(adj.to_dict())
+        
+        # Converte totais para string
+        for adj_type in adjustments_by_type:
+            adjustments_by_type[adj_type]["total"] = str(adjustments_by_type[adj_type]["total"])
+        
+        breakdown["adjustments"] = list(adjustments_by_type.values())
+        
+        # Calcula total com impostos se necessário
+        if include_taxes:
+            # Adiciona linha de impostos estimados
+            tax_estimate = result.final_amount * Decimal('0.15')  # 15% estimado
+            breakdown["tax_estimate"] = str(tax_estimate)
+            breakdown["total_with_tax"] = str(result.final_amount + tax_estimate)
+        
+        return breakdown
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Obtém estatísticas do engine"""
+        return {
+            **self._stats,
+            "cache_size": len(self._calculation_cache),
+            "rules_count": len(self.rule_manager._rules),
+            "cache_hit_rate": (
+                self._stats["cache_hits"] / self._stats["calculations"]
+                if self._stats["calculations"] > 0 else 0
+            )
+        }
+    
+    def clear_cache(self) -> int:
+        """Limpa cache e retorna número de itens removidos"""
+        count = len(self._calculation_cache)
+        self._calculation_cache.clear()
+        return count
+    
+    async def export_calculation_logs(
+        self,
+        tenant_id: str,
+        start_date: datetime,
+        end_date: datetime
+    ) -> List[Dict[str, Any]]:
+        """Exporta logs de cálculos para análise"""
+        # Em produção, buscaria do banco de auditoria
+        # Esta é uma implementação simplificada
+        return []
+
+
+# Fábrica de regras de precificação
+class PricingRuleFactory:
+    """Fábrica para criação de regras de precificação comuns"""
+    
+    @staticmethod
+    def create_percentage_discount_rule(
+        name: str,
+        description: str,
+        percentage: Decimal,
+        scope: PricingRuleScope,
+        scope_value: str,
+        conditions: Optional[List[PricingCondition]] = None,
+        priority: int = 100
+    ) -> PricingRule:
+        """Cria regra de desconto percentual"""
+        return PricingRule(
+            rule_id=f"rule_{uuid.uuid4().hex[:16]}",
+            name=name,
+            description=description,
+            rule_type=PricingRuleType.PERCENTAGE_DISCOUNT,
+            scope=scope,
+            scope_value=scope_value,
+            parameters={"percentage": float(percentage)},
+            conditions=conditions or [],
+            priority=priority,
+            tags=["discount", "percentage"]
+        )
+    
+    @staticmethod
+    def create_fixed_discount_rule(
+        name: str,
+        description: str,
+        amount: Decimal,
+        currency: str,
+        scope: PricingRuleScope,
+        scope_value: str,
+        conditions: Optional[List[PricingCondition]] = None,
+        priority: int = 100
+    ) -> PricingRule:
+        """Cria regra de desconto fixo"""
+        return PricingRule(
+            rule_id=f"rule_{uuid.uuid4().hex[:16]}",
+            name=name,
+            description=description,
+            rule_type=PricingRuleType.FIXED_DISCOUNT,
+            scope=scope,
+            scope_value=scope_value,
+            parameters={"amount": float(amount), "currency": currency},
+            conditions=conditions or [],
+            priority=priority,
+            tags=["discount", "fixed"]
+        )
+    
+    @staticmethod
+    def create_volume_discount_rule(
+        name: str,
+        description: str,
+        volume_breaks: Dict[int, Decimal],  # quantidade -> percentual de desconto
+        scope: PricingRuleScope,
+        scope_value: str,
+        conditions: Optional[List[PricingCondition]] = None,
+        priority: int = 100
+    ) -> PricingRule:
+        """Cria regra de desconto por volume"""
+        return PricingRule(
+            rule_id=f"rule_{uuid.uuid4().hex[:16]}",
+            name=name,
+            description=description,
+            rule_type=PricingRuleType.VOLUME,
+            scope=scope,
+            scope_value=scope_value,
+            parameters={"volume_breaks": {str(k): float(v) for k, v in volume_breaks.items()}},
+            conditions=conditions or [],
+            priority=priority,
+            tags=["discount", "volume"]
+        )
+    
+    @staticmethod
+    def create_tiered_pricing_rule(
+        name: str,
+        description: str,
+        tiers: List[Dict[str, Any]],  # [{min_quantity: x, max_quantity: y, price: z}]
+        scope: PricingRuleScope,
+        scope_value: str,
+        conditions: Optional[List[PricingCondition]] = None,
+        priority: int = 100
+    ) -> PricingRule:
+        """Cria regra de precificação por faixa"""
+        return PricingRule(
+            rule_id=f"rule_{uuid.uuid4().hex[:16]}",
+            name=name,
+            description=description,
+            rule_type=PricingRuleType.TIERED,
+            scope=scope,
+            scope_value=scope_value,
+            parameters={"tiers": tiers},
+            conditions=conditions or [],
+            priority=priority,
+            tags=["pricing", "tiered"]
+        )
+    
+    @staticmethod
+    def create_promotional_rule(
+        name: str,
+        description: str,
+        promo_type: str,  # "percentage", "fixed", "bogo"
+        discount: Optional[Decimal] = None,
+        buy_quantity: Optional[int] = None,
+        get_quantity: Optional[int] = None,
+        scope: PricingRuleScope,
+        scope_value: str,
+        conditions: Optional[List[PricingCondition]] = None,
+        valid_from: Optional[datetime] = None,
+        valid_to: Optional[datetime] = None,
+        priority: int = 50
+    ) -> PricingRule:
+        """Cria regra promocional"""
+        parameters = {"type": promo_type}
+        
+        if promo_type in ["percentage", "fixed"] and discount is not None:
+            parameters["discount"] = float(discount)
+        elif promo_type == "bogo" and buy_quantity is not None and get_quantity is not None:
+            parameters["buy_quantity"] = buy_quantity
+            parameters["get_quantity"] = get_quantity
+        
+        return PricingRule(
+            rule_id=f"rule_{uuid.uuid4().hex[:16]}",
+            name=name,
+            description=description,
+            rule_type=PricingRuleType.PROMOTIONAL,
+            scope=scope,
+            scope_value=scope_value,
+            parameters=parameters,
+            conditions=conditions or [],
+            valid_from=valid_from,
+            valid_to=valid_to,
+            priority=priority,
+            tags=["promotional", promo_type]
+        )
+
+
+# Cliente de exemplo para uso do Pricing Engine
+class PricingClient:
+    """Cliente simplificado para uso do Pricing Engine"""
+    
+    def __init__(self, pricing_engine: PricingEngine):
+        self.pricing_engine = pricing_engine
+    
+    async def get_plan_price(
+        self,
+        tenant_id: str,
+        user_id: str,
+        plan_id: str,
+        currency: str,
+        base_price: Decimal,
+        quantity: int = 1,
+        promo_code: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Obtém preço final do plano"""
+        # Valida código promocional se fornecido
+        promo_validation = None
+        if promo_code:
+            promo_validation = await self.pricing_engine.validate_promo_code(
+                tenant_id, promo_code, user_id, plan_id
+            )
+        
+        # Cria override
+        override = PriceOverride(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            plan_id=plan_id,
+            currency=currency,
+            base_amount=base_price,
+            quantity=quantity,
+            promo_code=promo_code if promo_validation and promo_validation["valid"] else None
+        )
+        
+        # Calcula preço
+        result = await self.pricing_engine.calculate_price(override)
+        
+        return {
+            "plan_id": plan_id,
+            "currency": currency,
+            "base_price": str(base_price),
+            "final_price": str(result.final_amount),
+            "discount_amount": str(base_price - result.final_amount),
+            "discount_percentage": str(
+                ((base_price - result.final_amount) / base_price * Decimal('100'))
+                if base_price > Decimal('0') else Decimal('0')
+            ),
+            "promo_code": promo_code if promo_validation and promo_validation["valid"] else None,
+            "promo_valid": promo_validation["valid"] if promo_validation else False,
+            "breakdown": result.to_dict()
+        }
+    
+    async def compare_plans(
+        self,
+        tenant_id: str,
+        user_id: str,
+        plans: List[Dict[str, Any]],  # [{plan_id, base_price, currency}]
+        quantity: int = 1
+    ) -> Dict[str, Any]:
+        """Compara preços de múltiplos planos"""
+        comparisons = []
+        
+        for plan in plans:
+            override = PriceOverride(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                plan_id=plan["plan_id"],
+                currency=plan["currency"],
+                base_amount=Decimal(str(plan["base_price"])),
+                quantity=quantity
+            )
+            
+            result = await self.pricing_engine.calculate_price(override)
+            
+            comparisons.append({
+                "plan_id": plan["plan_id"],
+                "base_price": str(plan["base_price"]),
+                "final_price": str(result.final_amount),
+                "currency": plan["currency"],
+                "savings": str(Decimal(str(plan["base_price"])) - result.final_amount),
+                "adjustments_count": len(result.adjustments)
+            })
+        
+        # Ordena por preço final
+        comparisons.sort(key=lambda x: Decimal(x["final_price"]))
+        
+        return {
+            "comparisons": comparisons,
+            "best_value": comparisons[0] if comparisons else None,
+            "quantity": quantity,
+            "compared_at": datetime.utcnow().isoformat()
+        }

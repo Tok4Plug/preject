@@ -1,0 +1,652 @@
+# app/models/antifraud_event.py
+"""
+Modelo de AntifraudEvent - Eventos de antifraude e scoring de risco.
+Cross-tenant, com fingerprint único e análise comportamental.
+"""
+
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text, Enum, Numeric
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+import enum
+
+from app.database import Base
+
+
+class AntifraudEventType(enum.Enum):
+    """Tipo de evento de antifraude."""
+    FINGERPRINT_CREATED = "fingerprint_created"        # Fingerprint criado
+    USER_BEHAVIOR = "user_behavior"                    # Comportamento do usuário
+    PAYMENT_ATTEMPT = "payment_attempt"                # Tentativa de pagamento
+    PAYMENT_SUCCESS = "payment_success"                # Pagamento bem-sucedido
+    PAYMENT_FAILED = "payment_failed"                  # Pagamento falhou
+    PAYMENT_CHARGEBACK = "payment_chargeback"          # Chargeback
+    ACCOUNT_TAKEOVER = "account_takeover"              # Tentativa de takeover
+    GEO_LOCATION = "geo_location"                      # Evento de geolocalização
+    DEVICE_FINGERPRINTING = "device_fingerprinting"    # Fingerprinting de dispositivo
+    RATE_LIMITING = "rate_limiting"                    # Rate limiting acionado
+    MANUAL_REVIEW = "manual_review"                    # Revisão manual
+    BLACKLIST = "blacklist"                            # Entrada em blacklist
+    WHITELIST = "whitelist"                            # Entrada em whitelist
+
+
+class AntifraudSeverity(enum.Enum):
+    """Severidade do evento."""
+    LOW = "low"                    # Baixo risco
+    MEDIUM = "medium"              # Risco médio
+    HIGH = "high"                  # Alto risco
+    CRITICAL = "critical"          # Risco crítico
+
+
+class AntifraudStatus(enum.Enum):
+    """Status da análise de antifraude."""
+    PENDING = "pending"            # Aguardando análise
+    REVIEW = "review"              # Em revisão manual
+    APPROVED = "approved"          # Aprovado
+    REJECTED = "rejected"          # Rejeitado
+    BLOCKED = "blocked"            # Bloqueado
+    WHITELISTED = "whitelisted"    # Whitelist
+    BLACKLISTED = "blacklisted"    # Blacklist
+
+
+class AntifraudEvent(Base):
+    """
+    Evento de antifraude - registro imutável de eventos de segurança.
+    
+    Princípios:
+    1. Cross-tenant: Eventos são globais, não isolados por tenant
+    2. Fingerprint único: Identificação única do usuário/device
+    3. Imutabilidade: Eventos não podem ser alterados após criação
+    4. Análise comportamental: Base para scoring de risco
+    5. Real-time: Suporte a análise em tempo real
+    """
+    
+    __tablename__ = "antifraud_events"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    event_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # af_xxx
+    tenant_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.tenants.id"), index=True)  # Opcional (cross-tenant)
+    
+    # Usuário/Entidade relacionada
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.users.id"), index=True)
+    bot_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.bots.id"), index=True)
+    
+    # Fingerprinting
+    fingerprint_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)  # Hash do fingerprint
+    fingerprint_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    session_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    device_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    
+    # Tipo e severidade
+    event_type: Mapped[AntifraudEventType] = mapped_column(Enum(AntifraudEventType), nullable=False, index=True)
+    severity: Mapped[AntifraudSeverity] = mapped_column(Enum(AntifraudSeverity), nullable=False, default=AntifraudSeverity.LOW, index=True)
+    
+    # Status e scoring
+    status: Mapped[AntifraudStatus] = mapped_column(Enum(AntifraudStatus), nullable=False, default=AntifraudStatus.PENDING, index=True)
+    risk_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # 0.0 a 100.0
+    confidence_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # 0.0 a 1.0
+    
+    # Dados do evento
+    event_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Geolocalização
+    ip_address: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    country_code: Mapped[Optional[str]] = mapped_column(String(2), index=True)
+    region: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    city: Mapped[Optional[str]] = mapped_column(String(100))
+    timezone: Mapped[Optional[str]] = mapped_column(String(50))
+    
+    # Dispositivo
+    user_agent: Mapped[Optional[str]] = mapped_column(Text)
+    device_type: Mapped[Optional[str]] = mapped_column(String(50))
+    browser: Mapped[Optional[str]] = mapped_column(String(100))
+    os: Mapped[Optional[str]] = mapped_column(String(100))
+    
+    # Comportamento
+    behavior_signature: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    velocity_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Dados de velocidade (clicks/min, etc.)
+    
+    # Análise manual
+    reviewed_by: Mapped[Optional[str]] = mapped_column(String(100))
+    review_notes: Mapped[Optional[str]] = mapped_column(Text)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos (quando aplicável)
+    payment_intent_id: Mapped[Optional[str]] = mapped_column(String(50), ForeignKey("saas.payment_intents.intent_id"), index=True)
+    webhook_event_id: Mapped[Optional[str]] = mapped_column(String(50), ForeignKey("saas.webhook_events.event_id"), index=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)  # Para eventos temporários
+    
+    # Relacionamentos
+    tenant: Mapped[Optional["Tenant"]] = relationship(back_populates="antifraud_events")
+    user: Mapped[Optional["User"]] = relationship(back_populates="antifraud_events")
+    bot: Mapped[Optional["Bot"]] = relationship()
+    payment_intent: Mapped[Optional["PaymentIntent"]] = relationship()
+    webhook_event: Mapped[Optional["WebhookEvent"]] = relationship()
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="antifraud_event", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_antifraud_events_fingerprint_created', 'fingerprint_hash', 'created_at'),
+        Index('ix_antifraud_events_type_severity', 'event_type', 'severity', 'created_at'),
+        Index('ix_antifraud_events_risk_score', 'risk_score', 'created_at'),
+        Index('ix_antifraud_events_ip_created', 'ip_address', 'created_at'),
+        Index('ix_antifraud_events_user_created', 'user_id', 'created_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<AntifraudEvent(id='{self.id}', event_id='{self.event_id}', type='{self.event_type.value}', risk_score={self.risk_score}, fingerprint='{self.fingerprint_hash[:8]}...')>"
+    
+    @classmethod
+    def generate_event_id(cls) -> str:
+        """Gera um ID único para o evento."""
+        timestamp = int(datetime.utcnow().timestamp() * 1000)
+        random_str = uuid.uuid4().hex[:8]
+        return f"af_{timestamp}_{random_str}"
+    
+    def to_dict(self, include_event_data: bool = True) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "event_id": self.event_id,
+            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
+            "bot_id": self.bot_id,
+            "fingerprint_hash": self.fingerprint_hash[:16] + "...",
+            "fingerprint_version": self.fingerprint_version,
+            "session_id": self.session_id,
+            "device_id": self.device_id,
+            "event_type": self.event_type.value,
+            "severity": self.severity.value,
+            "status": self.status.value,
+            "risk_score": self.risk_score,
+            "confidence_score": self.confidence_score,
+            "metadata": self.metadata,
+            "ip_address": self.ip_address,
+            "country_code": self.country_code,
+            "region": self.region,
+            "city": self.city,
+            "timezone": self.timezone,
+            "user_agent": self.user_agent,
+            "device_type": self.device_type,
+            "browser": self.browser,
+            "os": self.os,
+            "behavior_signature": self.behavior_signature,
+            "velocity_data": self.velocity_data,
+            "reviewed_by": self.reviewed_by,
+            "review_notes": self.review_notes,
+            "payment_intent_id": self.payment_intent_id,
+            "webhook_event_id": self.webhook_event_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "reviewed_at": self.reviewed_at.isoformat() if self.reviewed_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "is_resolved": self.is_resolved,
+            "is_blocked": self.is_blocked,
+            "requires_review": self.requires_review,
+            "days_since_creation": self.days_since_creation
+        }
+        
+        if include_event_data:
+            data["event_data"] = self.event_data
+        
+        return data
+    
+    @property
+    def is_resolved(self) -> bool:
+        """Verifica se o evento foi resolvido."""
+        return self.status in [
+            AntifraudStatus.APPROVED,
+            AntifraudStatus.REJECTED,
+            AntifraudStatus.BLOCKED,
+            AntifraudStatus.WHITELISTED,
+            AntifraudStatus.BLACKLISTED
+        ] or self.resolved_at is not None
+    
+    @property
+    def is_blocked(self) -> bool:
+        """Verifica se está bloqueado."""
+        return self.status == AntifraudStatus.BLOCKED
+    
+    @property
+    def requires_review(self) -> bool:
+        """Verifica se requer revisão manual."""
+        return (
+            self.status == AntifraudStatus.REVIEW or
+            self.severity in [AntifraudSeverity.HIGH, AntifraudSeverity.CRITICAL] or
+            self.risk_score > 70.0
+        )
+    
+    @property
+    def days_since_creation(self) -> int:
+        """Retorna dias desde a criação do evento."""
+        return (datetime.utcnow() - self.created_at).days
+    
+    def mark_for_review(self, reason: Optional[str] = None):
+        """Marca o evento para revisão manual."""
+        if self.is_resolved:
+            raise ValueError("Cannot mark resolved event for review")
+        
+        self.status = AntifraudStatus.REVIEW
+        self.updated_at = datetime.utcnow()
+        
+        if reason:
+            if "review_log" not in self.metadata:
+                self.metadata["review_log"] = []
+            
+            self.metadata["review_log"].append({
+                "marked_for_review_at": datetime.utcnow().isoformat(),
+                "reason": reason,
+                "status": "pending"
+            })
+    
+    def approve(self, approved_by: str, notes: Optional[str] = None):
+        """Aprova o evento (não é fraude)."""
+        if self.status not in [AntifraudStatus.PENDING, AntifraudStatus.REVIEW]:
+            raise ValueError(f"Cannot approve event with status {self.status}")
+        
+        self.status = AntifraudStatus.APPROVED
+        self.reviewed_by = approved_by
+        self.review_notes = notes
+        self.reviewed_at = datetime.utcnow()
+        self.resolved_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        # Log da aprovação
+        if "review_log" not in self.metadata:
+            self.metadata["review_log"] = []
+        
+        self.metadata["review_log"].append({
+            "reviewed_at": self.reviewed_at.isoformat(),
+            "reviewed_by": approved_by,
+            "action": "approved",
+            "notes": notes
+        })
+    
+    def reject(self, rejected_by: str, reason: str, notes: Optional[str] = None):
+        """Rejeita o evento (possível fraude)."""
+        if self.status not in [AntifraudStatus.PENDING, AntifraudStatus.REVIEW]:
+            raise ValueError(f"Cannot reject event with status {self.status}")
+        
+        self.status = AntifraudStatus.REJECTED
+        self.reviewed_by = rejected_by
+        self.review_notes = notes or reason
+        self.reviewed_at = datetime.utcnow()
+        self.resolved_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        # Log da rejeição
+        if "review_log" not in self.metadata:
+            self.metadata["review_log"] = []
+        
+        self.metadata["review_log"].append({
+            "reviewed_at": self.reviewed_at.isoformat(),
+            "reviewed_by": rejected_by,
+            "action": "rejected",
+            "reason": reason,
+            "notes": notes
+        })
+    
+    def block(self, blocked_by: str, reason: str, block_duration_hours: Optional[int] = None):
+        """Bloqueia o evento (fraude confirmada)."""
+        if self.is_resolved:
+            raise ValueError("Cannot block resolved event")
+        
+        self.status = AntifraudStatus.BLOCKED
+        self.reviewed_by = blocked_by
+        self.review_notes = reason
+        self.reviewed_at = datetime.utcnow()
+        self.resolved_at = datetime.utcnow()
+        
+        # Define expiração se for bloqueio temporário
+        if block_duration_hours:
+            self.expires_at = datetime.utcnow() + timedelta(hours=block_duration_hours)
+        
+        self.updated_at = datetime.utcnow()
+        
+        # Log do bloqueio
+        if "review_log" not in self.metadata:
+            self.metadata["review_log"] = []
+        
+        self.metadata["review_log"].append({
+            "reviewed_at": self.reviewed_at.isoformat(),
+            "reviewed_by": blocked_by,
+            "action": "blocked",
+            "reason": reason,
+            "block_duration_hours": block_duration_hours,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None
+        })
+    
+    def whitelist(self, whitelisted_by: str, reason: str, duration_days: Optional[int] = None):
+        """Adiciona à whitelist."""
+        if self.is_resolved:
+            raise ValueError("Cannot whitelist resolved event")
+        
+        self.status = AntifraudStatus.WHITELISTED
+        self.reviewed_by = whitelisted_by
+        self.review_notes = reason
+        self.reviewed_at = datetime.utcnow()
+        self.resolved_at = datetime.utcnow()
+        
+        # Define expiração se for whitelist temporária
+        if duration_days:
+            self.expires_at = datetime.utcnow() + timedelta(days=duration_days)
+        
+        self.updated_at = datetime.utcnow()
+        
+        # Log da whitelist
+        if "review_log" not in self.metadata:
+            self.metadata["review_log"] = []
+        
+        self.metadata["review_log"].append({
+            "reviewed_at": self.reviewed_at.isoformat(),
+            "reviewed_by": whitelisted_by,
+            "action": "whitelisted",
+            "reason": reason,
+            "duration_days": duration_days,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None
+        })
+    
+    def blacklist(self, blacklisted_by: str, reason: str):
+        """Adiciona à blacklist (permanente)."""
+        if self.is_resolved:
+            raise ValueError("Cannot blacklist resolved event")
+        
+        self.status = AntifraudStatus.BLACKLISTED
+        self.reviewed_by = blacklisted_by
+        self.review_notes = reason
+        self.reviewed_at = datetime.utcnow()
+        self.resolved_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        # Log da blacklist
+        if "review_log" not in self.metadata:
+            self.metadata["review_log"] = []
+        
+        self.metadata["review_log"].append({
+            "reviewed_at": self.reviewed_at.isoformat(),
+            "reviewed_by": blacklisted_by,
+            "action": "blacklisted",
+            "reason": reason,
+            "permanent": True
+        })
+    
+    def update_risk_score(self, new_score: float, reason: Optional[str] = None):
+        """Atualiza o score de risco."""
+        if not 0.0 <= new_score <= 100.0:
+            raise ValueError("Risk score must be between 0.0 and 100.0")
+        
+        old_score = self.risk_score
+        self.risk_score = new_score
+        self.updated_at = datetime.utcnow()
+        
+        # Log da mudança de score
+        if "risk_score_history" not in self.metadata:
+            self.metadata["risk_score_history"] = []
+        
+        self.metadata["risk_score_history"].append({
+            "old_score": old_score,
+            "new_score": new_score,
+            "reason": reason,
+            "updated_at": datetime.utcnow().isoformat()
+        })
+        
+        # Atualiza severidade baseado no score
+        if new_score >= 90.0:
+            self.severity = AntifraudSeverity.CRITICAL
+        elif new_score >= 70.0:
+            self.severity = AntifraudSeverity.HIGH
+        elif new_score >= 40.0:
+            self.severity = AntifraudSeverity.MEDIUM
+        else:
+            self.severity = AntifraudSeverity.LOW
+    
+    def add_behavior_data(self, behavior_type: str, data: Dict[str, Any]):
+        """Adiciona dados de comportamento."""
+        if "behavior_data" not in self.metadata:
+            self.metadata["behavior_data"] = {}
+        
+        if behavior_type not in self.metadata["behavior_data"]:
+            self.metadata["behavior_data"][behavior_type] = []
+        
+        self.metadata["behavior_data"][behavior_type].append({
+            "timestamp": datetime.utcnow().isoformat(),
+            "data": data
+        })
+        
+        self.updated_at = datetime.utcnow()
+    
+    def calculate_velocity_metrics(self, time_window_minutes: int = 5) -> Dict[str, Any]:
+        """Calcula métricas de velocidade (comportamento por tempo)."""
+        # Em produção, isso consultaria eventos recentes com o mesmo fingerprint
+        # Esta é uma implementação simplificada
+        
+        now = datetime.utcnow()
+        time_window = timedelta(minutes=time_window_minutes)
+        
+        # Em produção, seria uma query:
+        # similar_events = session.query(AntifraudEvent).filter(
+        #     AntifraudEvent.fingerprint_hash == self.fingerprint_hash,
+        #     AntifraudEvent.created_at >= now - time_window
+        # ).all()
+        
+        similar_events = []  # Placeholder
+        
+        event_types = {}
+        for event in similar_events:
+            event_type = event.event_type.value
+            event_types[event_type] = event_types.get(event_type, 0) + 1
+        
+        self.velocity_data = {
+            "time_window_minutes": time_window_minutes,
+            "total_events": len(similar_events),
+            "events_per_type": event_types,
+            "calculated_at": now.isoformat()
+        }
+        
+        self.updated_at = now
+        
+        return self.velocity_data
+    
+    def get_related_events(self, hours: int = 24, limit: int = 100) -> List["AntifraudEvent"]:
+        """Obtém eventos relacionados (mesmo fingerprint ou usuário)."""
+        # Em produção, seria uma query
+        # Esta é uma implementação simplificada
+        return []
+
+
+class AntifraudRule(Base):
+    """
+    Regra de antifraude - define condições para detecção automática.
+    """
+    
+    __tablename__ = "antifraud_rules"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    rule_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # rule_xxx
+    tenant_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.tenants.id"), index=True)  # None = global
+    
+    # Configuração da regra
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    
+    # Condições
+    condition_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # behavioral, payment, geographic, etc.
+    conditions: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Ações
+    action: Mapped[str] = mapped_column(String(50), nullable=False)  # block, review, whitelist, blacklist, score_adjustment
+    action_params: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Severidade e scoring
+    severity: Mapped[AntifraudSeverity] = mapped_column(Enum(AntifraudSeverity), nullable=False, default=AntifraudSeverity.MEDIUM)
+    risk_score_adjustment: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # Pode ser negativo
+    
+    # Controle
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    is_global: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # Aplica a todos os tenants
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # Maior prioridade = executada primeiro
+    
+    # Validade
+    valid_from: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    valid_until: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Estatísticas
+    times_triggered: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_triggered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relacionamentos
+    tenant: Mapped[Optional["Tenant"]] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_antifraud_rules_active_priority', 'is_active', 'priority', 'created_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<AntifraudRule(id='{self.id}', rule_id='{self.rule_id}', name='{self.name}', is_active={self.is_active})>"
+    
+    @property
+    def is_valid(self) -> bool:
+        """Verifica se a regra está válida."""
+        if not self.is_active:
+            return False
+        
+        now = datetime.utcnow()
+        
+        if self.valid_from and now < self.valid_from:
+            return False
+        
+        if self.valid_until and now > self.valid_until:
+            return False
+        
+        return True
+    
+    def evaluate(self, event_data: Dict[str, Any]) -> bool:
+        """Avalia se a regra deve ser acionada para os dados do evento."""
+        if not self.is_valid:
+            return False
+        
+        # Implementação simplificada da lógica de avaliação
+        # Em produção, seria um engine mais complexo
+        
+        condition_type = self.condition_type
+        
+        if condition_type == "behavioral":
+            return self._evaluate_behavioral_conditions(event_data)
+        elif condition_type == "payment":
+            return self._evaluate_payment_conditions(event_data)
+        elif condition_type == "geographic":
+            return self._evaluate_geographic_conditions(event_data)
+        elif condition_type == "velocity":
+            return self._evaluate_velocity_conditions(event_data)
+        
+        return False
+    
+    def _evaluate_behavioral_conditions(self, event_data: Dict[str, Any]) -> bool:
+        """Avalia condições comportamentais."""
+        # Implementação simplificada
+        conditions = self.conditions.get("behavioral", {})
+        
+        # Exemplo: Verifica se há muitos eventos em pouco tempo
+        max_events = conditions.get("max_events_per_hour")
+        if max_events and event_data.get("event_count", 0) > max_events:
+            return True
+        
+        return False
+    
+    def _evaluate_payment_conditions(self, event_data: Dict[str, Any]) -> bool:
+        """Avalia condições de pagamento."""
+        conditions = self.conditions.get("payment", {})
+        
+        # Exemplo: Verifica se há tentativas de pagamento com valores suspeitos
+        min_amount = conditions.get("min_amount_suspicious")
+        if min_amount and event_data.get("payment_amount", 0) > min_amount:
+            return True
+        
+        return False
+    
+    def _evaluate_geographic_conditions(self, event_data: Dict[str, Any]) -> bool:
+        """Avalia condições geográficas."""
+        conditions = self.conditions.get("geographic", {})
+        
+        # Exemplo: Verifica se o país está na blacklist
+        blacklisted_countries = conditions.get("blacklisted_countries", [])
+        if event_data.get("country_code") in blacklisted_countries:
+            return True
+        
+        return False
+    
+    def _evaluate_velocity_conditions(self, event_data: Dict[str, Any]) -> bool:
+        """Avalia condições de velocidade."""
+        conditions = self.conditions.get("velocity", {})
+        
+        # Exemplo: Verifica se há muitas ações por minuto
+        max_actions_per_minute = conditions.get("max_actions_per_minute")
+        if max_actions_per_minute and event_data.get("actions_per_minute", 0) > max_actions_per_minute:
+            return True
+        
+        return False
+    
+    def trigger(self, event: AntifraudEvent):
+        """Aciona a regra para um evento."""
+        self.times_triggered += 1
+        self.last_triggered_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+        
+        # Aplica ação
+        if self.action == "block":
+            event.block(
+                blocked_by=f"rule:{self.rule_id}",
+                reason=self.action_params.get("reason", "Triggered by antifraud rule"),
+                block_duration_hours=self.action_params.get("block_duration_hours")
+            )
+        
+        elif self.action == "review":
+            event.mark_for_review(
+                reason=self.action_params.get("reason", "Triggered by antifraud rule")
+            )
+        
+        elif self.action == "score_adjustment":
+            adjustment = self.risk_score_adjustment
+            if adjustment != 0:
+                new_score = min(100.0, max(0.0, event.risk_score + adjustment))
+                event.update_risk_score(
+                    new_score,
+                    reason=f"Adjusted by rule {self.rule_id}: {adjustment:+.1f}"
+                )
+        
+        # Log do trigger
+        if "trigger_history" not in self.metadata:
+            self.metadata["trigger_history"] = []
+        
+        self.metadata["trigger_history"].append({
+            "triggered_at": self.last_triggered_at.isoformat(),
+            "event_id": event.event_id,
+            "fingerprint_hash": event.fingerprint_hash,
+            "action": self.action,
+            "risk_score_adjustment": self.risk_score_adjustment if self.action == "score_adjustment" else None
+        })
+
+
+# Adiciona as relações de volta nos modelos relacionados
+Tenant.antifraud_events = relationship("AntifraudEvent", back_populates="tenant", cascade="all, delete-orphan")
+User.antifraud_events = relationship("AntifraudEvent", back_populates="user", cascade="all, delete-orphan")
+Bot.antifraud_events = relationship("AntifraudEvent", back_populates="bot", cascade="all, delete-orphan")

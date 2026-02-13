@@ -1,0 +1,566 @@
+# app/models/payment_intent.py
+"""
+Modelo de PaymentIntent - Intenção de pagamento imutável.
+Contrato interno entre oferta, usuário e provider de pagamento.
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text, Enum
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+import enum
+
+from app.database import Base
+from app.core.geo_resolver import GeoRegion
+
+
+class PaymentIntentStatus(enum.Enum):
+    """Status do Payment Intent."""
+    PENDING = "pending"                     # Criado, aguardando ação
+    AWAITING_PAYMENT = "awaiting_payment"   # Instruções exibidas, aguardando pagamento
+    PROCESSING = "processing"               # Pagamento em processamento pelo provider
+    PAID = "paid"                          # Pagamento confirmado
+    EXPIRED = "expired"                    # Tempo esgotado
+    FAILED = "failed"                      # Falha no pagamento
+    CANCELLED = "cancelled"                # Cancelado pelo usuário
+    REFUNDED = "refunded"                  # Reembolsado
+    CHARGEBACK = "chargeback"              # Chargeback/disputa
+
+
+class PaymentRail(enum.Enum):
+    """Rail de pagamento (abstração)."""
+    PIX_STATIC = "pix_static"
+    PIX_DYNAMIC = "pix_dynamic"
+    CARD_BRL = "card_brl"
+    MBWAY = "mbway"
+    SEPA_INSTANT = "sepa_instant"
+    CARD_EUR = "card_eur"
+    CASH_APP = "cash_app"
+    PAYPAL = "paypal"
+    CARD_USD = "card_usd"
+    P2P_US = "p2p_us"
+    WALLET_GLOBAL = "wallet_global"
+    CRYPTO = "crypto"
+
+
+class PaymentMethod(enum.Enum):
+    """Método de pagamento específico."""
+    # Brasil
+    PIX = "pix"
+    CREDIT_CARD = "credit_card"
+    DEBIT_CARD = "debit_card"
+    
+    # Europa
+    MBWAY_TRANSFER = "mbway_transfer"
+    SEPA_DIRECT_DEBIT = "sepa_direct_debit"
+    
+    # EUA
+    CASH_APP_TRANSFER = "cash_app_transfer"
+    PAYPAL_CHECKOUT = "paypal_checkout"
+    ZELLE = "zelle"
+    VENMO = "venmo"
+    
+    # Global
+    APPLE_PAY = "apple_pay"
+    GOOGLE_PAY = "google_pay"
+    USDT = "usdt"
+    BTC = "btc"
+
+
+class PaymentIntent(Base):
+    """
+    Intenção de pagamento - contrato interno imutável.
+    
+    Princípios:
+    1. Imutabilidade: Dados fundamentais não podem mudar após criação
+    2. Idempotência: Chave de idempotência previne duplicatas
+    3. Isolamento por tenant
+    4. Fonte da verdade para webhooks
+    5. Rastreamento completo do ciclo de vida
+    """
+    
+    __tablename__ = "payment_intents"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    intent_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)  # ID público: pi_xxx
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Entidades envolvidas
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.users.id"), nullable=False, index=True)
+    bot_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.bots.id"), nullable=False, index=True)
+    offer_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.offers.id"), nullable=False, index=True)
+    
+    # Dados do pagamento (imutáveis após criação)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)  # Valor exato
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)  # Moeda da oferta
+    
+    # Região operacional (para filtro de métodos)
+    region: Mapped[str] = mapped_column(String(20), nullable=False)  # BR, EU, US, etc.
+    
+    # Método de pagamento
+    payment_rail: Mapped[PaymentRail] = mapped_column(Enum(PaymentRail), nullable=False)
+    payment_method: Mapped[PaymentMethod] = mapped_column(Enum(PaymentMethod), nullable=False)
+    
+    # Provider selecionado
+    provider_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # ID do provider
+    provider_transaction_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)  # ID no provider
+    
+    # Status e ciclo de vida
+    status: Mapped[PaymentIntentStatus] = mapped_column(Enum(PaymentIntentStatus), nullable=False, default=PaymentIntentStatus.PENDING)
+    previous_status: Mapped[Optional[str]] = mapped_column(String(50))
+    
+    # Idempotência e antifraude
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    fingerprint_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    antifraud_score: Mapped[Optional[float]] = mapped_column(Float)
+    
+    # Dados do provider (armazenados após criação)
+    provider_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Dados do provider (código pix, link, etc.)
+    provider_metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Metadados do provider
+    
+    # Webhook data
+    webhook_data: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB)  # Dados brutos do webhook
+    webhook_received_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    webhook_signature: Mapped[Optional[str]] = mapped_column(String(512))  # Assinatura do webhook
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # Para rastreamento cross-system
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)  # Expiração
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="payment_intents")
+    user: Mapped["User"] = relationship(back_populates="payment_intents")
+    bot: Mapped["Bot"] = relationship(back_populates="payment_intents")
+    offer: Mapped["Offer"] = relationship(back_populates="payment_intents")
+    invoice: Mapped[Optional["Invoice"]] = relationship(back_populates="payment_intent", uselist=False)
+    subscription: Mapped[Optional["Subscription"]] = relationship(back_populates="payment_intent", uselist=False)
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="payment_intent", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_payment_intents_tenant_status', 'tenant_id', 'status'),
+        Index('ix_payment_intents_user_status', 'user_id', 'status'),
+        Index('ix_payment_intents_expires_status', 'expires_at', 'status'),
+        Index('ix_payment_intents_created', 'created_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<PaymentIntent(id='{self.id}', intent_id='{self.intent_id}', amount={self.amount} {self.currency}, status='{self.status.value}')>"
+    
+    def to_dict(self, include_provider_data: bool = False) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "intent_id": self.intent_id,
+            "tenant_id": self.tenant_id,
+            "user_id": self.user_id,
+            "bot_id": self.bot_id,
+            "offer_id": self.offer_id,
+            "amount": self.amount,
+            "currency": self.currency,
+            "region": self.region,
+            "payment_rail": self.payment_rail.value,
+            "payment_method": self.payment_method.value,
+            "provider_id": self.provider_id,
+            "provider_transaction_id": self.provider_transaction_id,
+            "status": self.status.value,
+            "previous_status": self.previous_status,
+            "fingerprint_hash": self.fingerprint_hash[:16] + "...",
+            "antifraud_score": self.antifraud_score,
+            "metadata": self.metadata,
+            "correlation_id": self.correlation_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "paid_at": self.paid_at.isoformat() if self.paid_at else None,
+            "failed_at": self.failed_at.isoformat() if self.failed_at else None,
+            "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None,
+            "refunded_at": self.refunded_at.isoformat() if self.refunded_at else None,
+            "is_expired": self.is_expired,
+            "is_paid": self.is_paid,
+            "is_failed": self.is_failed,
+            "time_remaining_seconds": self.time_remaining_seconds
+        }
+        
+        if include_provider_data:
+            data.update({
+                "provider_data": self.provider_data,
+                "provider_metadata": self.provider_metadata,
+                "webhook_received_at": self.webhook_received_at.isoformat() if self.webhook_received_at else None,
+                "webhook_signature": self.webhook_signature
+            })
+        
+        return data
+    
+    @property
+    def is_expired(self) -> bool:
+        """Verifica se o intent expirou."""
+        if self.status == PaymentIntentStatus.EXPIRED:
+            return True
+        
+        now = datetime.utcnow()
+        return now > self.expires_at and self.status not in [
+            PaymentIntentStatus.PAID,
+            PaymentIntentStatus.REFUNDED,
+            PaymentIntentStatus.CHARGEBACK
+        ]
+    
+    @property
+    def is_paid(self) -> bool:
+        """Verifica se o pagamento foi confirmado."""
+        return self.status in [
+            PaymentIntentStatus.PAID,
+            PaymentIntentStatus.REFUNDED,  # Foi pago, depois reembolsado
+            PaymentIntentStatus.CHARGEBACK  # Foi pago, depois chargeback
+        ]
+    
+    @property
+    def is_failed(self) -> bool:
+        """Verifica se o pagamento falhou."""
+        return self.status in [
+            PaymentIntentStatus.FAILED,
+            PaymentIntentStatus.EXPIRED,
+            PaymentIntentStatus.CANCELLED
+        ]
+    
+    @property
+    def time_remaining_seconds(self) -> int:
+        """Retorna segundos restantes até a expiração."""
+        if self.is_paid or self.is_failed:
+            return 0
+        
+        now = datetime.utcnow()
+        if now > self.expires_at:
+            return 0
+        
+        return int((self.expires_at - now).total_seconds())
+    
+    @property
+    def requires_action(self) -> bool:
+        """Verifica se o intent requer ação do usuário."""
+        return self.status in [
+            PaymentIntentStatus.PENDING,
+            PaymentIntentStatus.AWAITING_PAYMENT,
+            PaymentIntentStatus.PROCESSING
+        ] and not self.is_expired
+    
+    def update_status(self, new_status: PaymentIntentStatus, reason: Optional[str] = None) -> bool:
+        """
+        Atualiza o status do intent de forma controlada.
+        
+        Retorna:
+            bool: True se a transição for válida e aplicada
+        """
+        # Transições permitidas
+        valid_transitions = {
+            PaymentIntentStatus.PENDING: [
+                PaymentIntentStatus.AWAITING_PAYMENT,
+                PaymentIntentStatus.PROCESSING,
+                PaymentIntentStatus.CANCELLED,
+                PaymentIntentStatus.EXPIRED,
+                PaymentIntentStatus.FAILED
+            ],
+            PaymentIntentStatus.AWAITING_PAYMENT: [
+                PaymentIntentStatus.PROCESSING,
+                PaymentIntentStatus.PAID,
+                PaymentIntentStatus.CANCELLED,
+                PaymentIntentStatus.EXPIRED,
+                PaymentIntentStatus.FAILED
+            ],
+            PaymentIntentStatus.PROCESSING: [
+                PaymentIntentStatus.PAID,
+                PaymentIntentStatus.FAILED,
+                PaymentIntentStatus.CANCELLED
+            ],
+            PaymentIntentStatus.PAID: [
+                PaymentIntentStatus.REFUNDED,
+                PaymentIntentStatus.CHARGEBACK
+            ],
+            PaymentIntentStatus.FAILED: [],  # Estado terminal
+            PaymentIntentStatus.EXPIRED: [],  # Estado terminal
+            PaymentIntentStatus.CANCELLED: [],  # Estado terminal
+            PaymentIntentStatus.REFUNDED: [],  # Estado terminal
+            PaymentIntentStatus.CHARGEBACK: []  # Estado terminal
+        }
+        
+        current_status = self.status
+        
+        # Verifica se a transição é válida
+        if new_status not in valid_transitions.get(current_status, []):
+            return False
+        
+        # Atualiza status
+        self.previous_status = current_status.value
+        self.status = new_status
+        
+        # Atualiza timestamps específicos
+        now = datetime.utcnow()
+        self.updated_at = now
+        
+        if new_status == PaymentIntentStatus.PAID:
+            self.paid_at = now
+        elif new_status == PaymentIntentStatus.FAILED:
+            self.failed_at = now
+        elif new_status == PaymentIntentStatus.CANCELLED:
+            self.cancelled_at = now
+        elif new_status == PaymentIntentStatus.REFUNDED:
+            self.refunded_at = now
+        elif new_status == PaymentIntentStatus.EXPIRED:
+            # Garante que expires_at está no passado
+            if now > self.expires_at:
+                self.expires_at = now
+        
+        # Adiciona motivo ao metadata se fornecido
+        if reason:
+            if "status_change_log" not in self.metadata:
+                self.metadata["status_change_log"] = []
+            
+            self.metadata["status_change_log"].append({
+                "from": current_status.value,
+                "to": new_status.value,
+                "reason": reason,
+                "timestamp": now.isoformat()
+            })
+        
+        return True
+    
+    def mark_as_paid(
+        self,
+        provider_transaction_id: str,
+        webhook_data: Optional[Dict[str, Any]] = None,
+        webhook_signature: Optional[str] = None
+    ) -> bool:
+        """
+        Marca o intent como pago.
+        
+        Fluxo completo para confirmação via webhook.
+        """
+        success = self.update_status(PaymentIntentStatus.PAID, reason="webhook_confirmation")
+        
+        if success:
+            self.provider_transaction_id = provider_transaction_id
+            self.webhook_data = webhook_data
+            self.webhook_signature = webhook_signature
+            self.webhook_received_at = datetime.utcnow()
+            
+            # Adiciona dados do webhook ao metadata
+            if webhook_data:
+                self.metadata["last_webhook"] = {
+                    "received_at": self.webhook_received_at.isoformat(),
+                    "data_summary": {k: v for k, v in webhook_data.items() if not isinstance(v, dict) or k == "metadata"}
+                }
+        
+        return success
+    
+    def mark_as_failed(self, error_reason: str, provider_error_code: Optional[str] = None) -> bool:
+        """Marca o intent como falhado."""
+        success = self.update_status(PaymentIntentStatus.FAILED, reason=error_reason)
+        
+        if success and provider_error_code:
+            self.metadata["provider_error_code"] = provider_error_code
+        
+        return success
+    
+    def mark_as_expired(self) -> bool:
+        """Marca o intent como expirado."""
+        return self.update_status(PaymentIntentStatus.EXPIRED, reason="timeout")
+    
+    def mark_as_cancelled(self, reason: str = "user_cancelled") -> bool:
+        """Marca o intent como cancelado."""
+        return self.update_status(PaymentIntentStatus.CANCELLED, reason=reason)
+    
+    def mark_as_refunded(self, refund_reason: str, refund_amount: Optional[float] = None) -> bool:
+        """Marca o intent como reembolsado."""
+        success = self.update_status(PaymentIntentStatus.REFUNDED, reason=refund_reason)
+        
+        if success:
+            refund_data = {
+                "reason": refund_reason,
+                "refunded_at": datetime.utcnow().isoformat(),
+                "refunded_by": "system"  # Em produção, seria user_id do admin
+            }
+            
+            if refund_amount:
+                refund_data["amount"] = refund_amount
+                refund_data["currency"] = self.currency
+            
+            if "refunds" not in self.metadata:
+                self.metadata["refunds"] = []
+            
+            self.metadata["refunds"].append(refund_data)
+        
+        return success
+    
+    def mark_as_chargeback(self, chargeback_reason: str) -> bool:
+        """Marca o intent como chargeback."""
+        return self.update_status(PaymentIntentStatus.CHARGEBACK, reason=chargeback_reason)
+    
+    def update_provider_data(self, provider_data: Dict[str, Any]):
+        """Atualiza dados do provider (código pix, link, etc.)."""
+        self.provider_data = provider_data
+        self.updated_at = datetime.utcnow()
+    
+    def extend_expiration(self, additional_minutes: int = 5):
+        """Estende o tempo de expiração."""
+        self.expires_at = self.expires_at + timedelta(minutes=additional_minutes)
+        self.updated_at = datetime.utcnow()
+    
+    def get_provider_payment_instructions(self) -> Dict[str, Any]:
+        """Retorna instruções de pagamento para o usuário."""
+        instructions = {
+            "intent_id": self.intent_id,
+            "amount": self.amount,
+            "currency": self.currency,
+            "expires_at": self.expires_at.isoformat(),
+            "time_remaining_seconds": self.time_remaining_seconds,
+            "payment_method": self.payment_method.value,
+            "status": self.status.value
+        }
+        
+        # Adiciona instruções específicas do provider
+        if self.payment_method == PaymentMethod.PIX:
+            instructions.update({
+                "type": "pix",
+                "code": self.provider_data.get("code"),
+                "qr_code": self.provider_data.get("qr_code"),
+                "instructions": "Copie e cole o código no app do seu banco"
+            })
+        
+        elif self.payment_method == PaymentMethod.MBWAY_TRANSFER:
+            instructions.update({
+                "type": "mbway",
+                "reference": self.provider_data.get("reference"),
+                "phone_hint": self.provider_data.get("phone_hint", "+351"),
+                "instructions": "Use a referência no app MB Way"
+            })
+        
+        elif self.payment_method in [PaymentMethod.CASH_APP_TRANSFER, PaymentMethod.PAYPAL_CHECKOUT]:
+            instructions.update({
+                "type": "payment_link",
+                "url": self.provider_data.get("url"),
+                "instructions": "Clique no link para finalizar o pagamento"
+            })
+        
+        elif self.payment_method in [PaymentMethod.CREDIT_CARD, PaymentMethod.DEBIT_CARD]:
+            instructions.update({
+                "type": "checkout",
+                "url": self.provider_data.get("checkout_url"),
+                "instructions": "Preencha os dados do cartão no checkout seguro"
+            })
+        
+        return instructions
+    
+    def can_retry(self) -> bool:
+        """Verifica se o pagamento pode ser retentado."""
+        return self.status in [
+            PaymentIntentStatus.FAILED,
+            PaymentIntentStatus.EXPIRED,
+            PaymentIntentStatus.CANCELLED
+        ] and not self.is_paid
+    
+    def create_retry_intent(self) -> "PaymentIntent":
+        """Cria um novo intent para retentativa."""
+        if not self.can_retry():
+            raise ValueError("Cannot retry this payment intent")
+        
+        # Gera novo intent_id com sufixo de retry
+        base_intent_id = self.intent_id.rsplit("_retry", 1)[0]
+        retry_count = len([log for log in self.metadata.get("retry_log", [])])
+        new_intent_id = f"{base_intent_id}_retry{retry_count + 1}"
+        
+        # Cria novo intent
+        new_intent = PaymentIntent(
+            intent_id=new_intent_id,
+            tenant_id=self.tenant_id,
+            user_id=self.user_id,
+            bot_id=self.bot_id,
+            offer_id=self.offer_id,
+            amount=self.amount,
+            currency=self.currency,
+            region=self.region,
+            payment_rail=self.payment_rail,
+            payment_method=self.payment_method,
+            provider_id=self.provider_id,
+            fingerprint_hash=self.fingerprint_hash,
+            antifraud_score=self.antifraud_score,
+            metadata={
+                **self.metadata,
+                "parent_intent_id": self.intent_id,
+                "retry_count": retry_count + 1,
+                "created_at": datetime.utcnow().isoformat()
+            },
+            correlation_id=self.correlation_id,
+            expires_at=datetime.utcnow() + timedelta(minutes=15)
+        )
+        
+        # Atualiza log de retentativas no intent original
+        if "retry_log" not in self.metadata:
+            self.metadata["retry_log"] = []
+        
+        self.metadata["retry_log"].append({
+            "retry_intent_id": new_intent_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "reason": "user_retry"
+        })
+        
+        self.updated_at = datetime.utcnow()
+        
+        return new_intent
+
+
+class PaymentIntentEvent(Base):
+    """
+    Eventos do ciclo de vida do Payment Intent.
+    Para auditoria detalhada e replay de eventos.
+    """
+    
+    __tablename__ = "payment_intent_events"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    intent_id: Mapped[str] = mapped_column(String(50), ForeignKey("saas.payment_intents.intent_id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Evento
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # created, status_changed, webhook_received, etc.
+    event_data: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Contexto
+    actor_id: Mapped[Optional[str]] = mapped_column(String(100))  # user_id, system, provider_id
+    actor_type: Mapped[Optional[str]] = mapped_column(String(50))  # user, system, provider
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    
+    # Relacionamentos
+    intent: Mapped["PaymentIntent"] = relationship(back_populates="events")
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_payment_intent_events_intent_type', 'intent_id', 'event_type'),
+        Index('ix_payment_intent_events_created', 'created_at'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<PaymentIntentEvent(intent_id='{self.intent_id}', event_type='{self.event_type}', created_at='{self.created_at}')>"
+
+
+# Adiciona a relação de volta no PaymentIntent
+PaymentIntent.events = relationship("PaymentIntentEvent", back_populates="intent", cascade="all, delete-orphan")

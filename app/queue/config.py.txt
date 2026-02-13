@@ -1,0 +1,197 @@
+"""
+Configuração do sistema de filas.
+Suporta múltiplos backends (Redis, RabbitMQ, SQS) com fallback.
+"""
+
+import os
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Any
+
+from pydantic import BaseSettings, Field, validator
+
+
+class QueueBackend(Enum):
+    """Backends suportados para filas"""
+    REDIS = "redis"
+    RABBITMQ = "rabbitmq"
+    SQS = "sqs"
+    MEMORY = "memory"  # Apenas para desenvolvimento/testes
+
+
+class QueueMode(Enum):
+    """Modos de operação da fila"""
+    STANDARD = "standard"
+    FIFO = "fifo"
+    DELAYED = "delayed"
+
+
+@dataclass
+class QueueConfig:
+    """Configuração de uma fila específica"""
+    name: str
+    backend: QueueBackend = QueueBackend.REDIS
+    mode: QueueMode = QueueMode.STANDARD
+    max_retries: int = 3
+    retry_delays: List[int] = field(default_factory=lambda: [1, 5, 30, 60])
+    visibility_timeout: int = 300  # 5 minutos
+    dead_letter_queue: Optional[str] = None
+    priority: int = 0
+    tenant_isolation: bool = True
+    
+    # Configurações específicas por backend
+    backend_config: Dict[str, Any] = field(default_factory=dict)
+    
+    def get_queue_name(self, tenant_id: Optional[str] = None) -> str:
+        """Retorna o nome completo da fila com isolamento de tenant"""
+        if tenant_id and self.tenant_isolation:
+            return f"tenant_{tenant_id}_{self.name}"
+        return self.name
+    
+    def get_dead_letter_queue_name(self, tenant_id: Optional[str] = None) -> Optional[str]:
+        """Retorna o nome da dead letter queue"""
+        if not self.dead_letter_queue:
+            return None
+        if tenant_id and self.tenant_isolation:
+            return f"tenant_{tenant_id}_{self.dead_letter_queue}"
+        return self.dead_letter_queue
+
+
+class QueueSystemSettings(BaseSettings):
+    """Configurações do sistema de filas"""
+    
+    # Backend padrão
+    default_backend: QueueBackend = Field(
+        default=QueueBackend.REDIS,
+        env="QUEUE_BACKEND"
+    )
+    
+    # Configurações Redis
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        env="REDIS_URL"
+    )
+    redis_max_connections: int = Field(
+        default=50,
+        env="REDIS_MAX_CONNECTIONS"
+    )
+    
+    # Configurações RabbitMQ
+    rabbitmq_url: str = Field(
+        default="amqp://guest:guest@localhost:5672/",
+        env="RABBITMQ_URL"
+    )
+    
+    # Configurações AWS SQS
+    aws_region: str = Field(
+        default="us-east-1",
+        env="AWS_REGION"
+    )
+    aws_access_key_id: Optional[str] = Field(
+        default=None,
+        env="AWS_ACCESS_KEY_ID"
+    )
+    aws_secret_access_key: Optional[str] = Field(
+        default=None,
+        env="AWS_SECRET_ACCESS_KEY"
+    )
+    
+    # Configurações gerais
+    default_visibility_timeout: int = Field(
+        default=300,
+        env="QUEUE_VISIBILITY_TIMEOUT"
+    )
+    default_max_retries: int = Field(
+        default=3,
+        env="QUEUE_MAX_RETRIES"
+    )
+    enable_dead_letter_queue: bool = Field(
+        default=True,
+        env="QUEUE_ENABLE_DLQ"
+    )
+    
+    # Configurações de performance
+    worker_concurrency: int = Field(
+        default=10,
+        env="QUEUE_WORKER_CONCURRENCY"
+    )
+    poll_interval: float = Field(
+        default=0.1,
+        env="QUEUE_POLL_INTERVAL"
+    )
+    
+    # Configurações específicas por fila
+    queue_configs: Dict[str, Dict[str, Any]] = Field(
+        default_factory=lambda: {
+            "payment_webhook": {
+                "mode": "fifo",
+                "max_retries": 5,
+                "priority": 0,
+                "visibility_timeout": 600
+            },
+            "notification": {
+                "mode": "standard",
+                "max_retries": 3,
+                "priority": 1
+            },
+            "audit": {
+                "mode": "standard",
+                "max_retries": 1,
+                "priority": 2
+            },
+            "cleanup": {
+                "mode": "delayed",
+                "max_retries": 0,
+                "priority": 3
+            }
+        }
+    )
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+    
+    @validator("queue_configs", pre=True)
+    def parse_queue_configs(cls, v):
+        """Parse configurações de fila"""
+        if isinstance(v, str):
+            import json
+            v = json.loads(v)
+        return v
+    
+    def get_queue_config(self, queue_name: str) -> QueueConfig:
+        """Obtém configuração específica para uma fila"""
+        config_data = self.queue_configs.get(queue_name, {})
+        
+        return QueueConfig(
+            name=queue_name,
+            backend=self.default_backend,
+            mode=QueueMode(config_data.get("mode", "standard")),
+            max_retries=config_data.get("max_retries", self.default_max_retries),
+            retry_delays=[1, 5, 30, 60],
+            visibility_timeout=config_data.get(
+                "visibility_timeout", 
+                self.default_visibility_timeout
+            ),
+            dead_letter_queue=f"{queue_name}_dlq" if self.enable_dead_letter_queue else None,
+            priority=config_data.get("priority", 0),
+            tenant_isolation=True
+        )
+
+
+# Instância singleton das configurações
+_queue_settings: Optional[QueueSystemSettings] = None
+
+
+def get_queue_settings() -> QueueSystemSettings:
+    """Retorna as configurações do sistema de filas"""
+    global _queue_settings
+    if _queue_settings is None:
+        _queue_settings = QueueSystemSettings()
+    return _queue_settings
+
+
+def get_queue_config(queue_name: str) -> QueueConfig:
+    """Retorna configuração para uma fila específica"""
+    settings = get_queue_settings()
+    return settings.get_queue_config(queue_name)

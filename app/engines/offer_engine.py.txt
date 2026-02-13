@@ -1,0 +1,1288 @@
+"""
+Offer Engine - Motor de ofertas dinâmicas para upsell, downsell, reoferta.
+Gerencia fluxos de oferta ilimitados, multi-bot, multi-moeda com controle de estado.
+"""
+
+from datetime import datetime, timedelta
+from decimal import Decimal
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Any, Set
+from dataclasses import dataclass, field
+import asyncio
+import json
+import uuid
+from collections import defaultdict
+
+from app.core.state_machine import StateMachine, StateTransitionError
+from app.core.audit_logger import AuditLogger
+from app.core.geo_resolver import Region
+from app.core.plan_catalog import PlanCatalog, PlanVersion, BillingCycle
+
+
+class OfferType(Enum):
+    """Tipos de oferta."""
+    MAIN = "main"           # Oferta principal
+    UPSELL = "upsell"       # Upgrade após sucesso
+    DOWNSELL = "downsell"   # Alternativa após recusa
+    CROSS_SELL = "cross_sell"  # Produto complementar
+    RE_OFFER = "re_offer"   # Reoferta após timeout
+    TRIAL = "trial"         # Oferta de teste
+    BUNDLE = "bundle"       # Pacote
+
+
+class OfferTrigger(Enum):
+    """Gatilhos para transição de oferta."""
+    PAYMENT_SUCCESS = "payment_success"
+    PAYMENT_FAILED = "payment_failed"
+    USER_REFUSED = "user_refused"
+    TIMEOUT = "timeout"
+    MANUAL = "manual"
+    SCHEDULED = "scheduled"
+    USER_REQUEST = "user_request"
+
+
+class OfferStatus(Enum):
+    """Status de uma oferta."""
+    ACTIVE = "active"
+    PAUSED = "paused"
+    SCHEDULED = "scheduled"
+    EXPIRED = "expired"
+    ARCHIVED = "archived"
+
+
+@dataclass
+class OfferPrice:
+    """Preço de uma oferta com multi-moeda."""
+    currency: str  # ISO 4217
+    amount: Decimal
+    discounted_amount: Optional[Decimal] = None
+    setup_fee: Decimal = Decimal("0.00")
+    is_recurring: bool = False
+    billing_cycle: Optional[BillingCycle] = None
+    
+    @property
+    def final_amount(self) -> Decimal:
+        """Retorna o valor final (com desconto se aplicável)."""
+        return self.discounted_amount or self.amount
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "currency": self.currency,
+            "amount": str(self.amount),
+            "discounted_amount": str(self.discounted_amount) if self.discounted_amount else None,
+            "setup_fee": str(self.setup_fee),
+            "is_recurring": self.is_recurring,
+            "billing_cycle": self.billing_cycle.value if self.billing_cycle else None
+        }
+
+
+@dataclass
+class OfferContent:
+    """Conteúdo da oferta (multi-idioma, multi-mídia)."""
+    # Textos
+    title: Dict[str, str]  # language_code -> title
+    description: Dict[str, str]
+    button_text: Dict[str, str] = field(default_factory=dict)
+    
+    # Mídia
+    video_url: Optional[str] = None
+    image_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    
+    # Metadados
+    language: str = "pt"  # Idioma padrão
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def get_text(self, field: str, language: Optional[str] = None) -> str:
+        """Obtém texto no idioma especificado."""
+        lang = language or self.language
+        texts = getattr(self, field, {})
+        return texts.get(lang, texts.get(self.language, next(iter(texts.values()), "")))
+
+
+@dataclass
+class OfferRule:
+    """Regra de elegibilidade para oferta."""
+    rule_id: str
+    name: str
+    condition: str  # JSONPath ou template
+    condition_params: Dict[str, Any] = field(default_factory=dict)
+    
+    # Escopo
+    tenant_ids: List[str] = field(default_factory=list)
+    bot_ids: List[str] = field(default_factory=list)
+    countries: List[str] = field(default_factory=list)
+    
+    # Validade
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    max_uses: Optional[int] = None
+    uses_count: int = 0
+    
+    # Controles
+    is_active: bool = True
+    priority: int = 100
+    
+    def is_valid(self, context: Dict[str, Any]) -> bool:
+        """Verifica se a regra é válida para o contexto."""
+        if not self.is_active:
+            return False
+        
+        now = datetime.utcnow()
+        if self.valid_from and now < self.valid_from:
+            return False
+        
+        if self.valid_until and now > self.valid_until:
+            return False
+        
+        if self.max_uses and self.uses_count >= self.max_uses:
+            return False
+        
+        # Verifica escopo
+        tenant_id = context.get("tenant_id")
+        if self.tenant_ids and tenant_id not in self.tenant_ids:
+            return False
+        
+        bot_id = context.get("bot_id")
+        if self.bot_ids and bot_id not in self.bot_ids:
+            return False
+        
+        country = context.get("country")
+        if self.countries and country not in self.countries:
+            return False
+        
+        # Verifica condição personalizada
+        return self._evaluate_condition(context)
+    
+    def _evaluate_condition(self, context: Dict[str, Any]) -> bool:
+        """Avalia condição personalizada."""
+        # Implementação básica - em produção usar JSONPath ou engine de regras
+        try:
+            # Exemplo: condition = "user.total_spent > 100"
+            # Em produção usar algo como jmespath
+            return True
+        except:
+            return False
+    
+    def mark_used(self):
+        """Marca a regra como usada."""
+        self.uses_count += 1
+
+
+@dataclass
+class OfferTransition:
+    """Transição entre ofertas."""
+    from_offer_id: str
+    to_offer_id: str
+    trigger: OfferTrigger
+    condition: Optional[str] = None
+    delay_seconds: int = 0
+    priority: int = 100
+    is_active: bool = True
+    
+    def can_transition(self, context: Dict[str, Any]) -> bool:
+        """Verifica se pode transicionar."""
+        if not self.is_active:
+            return False
+        
+        if self.condition:
+            # Avalia condição
+            try:
+                # Em produção usar engine de expressões
+                return True
+            except:
+                return False
+        
+        return True
+
+
+@dataclass
+class Offer:
+    """Modelo de oferta dinâmica."""
+    # Identificadores
+    offer_id: str
+    tenant_id: str
+    name: str
+    
+    # Tipo e conteúdo
+    offer_type: OfferType
+    content: OfferContent
+    
+    # Preços
+    prices: Dict[str, OfferPrice]  # currency -> OfferPrice
+    
+    # Regras de elegibilidade
+    rules: List[OfferRule] = field(default_factory=list)
+    
+    # Transições
+    transitions: List[OfferTransition] = field(default_factory=list)
+    
+    # Plano associado (opcional)
+    plan_id: Optional[str] = None
+    plan_version: Optional[int] = None
+    
+    # Controles
+    status: OfferStatus = OfferStatus.ACTIVE
+    is_visible: bool = True
+    max_uses: Optional[int] = None
+    uses_count: int = 0
+    
+    # Timing
+    cooldown_hours: int = 0  # Cooldown entre ofertas para mesmo usuário
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    
+    # Tracking
+    pixel_ids: List[str] = field(default_factory=list)
+    tracking_params: Dict[str, str] = field(default_factory=dict)
+    
+    # Metadados
+    tags: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # Audit
+    created_by: str = "system"
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    
+    def is_eligible(self, context: Dict[str, Any]) -> Tuple[bool, List[str]]:
+        """Verifica se a oferta é elegível para o contexto."""
+        errors = []
+        
+        # Verifica status
+        if self.status != OfferStatus.ACTIVE:
+            errors.append(f"Offer status is {self.status.value}")
+        
+        # Verifica visibilidade
+        if not self.is_visible:
+            errors.append("Offer is not visible")
+        
+        # Verifica validade temporal
+        now = datetime.utcnow()
+        if self.valid_from and now < self.valid_from:
+            errors.append("Offer not yet valid")
+        
+        if self.valid_until and now > self.valid_until:
+            errors.append("Offer expired")
+        
+        # Verifica limite de usos
+        if self.max_uses and self.uses_count >= self.max_uses:
+            errors.append("Offer usage limit reached")
+        
+        # Verifica regras
+        if self.rules:
+            passed_rules = []
+            for rule in self.rules:
+                if rule.is_valid(context):
+                    passed_rules.append(rule.rule_id)
+                else:
+                    errors.append(f"Rule not satisfied: {rule.name}")
+            
+            if not passed_rules:
+                errors.append("No rules satisfied")
+        
+        return len(errors) == 0, errors
+    
+    def get_price_for_currency(self, currency: str) -> Optional[OfferPrice]:
+        """Obtém preço para uma moeda específica."""
+        return self.prices.get(currency)
+    
+    def get_suggested_price(self, region: Region) -> Optional[OfferPrice]:
+        """Obtém preço sugerido para uma região."""
+        # Mapeamento região -> moedas preferenciais
+        region_currencies = {
+            Region.BR: ["BRL"],
+            Region.LATAM: ["USD", "EUR", "MXN"],
+            Region.EU: ["EUR", "GBP"],
+            Region.US: ["USD"],
+            Region.UK: ["GBP"],
+            Region.ASIA: ["USD", "EUR", "JPY"],
+            Region.MENA: ["USD", "EUR", "AED"],
+            Region.GLOBAL: ["USD", "EUR"],
+            Region.UNKNOWN: ["USD"]
+        }
+        
+        preferred = region_currencies.get(region, ["USD"])
+        
+        for currency in preferred:
+            if currency in self.prices:
+                return self.prices[currency]
+        
+        # Retorna primeiro preço disponível
+        return next(iter(self.prices.values()), None) if self.prices else None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializa para dict."""
+        return {
+            "offer_id": self.offer_id,
+            "tenant_id": self.tenant_id,
+            "name": self.name,
+            "offer_type": self.offer_type.value,
+            "content": {
+                "title": self.content.title,
+                "description": self.content.description,
+                "button_text": self.content.button_text,
+                "video_url": self.content.video_url,
+                "image_url": self.content.image_url,
+                "thumbnail_url": self.content.thumbnail_url,
+                "language": self.content.language,
+                "metadata": self.content.metadata
+            },
+            "prices": {k: v.to_dict() for k, v in self.prices.items()},
+            "rules": [
+                {
+                    "rule_id": r.rule_id,
+                    "name": r.name,
+                    "condition": r.condition,
+                    "is_active": r.is_active
+                }
+                for r in self.rules
+            ],
+            "transitions": [
+                {
+                    "from_offer_id": t.from_offer_id,
+                    "to_offer_id": t.to_offer_id,
+                    "trigger": t.trigger.value,
+                    "delay_seconds": t.delay_seconds
+                }
+                for t in self.transitions
+            ],
+            "plan_id": self.plan_id,
+            "plan_version": self.plan_version,
+            "status": self.status.value,
+            "is_visible": self.is_visible,
+            "max_uses": self.max_uses,
+            "uses_count": self.uses_count,
+            "cooldown_hours": self.cooldown_hours,
+            "valid_from": self.valid_from.isoformat() if self.valid_from else None,
+            "valid_until": self.valid_until.isoformat() if self.valid_until else None,
+            "pixel_ids": self.pixel_ids,
+            "tracking_params": self.tracking_params,
+            "tags": self.tags,
+            "metadata": self.metadata,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat()
+        }
+
+
+@dataclass
+class UserOfferState:
+    """Estado de oferta para um usuário específico."""
+    user_id: str
+    tenant_id: str
+    current_offer_id: Optional[str]
+    offer_history: List[Dict[str, Any]] = field(default_factory=list)
+    last_offer_at: Optional[datetime] = None
+    cooldown_until: Optional[datetime] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def can_receive_offer(self, offer: Offer) -> bool:
+        """Verifica se usuário pode receber oferta (cooldown)."""
+        if not offer.cooldown_hours:
+            return True
+        
+        if not self.cooldown_until:
+            return True
+        
+        now = datetime.utcnow()
+        return now >= self.cooldown_until
+    
+    def record_offer_shown(self, offer_id: str):
+        """Registra que oferta foi mostrada ao usuário."""
+        self.current_offer_id = offer_id
+        self.last_offer_at = datetime.utcnow()
+        
+        if self.current_offer_id:
+            self.offer_history.append({
+                "offer_id": offer_id,
+                "shown_at": self.last_offer_at.isoformat(),
+                "action": "shown"
+            })
+    
+    def record_offer_accepted(self, offer_id: str):
+        """Registra que oferta foi aceita."""
+        if self.current_offer_id == offer_id:
+            self.offer_history.append({
+                "offer_id": offer_id,
+                "accepted_at": datetime.utcnow().isoformat(),
+                "action": "accepted"
+            })
+    
+    def record_offer_refused(self, offer_id: str):
+        """Registra que oferta foi recusada."""
+        if self.current_offer_id == offer_id:
+            self.offer_history.append({
+                "offer_id": offer_id,
+                "refused_at": datetime.utcnow().isoformat(),
+                "action": "refused"
+            })
+    
+    def set_cooldown(self, hours: int):
+        """Define cooldown para o usuário."""
+        self.cooldown_until = datetime.utcnow() + timedelta(hours=hours)
+
+
+class OfferEngine:
+    """
+    Motor de ofertas dinâmicas com suporte a upsell, downsell, reoferta.
+    Multi-tenant, multi-bot, com controle de estado e elegibilidade.
+    """
+    
+    def __init__(
+        self,
+        db_pool,
+        audit_logger: AuditLogger,
+        plan_catalog: PlanCatalog,
+        redis_client=None
+    ):
+        """
+        Inicializa o Offer Engine.
+        
+        Args:
+            db_pool: Pool de conexões com banco
+            audit_logger: Logger de auditoria
+            plan_catalog: Catálogo de planos
+            redis_client: Cliente Redis (opcional)
+        """
+        self.db_pool = db_pool
+        self.audit_logger = audit_logger
+        self.plan_catalog = plan_catalog
+        self.redis = redis_client
+        
+        # Cache de ofertas
+        self.offers: Dict[str, Offer] = {}
+        self.offers_by_tenant: Dict[str, List[Offer]] = defaultdict(list)
+        self.transitions_by_offer: Dict[str, List[OfferTransition]] = defaultdict(list)
+        
+        # Cache de estado de usuários
+        self.user_states: Dict[str, UserOfferState] = {}
+        
+        # Máquina de estados para ofertas
+        self.state_machine = StateMachine(
+            initial_states=[OfferStatus.ACTIVE.value],
+            transitions={
+                OfferStatus.ACTIVE.value: [
+                    OfferStatus.PAUSED.value,
+                    OfferStatus.EXPIRED.value,
+                    OfferStatus.ARCHIVED.value
+                ],
+                OfferStatus.PAUSED.value: [
+                    OfferStatus.ACTIVE.value,
+                    OfferStatus.ARCHIVED.value
+                ],
+                OfferStatus.SCHEDULED.value: [
+                    OfferStatus.ACTIVE.value,
+                    OfferStatus.CANCELLED.value
+                ],
+                OfferStatus.EXPIRED.value: [
+                    OfferStatus.ARCHIVED.value
+                ],
+                OfferStatus.ARCHIVED.value: []
+            },
+            state_field="status",
+            resource_id_field="offer_id"
+        )
+        
+        # Carrega ofertas
+        asyncio.create_task(self._load_offers())
+    
+    async def _load_offers(self):
+        """Carrega ofertas do banco para cache."""
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM offers WHERE status != 'archived'")
+            for row in rows:
+                offer = self._row_to_offer(row)
+                self.offers[offer.offer_id] = offer
+                self.offers_by_tenant[offer.tenant_id].append(offer)
+                
+                # Carrega transições
+                for transition in offer.transitions:
+                    self.transitions_by_offer[transition.from_offer_id].append(transition)
+    
+    async def get_offer_for_user(
+        self,
+        tenant_id: str,
+        user_id: str,
+        bot_id: str,
+        context: Dict[str, Any],
+        force_new: bool = False
+    ) -> Tuple[Optional[Offer], List[str]]:
+        """
+        Obtém a oferta apropriada para um usuário.
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário
+            bot_id: ID do bot
+            context: Contexto adicional
+            force_new: Forçar nova oferta (ignorar estado atual)
+            
+        Returns:
+            Tuple[offer, warnings]
+        """
+        # Obtém estado do usuário
+        user_state = await self._get_user_state(tenant_id, user_id)
+        
+        # Se tem oferta atual e não force_new, retorna ela
+        if not force_new and user_state.current_offer_id:
+            offer = self.offers.get(user_state.current_offer_id)
+            if offer and offer.tenant_id == tenant_id:
+                return offer, []
+        
+        # Busca ofertas elegíveis
+        eligible_offers = []
+        warnings = []
+        
+        for offer in self.offers_by_tenant.get(tenant_id, []):
+            # Verifica cooldown
+            if not user_state.can_receive_offer(offer):
+                warnings.append(f"Offer {offer.offer_id} in cooldown")
+                continue
+            
+            # Verifica elegibilidade
+            context_with_user = {
+                **context,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "bot_id": bot_id,
+                "user_state": user_state.metadata
+            }
+            
+            is_eligible, errors = offer.is_eligible(context_with_user)
+            if is_eligible:
+                eligible_offers.append(offer)
+            else:
+                warnings.extend(errors)
+        
+        if not eligible_offers:
+            return None, ["No eligible offers found"] + warnings
+        
+        # Seleciona oferta (prioridade: tipo, regras, etc.)
+        selected_offer = self._select_best_offer(eligible_offers, context)
+        
+        if selected_offer:
+            # Atualiza estado do usuário
+            user_state.record_offer_shown(selected_offer.offer_id)
+            if selected_offer.cooldown_hours:
+                user_state.set_cooldown(selected_offer.cooldown_hours)
+            
+            await self._save_user_state(user_state)
+            
+            # Log
+            await self.audit_logger.log(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                action="offer.shown",
+                resource_type="offer",
+                resource_id=selected_offer.offer_id,
+                changes={
+                    "offer_type": selected_offer.offer_type.value,
+                    "price_currencies": list(selected_offer.prices.keys())
+                },
+                metadata={
+                    "context": context,
+                    "warnings": warnings
+                }
+            )
+        
+        return selected_offer, warnings
+    
+    async def handle_offer_action(
+        self,
+        tenant_id: str,
+        user_id: str,
+        offer_id: str,
+        action: str,  # "accepted", "refused", "timeout"
+        action_context: Dict[str, Any]
+    ) -> Tuple[Optional[Offer], Optional[OfferTrigger], List[str]]:
+        """
+        Processa ação do usuário em uma oferta e determina próxima oferta.
+        
+        Args:
+            tenant_id: ID do tenant
+            user_id: ID do usuário
+            offer_id: ID da oferta
+            action: Ação do usuário
+            action_context: Contexto da ação
+            
+        Returns:
+            Tuple[next_offer, trigger, warnings]
+        """
+        # Verifica oferta atual
+        current_offer = self.offers.get(offer_id)
+        if not current_offer or current_offer.tenant_id != tenant_id:
+            return None, None, [f"Offer not found: {offer_id}"]
+        
+        # Obtém estado do usuário
+        user_state = await self._get_user_state(tenant_id, user_id)
+        
+        # Registra ação
+        if action == "accepted":
+            user_state.record_offer_accepted(offer_id)
+            trigger = OfferTrigger.PAYMENT_SUCCESS
+        elif action == "refused":
+            user_state.record_offer_refused(offer_id)
+            trigger = OfferTrigger.USER_REFUSED
+        elif action == "timeout":
+            trigger = OfferTrigger.TIMEOUT
+        else:
+            return None, None, [f"Invalid action: {action}"]
+        
+        await self._save_user_state(user_state)
+        
+        # Log da ação
+        await self.audit_logger.log(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            action=f"offer.{action}",
+            resource_type="offer",
+            resource_id=offer_id,
+            changes={
+                "action": action,
+                "trigger": trigger.value
+            },
+            metadata=action_context
+        )
+        
+        # Determina próxima oferta baseada na transição
+        next_offer = await self._get_next_offer(
+            current_offer, trigger, user_state, action_context
+        )
+        
+        return next_offer, trigger, []
+    
+    async def create_offer(
+        self,
+        tenant_id: str,
+        offer_data: Dict[str, Any],
+        created_by: str = "system"
+    ) -> Tuple[bool, Optional[Offer], List[str]]:
+        """
+        Cria uma nova oferta.
+        
+        Args:
+            tenant_id: ID do tenant
+            offer_data: Dados da oferta
+            created_by: Quem criou
+            
+        Returns:
+            Tuple[success, offer, errors]
+        """
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    # Gera ID
+                    offer_id = f"offer_{uuid.uuid4().hex[:8]}"
+                    
+                    # Processa preços
+                    prices = {}
+                    for currency, price_data in offer_data.get("prices", {}).items():
+                        prices[currency] = OfferPrice(
+                            currency=currency,
+                            amount=Decimal(str(price_data["amount"])),
+                            discounted_amount=(
+                                Decimal(str(price_data["discounted_amount"]))
+                                if price_data.get("discounted_amount") else None
+                            ),
+                            setup_fee=Decimal(str(price_data.get("setup_fee", "0.00"))),
+                            is_recurring=price_data.get("is_recurring", False),
+                            billing_cycle=(
+                                BillingCycle(price_data["billing_cycle"])
+                                if price_data.get("billing_cycle") else None
+                            )
+                        )
+                    
+                    # Processa conteúdo
+                    content_data = offer_data.get("content", {})
+                    content = OfferContent(
+                        title=content_data.get("title", {}),
+                        description=content_data.get("description", {}),
+                        button_text=content_data.get("button_text", {}),
+                        video_url=content_data.get("video_url"),
+                        image_url=content_data.get("image_url"),
+                        thumbnail_url=content_data.get("thumbnail_url"),
+                        language=content_data.get("language", "pt"),
+                        metadata=content_data.get("metadata", {})
+                    )
+                    
+                    # Processa regras
+                    rules = []
+                    for rule_data in offer_data.get("rules", []):
+                        rules.append(OfferRule(
+                            rule_id=f"rule_{uuid.uuid4().hex[:6]}",
+                            name=rule_data["name"],
+                            condition=rule_data["condition"],
+                            condition_params=rule_data.get("condition_params", {}),
+                            tenant_ids=rule_data.get("tenant_ids", []),
+                            bot_ids=rule_data.get("bot_ids", []),
+                            countries=rule_data.get("countries", []),
+                            valid_from=(
+                                datetime.fromisoformat(rule_data["valid_from"])
+                                if rule_data.get("valid_from") else None
+                            ),
+                            valid_until=(
+                                datetime.fromisoformat(rule_data["valid_until"])
+                                if rule_data.get("valid_until") else None
+                            ),
+                            max_uses=rule_data.get("max_uses"),
+                            is_active=rule_data.get("is_active", True),
+                            priority=rule_data.get("priority", 100)
+                        ))
+                    
+                    # Processa transições
+                    transitions = []
+                    for trans_data in offer_data.get("transitions", []):
+                        transitions.append(OfferTransition(
+                            from_offer_id=trans_data["from_offer_id"],
+                            to_offer_id=trans_data["to_offer_id"],
+                            trigger=OfferTrigger(trans_data["trigger"]),
+                            condition=trans_data.get("condition"),
+                            delay_seconds=trans_data.get("delay_seconds", 0),
+                            priority=trans_data.get("priority", 100),
+                            is_active=trans_data.get("is_active", True)
+                        ))
+                    
+                    # Cria oferta
+                    now = datetime.utcnow()
+                    offer = Offer(
+                        offer_id=offer_id,
+                        tenant_id=tenant_id,
+                        name=offer_data["name"],
+                        offer_type=OfferType(offer_data["offer_type"]),
+                        content=content,
+                        prices=prices,
+                        rules=rules,
+                        transitions=transitions,
+                        plan_id=offer_data.get("plan_id"),
+                        plan_version=offer_data.get("plan_version"),
+                        status=OfferStatus(offer_data.get("status", "active")),
+                        is_visible=offer_data.get("is_visible", True),
+                        max_uses=offer_data.get("max_uses"),
+                        cooldown_hours=offer_data.get("cooldown_hours", 0),
+                        valid_from=(
+                            datetime.fromisoformat(offer_data["valid_from"])
+                            if offer_data.get("valid_from") else None
+                        ),
+                        valid_until=(
+                            datetime.fromisoformat(offer_data["valid_until"])
+                            if offer_data.get("valid_until") else None
+                        ),
+                        pixel_ids=offer_data.get("pixel_ids", []),
+                        tracking_params=offer_data.get("tracking_params", {}),
+                        tags=offer_data.get("tags", []),
+                        metadata=offer_data.get("metadata", {}),
+                        created_by=created_by,
+                        created_at=now,
+                        updated_at=now
+                    )
+                    
+                    # Persiste no banco
+                    await conn.execute(
+                        """
+                        INSERT INTO offers (
+                            offer_id, tenant_id, name, offer_type, content,
+                            prices, rules, transitions, plan_id, plan_version,
+                            status, is_visible, max_uses, uses_count, cooldown_hours,
+                            valid_from, valid_until, pixel_ids, tracking_params,
+                            tags, metadata, created_by, created_at, updated_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+                        """,
+                        offer.offer_id,
+                        offer.tenant_id,
+                        offer.name,
+                        offer.offer_type.value,
+                        json.dumps({
+                            "title": offer.content.title,
+                            "description": offer.content.description,
+                            "button_text": offer.content.button_text,
+                            "video_url": offer.content.video_url,
+                            "image_url": offer.content.image_url,
+                            "thumbnail_url": offer.content.thumbnail_url,
+                            "language": offer.content.language,
+                            "metadata": offer.content.metadata
+                        }),
+                        json.dumps({k: v.to_dict() for k, v in offer.prices.items()}),
+                        json.dumps([
+                            {
+                                "rule_id": r.rule_id,
+                                "name": r.name,
+                                "condition": r.condition,
+                                "condition_params": r.condition_params,
+                                "tenant_ids": r.tenant_ids,
+                                "bot_ids": r.bot_ids,
+                                "countries": r.countries,
+                                "valid_from": r.valid_from.isoformat() if r.valid_from else None,
+                                "valid_until": r.valid_until.isoformat() if r.valid_until else None,
+                                "max_uses": r.max_uses,
+                                "uses_count": r.uses_count,
+                                "is_active": r.is_active,
+                                "priority": r.priority
+                            }
+                            for r in offer.rules
+                        ]),
+                        json.dumps([
+                            {
+                                "from_offer_id": t.from_offer_id,
+                                "to_offer_id": t.to_offer_id,
+                                "trigger": t.trigger.value,
+                                "condition": t.condition,
+                                "delay_seconds": t.delay_seconds,
+                                "priority": t.priority,
+                                "is_active": t.is_active
+                            }
+                            for t in offer.transitions
+                        ]),
+                        offer.plan_id,
+                        offer.plan_version,
+                        offer.status.value,
+                        offer.is_visible,
+                        offer.max_uses,
+                        offer.uses_count,
+                        offer.cooldown_hours,
+                        offer.valid_from,
+                        offer.valid_until,
+                        offer.pixel_ids,
+                        json.dumps(offer.tracking_params),
+                        offer.tags,
+                        json.dumps(offer.metadata),
+                        offer.created_by,
+                        offer.created_at,
+                        offer.updated_at
+                    )
+                    
+                    # Atualiza cache
+                    self.offers[offer.offer_id] = offer
+                    self.offers_by_tenant[tenant_id].append(offer)
+                    
+                    for transition in offer.transitions:
+                        self.transitions_by_offer[transition.from_offer_id].append(transition)
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=created_by,
+                        action="offer.created",
+                        resource_type="offer",
+                        resource_id=offer_id,
+                        changes={
+                            "name": offer.name,
+                            "type": offer.offer_type.value,
+                            "prices": list(offer.prices.keys())
+                        },
+                        metadata=offer.to_dict()
+                    )
+                    
+                    return True, offer, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def update_offer_status(
+        self,
+        tenant_id: str,
+        offer_id: str,
+        new_status: OfferStatus,
+        updated_by: str,
+        reason: str
+    ) -> Tuple[bool, Optional[Offer], List[str]]:
+        """Atualiza status de uma oferta."""
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    offer = self.offers.get(offer_id)
+                    if not offer or offer.tenant_id != tenant_id:
+                        return False, None, [f"Offer not found: {offer_id}"]
+                    
+                    old_status = offer.status
+                    
+                    # Valida transição
+                    if not self.state_machine.can_transition(old_status.value, new_status.value):
+                        return False, None, [
+                            f"Cannot transition from {old_status.value} to {new_status.value}"
+                        ]
+                    
+                    # Atualiza
+                    updated_at = datetime.utcnow()
+                    await conn.execute(
+                        """
+                        UPDATE offers 
+                        SET status = $1, updated_at = $2
+                        WHERE offer_id = $3 AND tenant_id = $4
+                        """,
+                        new_status.value,
+                        updated_at,
+                        offer_id,
+                        tenant_id
+                    )
+                    
+                    # Atualiza cache
+                    offer.status = new_status
+                    offer.updated_at = updated_at
+                    
+                    # Log
+                    await self.audit_logger.log(
+                        tenant_id=tenant_id,
+                        user_id=updated_by,
+                        action="offer.status_changed",
+                        resource_type="offer",
+                        resource_id=offer_id,
+                        changes={
+                            "old_status": old_status.value,
+                            "new_status": new_status.value,
+                            "reason": reason
+                        }
+                    )
+                    
+                    return True, offer, []
+                    
+                except Exception as e:
+                    return False, None, [f"Database error: {str(e)}"]
+    
+    async def get_offers_by_tenant(
+        self,
+        tenant_id: str,
+        include_invisible: bool = False,
+        include_inactive: bool = False
+    ) -> List[Offer]:
+        """Lista ofertas de um tenant."""
+        offers = self.offers_by_tenant.get(tenant_id, [])
+        
+        filtered = []
+        for offer in offers:
+            if not include_invisible and not offer.is_visible:
+                continue
+            
+            if not include_inactive and offer.status != OfferStatus.ACTIVE:
+                continue
+            
+            filtered.append(offer)
+        
+        return filtered
+    
+    async def track_offer_view(
+        self,
+        tenant_id: str,
+        user_id: str,
+        offer_id: str,
+        bot_id: str,
+        view_data: Dict[str, Any]
+    ):
+        """Registra visualização de oferta para analytics."""
+        # Em produção, enviaria para analytics pipeline
+        pass
+    
+    async def get_offer_stats(
+        self,
+        tenant_id: str,
+        offer_id: str,
+        days: int = 30
+    ) -> Dict[str, Any]:
+        """Obtém estatísticas de uma oferta."""
+        async with self.db_pool.acquire() as conn:
+            since_date = datetime.utcnow() - timedelta(days=days)
+            
+            # Busca métricas
+            metrics = await conn.fetchrow(
+                """
+                SELECT 
+                    COUNT(*) as total_views,
+                    SUM(CASE WHEN action = 'accepted' THEN 1 ELSE 0 END) as accepted,
+                    SUM(CASE WHEN action = 'refused' THEN 1 ELSE 0 END) as refused,
+                    SUM(CASE WHEN action = 'timeout' THEN 1 ELSE 0 END) as timeout
+                FROM offer_events 
+                WHERE tenant_id = $1 AND offer_id = $2 AND created_at >= $3
+                """,
+                tenant_id, offer_id, since_date
+            )
+            
+            # Busca conversão por dia
+            daily_stats = await conn.fetch(
+                """
+                SELECT 
+                    DATE(created_at) as date,
+                    COUNT(*) as views,
+                    SUM(CASE WHEN action = 'accepted' THEN 1 ELSE 0 END) as accepted
+                FROM offer_events 
+                WHERE tenant_id = $1 AND offer_id = $2 AND created_at >= $3
+                GROUP BY DATE(created_at)
+                ORDER BY date DESC
+                """,
+                tenant_id, offer_id, since_date
+            )
+            
+            return {
+                "total_views": metrics["total_views"] or 0,
+                "accepted": metrics["accepted"] or 0,
+                "refused": metrics["refused"] or 0,
+                "timeout": metrics["timeout"] or 0,
+                "conversion_rate": (
+                    (metrics["accepted"] or 0) / (metrics["total_views"] or 1) * 100
+                    if metrics["total_views"] else 0
+                ),
+                "daily_stats": [
+                    {
+                        "date": row["date"].isoformat() if hasattr(row["date"], "isoformat") else str(row["date"]),
+                        "views": row["views"],
+                        "accepted": row["accepted"],
+                        "conversion_rate": (row["accepted"] / row["views"] * 100) if row["views"] else 0
+                    }
+                    for row in daily_stats
+                ]
+            }
+    
+    # Métodos privados
+    async def _get_user_state(
+        self,
+        tenant_id: str,
+        user_id: str
+    ) -> UserOfferState:
+        """Obtém estado de oferta do usuário."""
+        cache_key = f"offer_state:{tenant_id}:{user_id}"
+        
+        # Verifica cache
+        if cache_key in self.user_states:
+            return self.user_states[cache_key]
+        
+        # Busca no banco
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM user_offer_states 
+                WHERE tenant_id = $1 AND user_id = $2
+                """,
+                tenant_id, user_id
+            )
+            
+            if row:
+                state = UserOfferState(
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    current_offer_id=row["current_offer_id"],
+                    offer_history=json.loads(row["offer_history"]) if row.get("offer_history") else [],
+                    last_offer_at=row["last_offer_at"],
+                    cooldown_until=row["cooldown_until"],
+                    metadata=json.loads(row["metadata"]) if row.get("metadata") else {}
+                )
+            else:
+                # Cria novo estado
+                state = UserOfferState(
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    current_offer_id=None
+                )
+        
+        # Armazena em cache
+        self.user_states[cache_key] = state
+        return state
+    
+    async def _save_user_state(self, state: UserOfferState):
+        """Salva estado do usuário no banco."""
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_offer_states 
+                (user_id, tenant_id, current_offer_id, offer_history,
+                 last_offer_at, cooldown_until, metadata, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (user_id, tenant_id) 
+                DO UPDATE SET
+                    current_offer_id = EXCLUDED.current_offer_id,
+                    offer_history = EXCLUDED.offer_history,
+                    last_offer_at = EXCLUDED.last_offer_at,
+                    cooldown_until = EXCLUDED.cooldown_until,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                state.user_id,
+                state.tenant_id,
+                state.current_offer_id,
+                json.dumps(state.offer_history),
+                state.last_offer_at,
+                state.cooldown_until,
+                json.dumps(state.metadata),
+                datetime.utcnow()
+            )
+    
+    def _select_best_offer(
+        self,
+        eligible_offers: List[Offer],
+        context: Dict[str, Any]
+    ) -> Optional[Offer]:
+        """Seleciona a melhor oferta dentre as elegíveis."""
+        if not eligible_offers:
+            return None
+        
+        # Prioridade: tipo MAIN > UPSELL > outros
+        type_priority = {
+            OfferType.MAIN: 1,
+            OfferType.UPSELL: 2,
+            OfferType.TRIAL: 3,
+            OfferType.DOWNSELL: 4,
+            OfferType.RE_OFFER: 5,
+            OfferType.CROSS_SELL: 6,
+            OfferType.BUNDLE: 7
+        }
+        
+        # Ordena por: tipo, regras com maior prioridade, menor cooldown
+        eligible_offers.sort(key=lambda o: (
+            type_priority.get(o.offer_type, 99),
+            min([r.priority for r in o.rules], default=100),
+            o.cooldown_hours
+        ))
+        
+        return eligible_offers[0]
+    
+    async def _get_next_offer(
+        self,
+        current_offer: Offer,
+        trigger: OfferTrigger,
+        user_state: UserOfferState,
+        context: Dict[str, Any]
+    ) -> Optional[Offer]:
+        """Determina próxima oferta baseada em transições."""
+        # Busca transições possíveis
+        transitions = self.transitions_by_offer.get(current_offer.offer_id, [])
+        
+        # Filtra por trigger
+        trigger_transitions = [t for t in transitions if t.trigger == trigger]
+        
+        if not trigger_transitions:
+            return None
+        
+        # Ordena por prioridade
+        trigger_transitions.sort(key=lambda t: t.priority)
+        
+        # Tenta cada transição
+        for transition in trigger_transitions:
+            # Verifica se pode transicionar
+            if not transition.can_transition(context):
+                continue
+            
+            # Busca oferta de destino
+            next_offer = self.offers.get(transition.to_offer_id)
+            if not next_offer:
+                continue
+            
+            # Verifica elegibilidade
+            eligibility_context = {
+                **context,
+                "tenant_id": next_offer.tenant_id,
+                "user_id": user_state.user_id,
+                "user_state": user_state.metadata,
+                "previous_offer_id": current_offer.offer_id,
+                "trigger": trigger.value
+            }
+            
+            is_eligible, _ = next_offer.is_eligible(eligibility_context)
+            if is_eligible:
+                # Aplica delay se necessário
+                if transition.delay_seconds > 0:
+                    # Em produção, agendaria para o futuro
+                    # Por agora retorna None e deixa o sistema reagendar
+                    return None
+                
+                return next_offer
+        
+        return None
+    
+    def _row_to_offer(self, row) -> Offer:
+        """Converte linha do banco para Offer."""
+        content_data = json.loads(row["content"])
+        
+        # Preços
+        prices_data = json.loads(row["prices"])
+        prices = {}
+        for currency, price_dict in prices_data.items():
+            prices[currency] = OfferPrice(
+                currency=currency,
+                amount=Decimal(str(price_dict["amount"])),
+                discounted_amount=(
+                    Decimal(str(price_dict["discounted_amount"]))
+                    if price_dict.get("discounted_amount") else None
+                ),
+                setup_fee=Decimal(str(price_dict.get("setup_fee", "0.00"))),
+                is_recurring=price_dict.get("is_recurring", False),
+                billing_cycle=(
+                    BillingCycle(price_dict["billing_cycle"])
+                    if price_dict.get("billing_cycle") else None
+                )
+            )
+        
+        # Regras
+        rules_data = json.loads(row["rules"]) if row.get("rules") else []
+        rules = []
+        for rule_dict in rules_data:
+            rules.append(OfferRule(
+                rule_id=rule_dict["rule_id"],
+                name=rule_dict["name"],
+                condition=rule_dict["condition"],
+                condition_params=rule_dict.get("condition_params", {}),
+                tenant_ids=rule_dict.get("tenant_ids", []),
+                bot_ids=rule_dict.get("bot_ids", []),
+                countries=rule_dict.get("countries", []),
+                valid_from=(
+                    datetime.fromisoformat(rule_dict["valid_from"])
+                    if rule_dict.get("valid_from") else None
+                ),
+                valid_until=(
+                    datetime.fromisoformat(rule_dict["valid_until"])
+                    if rule_dict.get("valid_until") else None
+                ),
+                max_uses=rule_dict.get("max_uses"),
+                uses_count=rule_dict.get("uses_count", 0),
+                is_active=rule_dict.get("is_active", True),
+                priority=rule_dict.get("priority", 100)
+            ))
+        
+        # Transições
+        transitions_data = json.loads(row["transitions"]) if row.get("transitions") else []
+        transitions = []
+        for trans_dict in transitions_data:
+            transitions.append(OfferTransition(
+                from_offer_id=trans_dict["from_offer_id"],
+                to_offer_id=trans_dict["to_offer_id"],
+                trigger=OfferTrigger(trans_dict["trigger"]),
+                condition=trans_dict.get("condition"),
+                delay_seconds=trans_dict.get("delay_seconds", 0),
+                priority=trans_dict.get("priority", 100),
+                is_active=trans_dict.get("is_active", True)
+            ))
+        
+        return Offer(
+            offer_id=row["offer_id"],
+            tenant_id=row["tenant_id"],
+            name=row["name"],
+            offer_type=OfferType(row["offer_type"]),
+            content=OfferContent(
+                title=content_data.get("title", {}),
+                description=content_data.get("description", {}),
+                button_text=content_data.get("button_text", {}),
+                video_url=content_data.get("video_url"),
+                image_url=content_data.get("image_url"),
+                thumbnail_url=content_data.get("thumbnail_url"),
+                language=content_data.get("language", "pt"),
+                metadata=content_data.get("metadata", {})
+            ),
+            prices=prices,
+            rules=rules,
+            transitions=transitions,
+            plan_id=row.get("plan_id"),
+            plan_version=row.get("plan_version"),
+            status=OfferStatus(row["status"]),
+            is_visible=row["is_visible"],
+            max_uses=row.get("max_uses"),
+            uses_count=row.get("uses_count", 0),
+            cooldown_hours=row.get("cooldown_hours", 0),
+            valid_from=row.get("valid_from"),
+            valid_until=row.get("valid_until"),
+            pixel_ids=row.get("pixel_ids", []),
+            tracking_params=json.loads(row["tracking_params"]) if row.get("tracking_params") else {},
+            tags=row.get("tags", []),
+            metadata=json.loads(row["metadata"]) if row.get("metadata") else {},
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )

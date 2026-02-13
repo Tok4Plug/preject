@@ -1,0 +1,603 @@
+"""
+Criptografia e segurança central do sistema SaaS.
+Implementa AES-256, HMAC, hashing seguro e geração de tokens.
+Todas as operações são fail-safe e logam auditoria.
+"""
+
+import os
+import base64
+import hashlib
+import hmac
+import secrets
+import json
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Tuple
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.backends import default_backend
+import logging
+
+from ..exceptions import (
+    EncryptionError,
+    DecryptionError,
+    SignatureError,
+    TokenValidationError,
+    SecurityError,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class CryptographyEngine:
+    """Motor central de criptografia e segurança."""
+    
+    # Algoritmos e parâmetros
+    AES_KEY_SIZE = 32  # 256 bits
+    HMAC_KEY_SIZE = 32  # 256 bits
+    SALT_SIZE = 16  # 128 bits
+    IV_SIZE = 16  # 128 bits para AES CBC
+    TOKEN_SIZE = 32  # 256 bits
+    HMAC_ALGORITHM = hashlib.sha256
+    KDF_ITERATIONS = 100000  # Para PBKDF2
+    
+    def __init__(self, secret_key: Optional[str] = None):
+        """
+        Inicializa o motor de criptografia.
+        
+        Args:
+            secret_key: Chave secreta master (opcional, busca de ENV)
+        """
+        self.secret_key = secret_key or os.getenv('CRYPTO_SECRET_KEY')
+        if not self.secret_key:
+            raise SecurityError("Chave secreta de criptografia não configurada")
+        
+        if len(self.secret_key) < 32:
+            raise SecurityError("Chave secreta deve ter pelo menos 32 caracteres")
+        
+        # Deriva chaves específicas da master
+        self._derived_keys = self._derive_keys()
+        
+    def _derive_keys(self) -> Dict[str, bytes]:
+        """Deriva chaves específicas da chave master."""
+        master_key = self.secret_key.encode('utf-8')
+        
+        # Usa HKDF para derivar chaves específicas
+        salt = b'saas_crypto_salt'
+        hkdf = hashlib.pbkdf2_hmac(
+            'sha256',
+            master_key,
+            salt,
+            self.KDF_ITERATIONS,
+            self.AES_KEY_SIZE + self.HMAC_KEY_SIZE
+        )
+        
+        return {
+            'aes_key': hkdf[:self.AES_KEY_SIZE],
+            'hmac_key': hkdf[self.AES_KEY_SIZE:],
+        }
+    
+    def encrypt_aes(self, plaintext: str, context: str = "default") -> str:
+        """
+        Criptografa texto usando AES-256-CBC com IV único.
+        
+        Args:
+            plaintext: Texto a ser criptografado
+            context: Contexto para auditoria
+            
+        Returns:
+            String base64: iv + ciphertext
+            
+        Raises:
+            EncryptionError: Se a criptografia falhar
+        """
+        try:
+            # Gera IV único
+            iv = os.urandom(self.IV_SIZE)
+            
+            # Configura cipher AES-256-CBC
+            cipher = Cipher(
+                algorithms.AES(self._derived_keys['aes_key']),
+                modes.CBC(iv),
+                backend=default_backend()
+            )
+            
+            # Aplica padding PKCS7
+            padder = padding.PKCS7(128).padder()
+            padded_data = padder.update(plaintext.encode('utf-8')) + padder.finalize()
+            
+            # Criptografa
+            encryptor = cipher.encryptor()
+            ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+            
+            # Combina IV + ciphertext
+            encrypted_data = iv + ciphertext
+            
+            # Codifica em base64
+            result = base64.b64encode(encrypted_data).decode('utf-8')
+            
+            # Log de auditoria
+            logger.info(f"Encryption successful: context={context}, length={len(plaintext)}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Encryption failed: context={context}, error={str(e)}")
+            raise EncryptionError(f"Falha na criptografia: {str(e)}")
+    
+    def decrypt_aes(self, encrypted_text: str, context: str = "default") -> str:
+        """
+        Descriptografa texto criptografado com AES-256-CBC.
+        
+        Args:
+            encrypted_text: Texto criptografado em base64
+            context: Contexto para auditoria
+            
+        Returns:
+            Texto descriptografado
+            
+        Raises:
+            DecryptionError: Se a descriptografia falhar
+        """
+        try:
+            # Decodifica base64
+            encrypted_data = base64.b64decode(encrypted_text)
+            
+            # Extrai IV e ciphertext
+            if len(encrypted_data) < self.IV_SIZE:
+                raise DecryptionError("Dados criptografados inválidos")
+            
+            iv = encrypted_data[:self.IV_SIZE]
+            ciphertext = encrypted_data[self.IV_SIZE:]
+            
+            # Configura cipher
+            cipher = Cipher(
+                algorithms.AES(self._derived_keys['aes_key']),
+                modes.CBC(iv),
+                backend=default_backend()
+            )
+            
+            # Descriptografa
+            decryptor = cipher.decryptor()
+            padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            
+            # Remove padding
+            unpadder = padding.PKCS7(128).unpadder()
+            plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
+            
+            result = plaintext.decode('utf-8')
+            
+            # Log de auditoria
+            logger.info(f"Decryption successful: context={context}, length={len(result)}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Decryption failed: context={context}, error={str(e)}")
+            raise DecryptionError(f"Falha na descriptografia: {str(e)}")
+    
+    def create_hmac_signature(self, data: Any, timestamp: Optional[datetime] = None) -> str:
+        """
+        Cria assinatura HMAC para dados.
+        
+        Args:
+            data: Dados a serem assinados (serão convertidos para JSON)
+            timestamp: Timestamp opcional para nonce
+            
+        Returns:
+            Assinatura HMAC em base64
+        """
+        try:
+            # Prepara payload
+            payload = {
+                'data': data,
+                'timestamp': timestamp.isoformat() if timestamp else 
+                           datetime.now(timezone.utc).isoformat()
+            }
+            
+            # Serializa para JSON de forma consistente
+            payload_str = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+            
+            # Cria HMAC
+            signature = hmac.new(
+                self._derived_keys['hmac_key'],
+                payload_str.encode('utf-8'),
+                self.HMAC_ALGORITHM
+            ).digest()
+            
+            return base64.b64encode(signature).decode('utf-8')
+            
+        except Exception as e:
+            raise SignatureError(f"Falha ao criar assinatura: {str(e)}")
+    
+    def verify_hmac_signature(self, data: Any, signature: str, 
+                            max_age_seconds: int = 300) -> bool:
+        """
+        Verifica assinatura HMAC com validade temporal.
+        
+        Args:
+            data: Dados originais
+            signature: Assinatura a ser verificada
+            max_age_seconds: Tempo máximo de validade em segundos
+            
+        Returns:
+            True se a assinatura for válida
+            
+        Raises:
+            SignatureError: Se a assinatura for inválida ou expirada
+        """
+        try:
+            # Decodifica a assinatura
+            expected_signature = base64.b64decode(signature)
+            
+            # Recria o payload para verificar
+            # Primeiro extrai timestamp do payload original
+            if isinstance(data, dict) and 'timestamp' in data:
+                payload = data
+            else:
+                # Se não tem timestamp, assume agora
+                payload = {
+                    'data': data,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+            
+            # Verifica expiração
+            timestamp_str = payload.get('timestamp')
+            if timestamp_str:
+                timestamp = datetime.fromisoformat(
+                    timestamp_str.replace('Z', '+00:00')
+                )
+                age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+                
+                if age > max_age_seconds:
+                    raise SignatureError(f"Assinatura expirada: {age}s > {max_age_seconds}s")
+            
+            # Recria assinatura
+            payload_str = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+            actual_signature = hmac.new(
+                self._derived_keys['hmac_key'],
+                payload_str.encode('utf-8'),
+                self.HMAC_ALGORITHM
+            ).digest()
+            
+            # Comparação segura contra timing attacks
+            if not hmac.compare_digest(expected_signature, actual_signature):
+                raise SignatureError("Assinatura HMAC inválida")
+            
+            return True
+            
+        except SignatureError:
+            raise
+        except Exception as e:
+            raise SignatureError(f"Falha ao verificar assinatura: {str(e)}")
+    
+    def hash_fingerprint(self, components: Dict[str, Any]) -> str:
+        """
+        Gera fingerprint hash seguro para identificação única.
+        
+        Args:
+            components: Componentes para gerar fingerprint
+            
+        Returns:
+            Hash seguro (SHA-256)
+        """
+        try:
+            # Ordena componentes para consistência
+            sorted_components = json.dumps(
+                components, 
+                sort_keys=True, 
+                separators=(',', ':')
+            )
+            
+            # Adiciona salt específico para fingerprint
+            salt = b'fingerprint_salt_v1'
+            
+            # Usa PBKDF2 para tornar mais resistente
+            hash_result = hashlib.pbkdf2_hmac(
+                'sha256',
+                sorted_components.encode('utf-8'),
+                salt,
+                10000,  # Iterações
+                32  # Tamanho em bytes
+            )
+            
+            return hash_result.hex()
+            
+        except Exception as e:
+            raise SecurityError(f"Falha ao gerar fingerprint: {str(e)}")
+    
+    def generate_secure_token(self, length: int = TOKEN_SIZE) -> str:
+        """
+        Gera token seguro para URLs, acesso, etc.
+        
+        Args:
+            length: Comprimento do token em bytes
+            
+        Returns:
+            Token seguro em base64 URL-safe
+        """
+        try:
+            # Gera bytes aleatórios seguros
+            token_bytes = secrets.token_bytes(length)
+            
+            # Codifica em base64 URL-safe
+            token = base64.urlsafe_b64encode(token_bytes).decode('utf-8')
+            
+            # Remove padding
+            token = token.replace('=', '')
+            
+            return token
+            
+        except Exception as e:
+            raise SecurityError(f"Falha ao gerar token: {str(e)}")
+    
+    def generate_signed_url_token(self, path: str, expires_in: int = 3600,
+                                **params) -> str:
+        """
+        Gera token assinado para URLs com expiração.
+        
+        Args:
+            path: Caminho da URL
+            expires_in: Tempo de expiração em segundos
+            **params: Parâmetros adicionais
+            
+        Returns:
+            Token assinado
+            
+        Raises:
+            TokenValidationError: Se a geração falhar
+        """
+        try:
+            # Calcula expiração
+            expires_at = int(datetime.now(timezone.utc).timestamp()) + expires_in
+            
+            # Prepara payload
+            payload = {
+                'path': path,
+                'exp': expires_at,
+                'params': params,
+                'nonce': secrets.token_hex(8)
+            }
+            
+            # Cria assinatura
+            signature = self.create_hmac_signature(payload)
+            
+            # Codifica payload
+            payload_encoded = base64.urlsafe_b64encode(
+                json.dumps(payload).encode('utf-8')
+            ).decode('utf-8')
+            
+            # Remove padding
+            payload_encoded = payload_encoded.replace('=', '')
+            
+            # Retorna token no formato: payload.signature
+            return f"{payload_encoded}.{signature}"
+            
+        except Exception as e:
+            raise TokenValidationError(f"Falha ao gerar token de URL: {str(e)}")
+    
+    def verify_signed_url_token(self, token: str, path: str, 
+                              **expected_params) -> bool:
+        """
+        Verifica token de URL assinado.
+        
+        Args:
+            token: Token a ser verificado
+            path: Caminho esperado
+            **expected_params: Parâmetros esperados
+            
+        Returns:
+            True se o token for válido
+            
+        Raises:
+            TokenValidationError: Se a verificação falhar
+        """
+        try:
+            # Separa payload e assinatura
+            if '.' not in token:
+                raise TokenValidationError("Formato de token inválido")
+            
+            payload_encoded, signature = token.split('.', 1)
+            
+            # Adiciona padding se necessário
+            padding_needed = len(payload_encoded) % 4
+            if padding_needed:
+                payload_encoded += '=' * (4 - padding_needed)
+            
+            # Decodifica payload
+            payload_json = base64.urlsafe_b64decode(payload_encoded).decode('utf-8')
+            payload = json.loads(payload_json)
+            
+            # Verifica assinatura
+            self.verify_hmac_signature(payload, signature)
+            
+            # Verifica expiração
+            expires_at = payload.get('exp')
+            if not expires_at:
+                raise TokenValidationError("Token não tem expiração")
+            
+            current_time = int(datetime.now(timezone.utc).timestamp())
+            if current_time > expires_at:
+                raise TokenValidationError("Token expirado")
+            
+            # Verifica caminho
+            if payload.get('path') != path:
+                raise TokenValidationError(f"Caminho inválido: {payload.get('path')}")
+            
+            # Verifica parâmetros
+            token_params = payload.get('params', {})
+            for key, expected_value in expected_params.items():
+                if token_params.get(key) != expected_value:
+                    raise TokenValidationError(
+                        f"Parâmetro '{key}' não corresponde: "
+                        f"{token_params.get(key)} != {expected_value}"
+                    )
+            
+            return True
+            
+        except TokenValidationError:
+            raise
+        except Exception as e:
+            raise TokenValidationError(f"Falha ao verificar token: {str(e)}")
+    
+    def encrypt_sensitive_field(self, field_name: str, value: str, 
+                              tenant_id: str) -> str:
+        """
+        Criptografa campo sensível com contexto de tenant.
+        
+        Args:
+            field_name: Nome do campo para auditoria
+            value: Valor a ser criptografado
+            tenant_id: ID do tenant para isolamento
+            
+        Returns:
+            Valor criptografado
+        """
+        context = f"{tenant_id}:{field_name}"
+        return self.encrypt_aes(value, context)
+    
+    def decrypt_sensitive_field(self, field_name: str, encrypted_value: str,
+                              tenant_id: str) -> str:
+        """
+        Descriptografa campo sensível com contexto de tenant.
+        
+        Args:
+            field_name: Nome do campo para auditoria
+            encrypted_value: Valor criptografado
+            tenant_id: ID do tenant para isolamento
+            
+        Returns:
+            Valor descriptografado
+        """
+        context = f"{tenant_id}:{field_name}"
+        return self.decrypt_aes(encrypted_value, context)
+    
+    def generate_key_pair(self) -> Tuple[str, str]:
+        """
+        Gera par de chaves para assinatura assimétrica (simplificado).
+        
+        Returns:
+            Tupla (private_key, public_key) em base64
+        """
+        # Nota: Para produção, use bibliotecas especializadas como cryptography
+        # Esta é uma implementação simplificada para desenvolvimento
+        
+        # Gera chave privada
+        private_key = secrets.token_bytes(32)
+        
+        # Deriva chave pública (simplificado - não use em produção real)
+        # Em produção, use ECDSA ou RSA
+        public_key = hashlib.sha256(private_key).digest()
+        
+        return (
+            base64.b64encode(private_key).decode('utf-8'),
+            base64.b64encode(public_key).decode('utf-8')
+        )
+    
+    def secure_compare(self, a: str, b: str) -> bool:
+        """
+        Comparação segura contra timing attacks.
+        
+        Args:
+            a: Primeira string
+            b: Segunda string
+            
+        Returns:
+            True se as strings forem iguais
+        """
+        return hmac.compare_digest(a, b)
+
+
+# Instância global para uso direto
+try:
+    crypto_engine = CryptographyEngine()
+except SecurityError:
+    # Modo de desenvolvimento/fallback
+    crypto_engine = None
+    logger.warning("Cryptography engine não inicializado - modo de desenvolvimento")
+
+
+# Funções utilitárias de alto nível
+def encrypt_payment_id(payment_id: str, tenant_id: str) -> str:
+    """Criptografa ID de pagamento."""
+    if not crypto_engine:
+        raise SecurityError("Motor de criptografia não disponível")
+    return crypto_engine.encrypt_sensitive_field('payment_id', payment_id, tenant_id)
+
+
+def decrypt_payment_id(encrypted_payment_id: str, tenant_id: str) -> str:
+    """Descriptografa ID de pagamento."""
+    if not crypto_engine:
+        raise SecurityError("Motor de criptografia não disponível")
+    return crypto_engine.decrypt_sensitive_field('payment_id', encrypted_payment_id, tenant_id)
+
+
+def create_webhook_signature(payload: dict, provider: str) -> str:
+    """Cria assinatura para webhook."""
+    if not crypto_engine:
+        raise SecurityError("Motor de criptografia não disponível")
+    
+    # Adiciona provider ao payload para contexto
+    signed_payload = {
+        **payload,
+        '_provider': provider,
+        '_timestamp': datetime.now(timezone.utc).isoformat()
+    }
+    
+    return crypto_engine.create_hmac_signature(signed_payload)
+
+
+def verify_webhook_signature(payload: dict, signature: str, provider: str) -> bool:
+    """Verifica assinatura de webhook."""
+    if not crypto_engine:
+        raise SecurityError("Motor de criptografia não disponível")
+    
+    # Prepara payload esperado
+    expected_payload = {
+        **payload,
+        '_provider': provider
+    }
+    
+    return crypto_engine.verify_hmac_signature(expected_payload, signature)
+
+
+def generate_access_token(user_id: str, tenant_id: str, scopes: list) -> str:
+    """Gera token de acesso seguro."""
+    if not crypto_engine:
+        raise SecurityError("Motor de criptografia não disponível")
+    
+    payload = {
+        'user_id': user_id,
+        'tenant_id': tenant_id,
+        'scopes': scopes,
+        'jti': secrets.token_hex(16),  # JWT ID único
+        'iat': int(datetime.now(timezone.utc).timestamp())
+    }
+    
+    # Em produção, use JWT proper
+    # Esta é uma implementação simplificada
+    payload_encoded = base64.urlsafe_b64encode(
+        json.dumps(payload).encode('utf-8')
+    ).decode('utf-8').replace('=', '')
+    
+    signature = crypto_engine.create_hmac_signature(payload)
+    
+    return f"{payload_encoded}.{signature}"
+
+
+def hash_user_fingerprint(user_data: dict) -> str:
+    """Gera fingerprint hash único para usuário."""
+    if not crypto_engine:
+        raise SecurityError("Motor de criptografia não disponível")
+    
+    # Componentes padrão para fingerprint
+    components = {
+        'telegram_id': user_data.get('telegram_id'),
+        'username': user_data.get('username'),
+        'language_code': user_data.get('language_code'),
+        'tenant_id': user_data.get('tenant_id')
+    }
+    
+    # Remove valores None
+    components = {k: v for k, v in components.items() if v is not None}
+    
+    return crypto_engine.hash_fingerprint(components)

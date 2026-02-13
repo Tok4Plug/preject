@@ -1,0 +1,498 @@
+"""
+Worker especializado para processamento de tarefas de notificação.
+Integra com NotificationEngine, TemplateEngine e providers de notificação.
+"""
+
+import logging
+import time
+from datetime import datetime
+from typing import Any, Dict, Optional, List
+from dataclasses import asdict
+
+from ...core.notification_engine import NotificationEngine
+from ...core.template_engine import TemplateEngine
+from ...core.audit_logger import AuditLogger
+from ...core.metrics_engine import MetricsEngine
+from ...queue import BaseWorker, BaseTask, NotificationSendTask, AuditLogTask
+from ...queue.tasks import TaskFactory
+
+logger = logging.getLogger(__name__)
+
+
+class NotificationWorker(BaseWorker):
+    """
+    Worker para processamento de tarefas de notificação.
+    Processa envio de notificações por múltiplos canais.
+    """
+    
+    def __init__(
+        self,
+        queue,
+        worker_id: str,
+        notification_engine: NotificationEngine,
+        template_engine: TemplateEngine,
+        tenant_id: Optional[str] = None,
+        audit_logger: Optional[AuditLogger] = None,
+        metrics_engine: Optional[MetricsEngine] = None
+    ):
+        super().__init__(
+            queue=queue,
+            worker_id=worker_id,
+            tenant_id=tenant_id,
+            audit_logger=audit_logger,
+            metrics_engine=metrics_engine
+        )
+        
+        self.notification_engine = notification_engine
+        self.template_engine = template_engine
+        
+        logger.info(f"NotificationWorker {worker_id} initialized")
+    
+    async def process_task(self, task: BaseTask) -> Any:
+        """Processa uma tarefa de notificação baseada no tipo"""
+        
+        if task.task_type == "notification_send":
+            return await self._process_notification_send(task)
+        elif task.task_type == "audit_log":
+            return await self._process_audit_log(task)
+        else:
+            raise ValueError(f"Tipo de tarefa não suportada: {task.task_type}")
+    
+    async def _process_notification_send(self, task: NotificationSendTask) -> Dict[str, Any]:
+        """
+        Processa envio de notificação.
+        Fluxo: renderiza template → envia → registra → métricas
+        """
+        
+        start_time = time.time()
+        tenant_id = task.metadata.tenant_id
+        user_id = task.payload["user_id"]
+        template_id = task.payload["template_id"]
+        channel = task.payload["channel"]
+        variables = task.payload.get("variables", {})
+        
+        logger.info(
+            f"Sending notification to user {user_id}",
+            extra={
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "template_id": template_id,
+                "channel": channel,
+                "task_id": str(task.metadata.task_id)
+            }
+        )
+        
+        try:
+            # 1. Renderiza template
+            template_result = await self.template_engine.render(
+                tenant_id=tenant_id,
+                template_id=template_id,
+                variables=variables
+            )
+            
+            if not template_result.get("success"):
+                logger.error(
+                    f"Template rendering failed",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "template_id": template_id,
+                        "error": template_result.get("error")
+                    }
+                )
+                return template_result
+            
+            content = template_result["content"]
+            template_variant = template_result.get("variant")
+            
+            # 2. Envia notificação
+            notification_result = await self.notification_engine.send(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                channel=channel,
+                content=content,
+                metadata={
+                    "template_id": template_id,
+                    "template_variant": template_variant,
+                    "variables": variables,
+                    "task_id": str(task.metadata.task_id),
+                    "scheduled_for": task.payload.get("scheduled_for")
+                }
+            )
+            
+            if not notification_result.get("success"):
+                logger.error(
+                    f"Notification send failed",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "channel": channel,
+                        "error": notification_result.get("error")
+                    }
+                )
+                
+                # Tenta fallback se configurado
+                if task.payload.get("enable_fallback", False):
+                    return await self._send_fallback_notification(
+                        tenant_id, user_id, template_id, channel, variables
+                    )
+                
+                return notification_result
+            
+            notification_id = notification_result.get("notification_id")
+            
+            # 3. Registra métricas
+            if self.metrics_engine:
+                await self.metrics_engine.increment_counter(
+                    name="notifications_sent",
+                    tenant_id=tenant_id,
+                    tags={
+                        "channel": channel,
+                        "template": template_id,
+                        "status": "success"
+                    }
+                )
+                
+                await self.metrics_engine.record_histogram(
+                    name="notification_processing_time_ms",
+                    tenant_id=tenant_id,
+                    value=(time.time() - start_time) * 1000,
+                    tags={
+                        "channel": channel,
+                        "template": template_id
+                    }
+                )
+            
+            # 4. Registra auditoria
+            if self.audit_logger:
+                await self.audit_logger.log(
+                    action="notification_sent",
+                    resource_type="notification",
+                    resource_id=notification_id,
+                    tenant_id=tenant_id,
+                    details={
+                        "user_id": user_id,
+                        "channel": channel,
+                        "template_id": template_id,
+                        "template_variant": template_variant,
+                        "provider": notification_result.get("provider"),
+                        "processing_time_ms": (time.time() - start_time) * 1000,
+                        "task_id": str(task.metadata.task_id)
+                    }
+                )
+            
+            logger.info(
+                f"Notification sent successfully",
+                extra={
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "notification_id": notification_id,
+                    "channel": channel,
+                    "processing_time": time.time() - start_time
+                }
+            )
+            
+            return {
+                "status": "success",
+                "notification_id": notification_id,
+                "channel": channel,
+                "provider": notification_result.get("provider"),
+                "sent_at": notification_result.get("sent_at"),
+                "processing_time_ms": (time.time() - start_time) * 1000
+            }
+            
+        except Exception as e:
+            logger.error(
+                f"Error sending notification: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
+                    "template_id": template_id,
+                    "channel": channel
+                },
+                exc_info=True
+            )
+            
+            if self.metrics_engine:
+                await self.metrics_engine.increment_counter(
+                    name="notifications_failed",
+                    tenant_id=tenant_id,
+                    tags={
+                        "channel": channel,
+                        "template": template_id,
+                        "error_type": type(e).__name__
+                    }
+                )
+            
+            raise
+    
+    async def _process_audit_log(self, task: AuditLogTask) -> Dict[str, Any]:
+        """Processa registro de log de auditoria"""
+        
+        tenant_id = task.metadata.tenant_id
+        action = task.payload["action"]
+        resource_type = task.payload["resource_type"]
+        resource_id = task.payload["resource_id"]
+        changes = task.payload.get("changes", {})
+        
+        logger.debug(
+            f"Processing audit log",
+            extra={
+                "tenant_id": tenant_id,
+                "action": action,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "task_id": str(task.metadata.task_id)
+            }
+        )
+        
+        try:
+            # Esta tarefa é tipicamente processada pelo AuditLogger diretamente,
+            # mas podemos adicionar processamento adicional aqui se necessário.
+            
+            # Exemplo: enviar para sistema externo de auditoria
+            # await self._send_to_external_audit_system(...)
+            
+            return {
+                "status": "success",
+                "action": action,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "processed_at": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(
+                f"Error processing audit log: {str(e)}",
+                extra={
+                    "tenant_id": tenant_id,
+                    "action": action,
+                    "resource_type": resource_type
+                }
+            )
+            
+            # Não relançamos a exceção para não bloquear o fluxo principal
+            return {
+                "status": "failed",
+                "error": str(e),
+                "action": action,
+                "resource_type": resource_type
+            }
+    
+    async def _send_fallback_notification(
+        self,
+        tenant_id: str,
+        user_id: str,
+        template_id: str,
+        primary_channel: str,
+        variables: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Tenta enviar notificação por canal alternativo"""
+        
+        fallback_channels = {
+            "telegram": ["email", "sms"],
+            "email": ["telegram", "sms"],
+            "sms": ["email", "telegram"],
+            "push": ["email", "telegram"]
+        }
+        
+        available_fallbacks = fallback_channels.get(primary_channel, [])
+        
+        for fallback_channel in available_fallbacks:
+            try:
+                logger.info(
+                    f"Trying fallback channel {fallback_channel}",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "original_channel": primary_channel,
+                        "fallback_channel": fallback_channel
+                    }
+                )
+                
+                # Renderiza template novamente (pode ter variantes por canal)
+                template_result = await self.template_engine.render(
+                    tenant_id=tenant_id,
+                    template_id=template_id,
+                    variables=variables,
+                    channel=fallback_channel
+                )
+                
+                if not template_result.get("success"):
+                    continue
+                
+                # Envia pelo canal alternativo
+                result = await self.notification_engine.send(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    channel=fallback_channel,
+                    content=template_result["content"],
+                    metadata={
+                        "template_id": template_id,
+                        "variables": variables,
+                        "is_fallback": True,
+                        "original_channel": primary_channel
+                    }
+                )
+                
+                if result.get("success"):
+                    logger.info(
+                        f"Fallback notification sent successfully",
+                        extra={
+                            "tenant_id": tenant_id,
+                            "user_id": user_id,
+                            "original_channel": primary_channel,
+                            "fallback_channel": fallback_channel
+                        }
+                    )
+                    
+                    if self.metrics_engine:
+                        await self.metrics_engine.increment_counter(
+                            name="notifications_fallback_success",
+                            tenant_id=tenant_id,
+                            tags={
+                                "original_channel": primary_channel,
+                                "fallback_channel": fallback_channel
+                            }
+                        )
+                    
+                    return {
+                        "status": "fallback_success",
+                        "notification_id": result.get("notification_id"),
+                        "channel": fallback_channel,
+                        "original_channel": primary_channel,
+                        "is_fallback": True,
+                        "provider": result.get("provider")
+                    }
+                    
+            except Exception as e:
+                logger.warning(
+                    f"Fallback channel {fallback_channel} also failed: {str(e)}",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "fallback_channel": fallback_channel
+                    }
+                )
+                continue
+        
+        logger.error(
+            f"All notification channels failed",
+            extra={
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "template_id": template_id,
+                "primary_channel": primary_channel,
+                "fallback_channels": available_fallbacks
+            }
+        )
+        
+        if self.metrics_engine:
+            await self.metrics_engine.increment_counter(
+                name="notifications_all_channels_failed",
+                tenant_id=tenant_id,
+                tags={
+                    "template": template_id,
+                    "primary_channel": primary_channel
+                }
+            )
+        
+        return {
+            "status": "failed",
+            "error": "All notification channels failed",
+            "original_channel": primary_channel,
+            "attempted_fallbacks": available_fallbacks
+        }
+
+
+class NotificationWorkerManager:
+    """Gerencia múltiplos workers de notificação"""
+    
+    def __init__(self, queue, **dependencies):
+        self.queue = queue
+        self.dependencies = dependencies
+        self.workers: Dict[str, NotificationWorker] = {}
+        self.worker_tasks: Dict[str, asyncio.Task] = {}
+    
+    async def start_worker(
+        self,
+        worker_id: str,
+        tenant_id: Optional[str] = None,
+        concurrency: int = 5
+    ) -> NotificationWorker:
+        """Inicia um worker de notificação"""
+        
+        worker = NotificationWorker(
+            queue=self.queue,
+            worker_id=worker_id,
+            tenant_id=tenant_id,
+            **self.dependencies
+        )
+        
+        self.workers[worker_id] = worker
+        
+        # Inicia worker em background
+        task = asyncio.create_task(
+            worker.start("notification_queue", concurrency)
+        )
+        self.worker_tasks[worker_id] = task
+        
+        logger.info(f"NotificationWorker {worker_id} started")
+        return worker
+    
+    async def stop_worker(self, worker_id: str):
+        """Para um worker de notificação"""
+        
+        if worker_id in self.workers:
+            await self.workers[worker_id].stop()
+            del self.workers[worker_id]
+        
+        if worker_id in self.worker_tasks:
+            self.worker_tasks[worker_id].cancel()
+            try:
+                await self.worker_tasks[worker_id]
+            except asyncio.CancelledError:
+                pass
+            del self.worker_tasks[worker_id]
+        
+        logger.info(f"NotificationWorker {worker_id} stopped")
+    
+    async def stop_all(self):
+        """Para todos os workers"""
+        
+        for worker_id in list(self.workers.keys()):
+            await self.stop_worker(worker_id)
+        
+        logger.info("All notification workers stopped")
+    
+    async def send_immediate_notification(
+        self,
+        tenant_id: str,
+        user_id: str,
+        template_id: str,
+        channel: str,
+        variables: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Envia notificação imediata sem passar pela fila"""
+        
+        worker_id = f"immediate_{tenant_id}_{user_id}"
+        
+        if worker_id not in self.workers:
+            worker = NotificationWorker(
+                queue=self.queue,
+                worker_id=worker_id,
+                tenant_id=tenant_id,
+                **self.dependencies
+            )
+            self.workers[worker_id] = worker
+        
+        # Cria tarefa local
+        task = TaskFactory.create_notification(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            template_id=template_id,
+            channel=channel,
+            variables=variables
+        )
+        
+        # Processa imediatamente
+        return await self.workers[worker_id].process_task(task)

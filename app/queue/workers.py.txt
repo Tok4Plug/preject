@@ -1,0 +1,480 @@
+"""
+Workers especializados para processamento de tarefas assíncronas.
+Cada worker é responsável por um tipo específico de tarefa.
+"""
+
+import asyncio
+import logging
+from typing import Dict, Any, Optional, Callable
+from datetime import datetime
+
+from .base import BaseQueue, QueueMessage
+from .tasks import (
+    BaseTask, deserialize_task, TaskValidator, TaskFactory,
+    PaymentWebhookTask, EntitlementGrantTask, NotificationSendTask,
+    AuditLogTask
+)
+from ..core.flow_engine import FlowEngine
+from ..core.billing_engine import BillingEngine
+from ..core.entitlement_engine import EntitlementEngine
+from ..core.notification_engine import NotificationEngine
+from ..core.audit_logger import AuditLogger
+from ..core.antifraud import AntifraudEngine
+
+logger = logging.getLogger(__name__)
+
+
+class BaseWorker:
+    """Classe base para todos os workers"""
+    
+    def __init__(
+        self,
+        queue: BaseQueue,
+        queue_name: str,
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1
+    ):
+        self.queue = queue
+        self.queue_name = queue_name
+        self.tenant_id = tenant_id
+        self.batch_size = batch_size
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+    
+    async def start(self) -> None:
+        """Inicia o worker"""
+        if self._running:
+            logger.warning(f"Worker for {self.queue_name} is already running")
+            return
+        
+        self._running = True
+        self._task = asyncio.create_task(self._run())
+        
+        logger.info(
+            f"Started worker for {self.queue_name}",
+            extra={"tenant_id": self.tenant_id, "queue": self.queue_name}
+        )
+    
+    async def stop(self) -> None:
+        """Para o worker de forma segura"""
+        self._running = False
+        
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.info(
+            f"Stopped worker for {self.queue_name}",
+            extra={"tenant_id": self.tenant_id, "queue": self.queue_name}
+        )
+    
+    async def _run(self) -> None:
+        """Loop principal do worker"""
+        while self._running:
+            try:
+                await self.queue.consume(
+                    queue_name=self.queue_name,
+                    callback=self.process_message,
+                    tenant_id=self.tenant_id,
+                    batch_size=self.batch_size
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(
+                    f"Error in worker for {self.queue_name}: {e}",
+                    extra={"tenant_id": self.tenant_id, "queue": self.queue_name}
+                )
+                await asyncio.sleep(1)  # Pausa em caso de erro
+    
+    async def process_message(self, message: QueueMessage) -> Any:
+        """Processa uma mensagem da fila"""
+        raise NotImplementedError
+
+
+class TaskWorker(BaseWorker):
+    """Worker genérico para processamento de tarefas"""
+    
+    def __init__(
+        self,
+        queue: BaseQueue,
+        task_type: str,
+        processor: Callable[[BaseTask], Any],
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1
+    ):
+        queue_name = f"{task_type}_queue"
+        super().__init__(queue, queue_name, tenant_id, batch_size)
+        self.task_type = task_type
+        self.processor = processor
+    
+    async def process_message(self, message: QueueMessage) -> Any:
+        """Processa uma mensagem contendo uma tarefa"""
+        try:
+            # Desserializa a tarefa
+            task_data = message.payload
+            task = deserialize_task(task_data)
+            
+            # Valida a tarefa
+            errors = TaskValidator.validate_task(task)
+            if errors:
+                logger.error(
+                    f"Invalid task received: {errors}",
+                    extra={
+                        "tenant_id": task.metadata.tenant_id,
+                        "task_id": task.metadata.task_id,
+                        "task_type": task.task_type
+                    }
+                )
+                return
+            
+            # Verifica se é o tipo correto
+            if task.task_type != self.task_type:
+                logger.warning(
+                    f"Task type mismatch: expected {self.task_type}, got {task.task_type}",
+                    extra={
+                        "tenant_id": task.metadata.tenant_id,
+                        "task_id": task.metadata.task_id
+                    }
+                )
+                return
+            
+            # Processa a tarefa
+            logger.info(
+                f"Processing task {task.metadata.task_id}",
+                extra={
+                    "tenant_id": task.metadata.tenant_id,
+                    "task_type": task.task_type,
+                    "task_id": task.metadata.task_id
+                }
+            )
+            
+            result = await self.processor(task)
+            
+            logger.info(
+                f"Task {task.metadata.task_id} processed successfully",
+                extra={
+                    "tenant_id": task.metadata.tenant_id,
+                    "task_type": task.task_type,
+                    "task_id": task.metadata.task_id
+                }
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                f"Failed to process task: {e}",
+                extra={
+                    "tenant_id": message.metadata.tenant_id,
+                    "message_id": message.metadata.message_id,
+                    "task_type": self.task_type
+                },
+                exc_info=True
+            )
+            raise
+
+
+class PaymentWebhookWorker(TaskWorker):
+    """Worker especializado para webhooks de pagamento"""
+    
+    def __init__(
+        self,
+        queue: BaseQueue,
+        billing_engine: BillingEngine,
+        entitlement_engine: EntitlementEngine,
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1
+    ):
+        super().__init__(
+            queue=queue,
+            task_type="payment_webhook",
+            processor=self._process_payment_webhook,
+            tenant_id=tenant_id,
+            batch_size=batch_size
+        )
+        self.billing_engine = billing_engine
+        self.entitlement_engine = entitlement_engine
+    
+    async def _process_payment_webhook(self, task: PaymentWebhookTask) -> None:
+        """Processa um webhook de pagamento"""
+        provider = task.payload["provider"]
+        event_data = task.payload["event_data"]
+        
+        # Processa o pagamento
+        payment_result = await self.billing_engine.process_payment_webhook(
+            provider=provider,
+            event_data=event_data,
+            tenant_id=task.metadata.tenant_id
+        )
+        
+        # Se o pagamento for confirmado, concede acesso
+        if payment_result["status"] == "paid":
+            user_id = payment_result["user_id"]
+            offer_id = payment_result["offer_id"]
+            
+            await self.entitlement_engine.grant_access(
+                tenant_id=task.metadata.tenant_id,
+                user_id=user_id,
+                offer_id=offer_id,
+                payment_id=payment_result["payment_id"]
+            )
+
+
+class EntitlementWorker(TaskWorker):
+    """Worker para concessão de acessos"""
+    
+    def __init__(
+        self,
+        queue: BaseQueue,
+        entitlement_engine: EntitlementEngine,
+        notification_engine: NotificationEngine,
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1
+    ):
+        super().__init__(
+            queue=queue,
+            task_type="entitlement_grant",
+            processor=self._process_entitlement_grant,
+            tenant_id=tenant_id,
+            batch_size=batch_size
+        )
+        self.entitlement_engine = entitlement_engine
+        self.notification_engine = notification_engine
+    
+    async def _process_entitlement_grant(self, task: EntitlementGrantTask) -> None:
+        """Processa concessão de acesso"""
+        user_id = task.payload["user_id"]
+        entitlement_type = task.payload["entitlement_type"]
+        scope = task.payload["scope"]
+        
+        # Concede o acesso
+        entitlement = await self.entitlement_engine.grant(
+            tenant_id=task.metadata.tenant_id,
+            user_id=user_id,
+            entitlement_type=entitlement_type,
+            scope=scope,
+            expires_at=task.payload.get("expires_at")
+        )
+        
+        # Envia notificação de acesso concedido
+        await self.notification_engine.send_notification(
+            tenant_id=task.metadata.tenant_id,
+            user_id=user_id,
+            template_id="access_granted",
+            channel="telegram",
+            variables={
+                "entitlement_type": entitlement_type,
+                "granted_at": datetime.utcnow().isoformat()
+            }
+        )
+
+
+class NotificationWorker(TaskWorker):
+    """Worker para envio de notificações"""
+    
+    def __init__(
+        self,
+        queue: BaseQueue,
+        notification_engine: NotificationEngine,
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1
+    ):
+        super().__init__(
+            queue=queue,
+            task_type="notification_send",
+            processor=self._process_notification,
+            tenant_id=tenant_id,
+            batch_size=batch_size
+        )
+        self.notification_engine = notification_engine
+    
+    async def _process_notification(self, task: NotificationSendTask) -> None:
+        """Processa envio de notificação"""
+        user_id = task.payload["user_id"]
+        template_id = task.payload["template_id"]
+        channel = task.payload["channel"]
+        variables = task.payload["variables"]
+        
+        # Envia a notificação
+        await self.notification_engine.send(
+            tenant_id=task.metadata.tenant_id,
+            user_id=user_id,
+            template_id=template_id,
+            channel=channel,
+            variables=variables
+        )
+
+
+class AuditWorker(TaskWorker):
+    """Worker para registro de auditoria"""
+    
+    def __init__(
+        self,
+        queue: BaseQueue,
+        audit_logger: AuditLogger,
+        tenant_id: Optional[str] = None,
+        batch_size: int = 1
+    ):
+        super().__init__(
+            queue=queue,
+            task_type="audit_log",
+            processor=self._process_audit_log,
+            tenant_id=tenant_id,
+            batch_size=batch_size
+        )
+        self.audit_logger = audit_logger
+    
+    async def _process_audit_log(self, task: AuditLogTask) -> None:
+        """Processa registro de auditoria"""
+        action = task.payload["action"]
+        resource_type = task.payload["resource_type"]
+        resource_id = task.payload["resource_id"]
+        changes = task.payload["changes"]
+        actor_id = task.payload.get("actor_id")
+        actor_type = task.payload.get("actor_type", "system")
+        
+        # Registra o log de auditoria
+        await self.audit_logger.log(
+            tenant_id=task.metadata.tenant_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            changes=changes,
+            actor_id=actor_id,
+            actor_type=actor_type
+        )
+
+
+class WorkerManager:
+    """Gerencia múltiplos workers de forma coordenada"""
+    
+    def __init__(self):
+        self.workers: Dict[str, BaseWorker] = {}
+        self._running = False
+    
+    def register_worker(self, name: str, worker: BaseWorker) -> None:
+        """Registra um worker no manager"""
+        if name in self.workers:
+            raise ValueError(f"Worker with name {name} already registered")
+        
+        self.workers[name] = worker
+    
+    async def start_all(self) -> None:
+        """Inicia todos os workers"""
+        if self._running:
+            logger.warning("Worker manager is already running")
+            return
+        
+        self._running = True
+        
+        # Inicia todos os workers em paralelo
+        start_tasks = []
+        for name, worker in self.workers.items():
+            start_tasks.append(worker.start())
+        
+        await asyncio.gather(*start_tasks)
+        
+        logger.info(f"Started {len(self.workers)} workers")
+    
+    async def stop_all(self) -> None:
+        """Para todos os workers de forma segura"""
+        if not self._running:
+            return
+        
+        self._running = False
+        
+        # Para todos os workers em paralelo
+        stop_tasks = []
+        for name, worker in self.workers.items():
+            stop_tasks.append(worker.stop())
+        
+        await asyncio.gather(*stop_tasks, return_exceptions=True)
+        
+        logger.info(f"Stopped {len(self.workers)} workers")
+    
+    def get_worker(self, name: str) -> Optional[BaseWorker]:
+        """Obtém um worker pelo nome"""
+        return self.workers.get(name)
+    
+    async def restart_worker(self, name: str) -> bool:
+        """Reinicia um worker específico"""
+        worker = self.get_worker(name)
+        if not worker:
+            logger.error(f"Worker {name} not found")
+            return False
+        
+        try:
+            await worker.stop()
+            await asyncio.sleep(0.1)  # Pequena pausa
+            await worker.start()
+            logger.info(f"Restarted worker {name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to restart worker {name}: {e}")
+            return False
+
+
+# Fábrica para criar workers padrão
+def create_default_workers(
+    queue: BaseQueue,
+    billing_engine: BillingEngine,
+    entitlement_engine: EntitlementEngine,
+    notification_engine: NotificationEngine,
+    audit_logger: AuditLogger,
+    tenant_id: Optional[str] = None
+) -> WorkerManager:
+    """
+    Cria um conjunto padrão de workers para o sistema.
+    
+    Args:
+        queue: Instância da fila
+        billing_engine: Engine de faturamento
+        entitlement_engine: Engine de concessão de acesso
+        notification_engine: Engine de notificação
+        audit_logger: Logger de auditoria
+        tenant_id: ID do tenant (opcional)
+        
+    Returns:
+        WorkerManager com workers configurados
+    """
+    manager = WorkerManager()
+    
+    # Payment webhook worker
+    payment_worker = PaymentWebhookWorker(
+        queue=queue,
+        billing_engine=billing_engine,
+        entitlement_engine=entitlement_engine,
+        tenant_id=tenant_id
+    )
+    manager.register_worker("payment_webhook", payment_worker)
+    
+    # Entitlement worker
+    entitlement_worker = EntitlementWorker(
+        queue=queue,
+        entitlement_engine=entitlement_engine,
+        notification_engine=notification_engine,
+        tenant_id=tenant_id
+    )
+    manager.register_worker("entitlement", entitlement_worker)
+    
+    # Notification worker
+    notification_worker = NotificationWorker(
+        queue=queue,
+        notification_engine=notification_engine,
+        tenant_id=tenant_id
+    )
+    manager.register_worker("notification", notification_worker)
+    
+    # Audit worker
+    audit_worker = AuditWorker(
+        queue=queue,
+        audit_logger=audit_logger,
+        tenant_id=tenant_id
+    )
+    manager.register_worker("audit", audit_worker)
+    
+    return manager

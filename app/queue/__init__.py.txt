@@ -1,0 +1,381 @@
+"""
+Sistema de filas distribuídas para processamento assíncrono.
+Produção-ready com circuit breakers, rate limiting, criptografia e versionamento.
+"""
+
+from .base import (
+    BaseQueue,
+    DeadLetterQueue,
+    QueueMetrics,
+    QueueMessage,
+    QueueMetadata,
+    QueueError,
+    QueueConfigurationError,
+    QueuePublishError,
+    QueueConsumeError,
+    IdempotencyViolationError,
+)
+
+from .tasks import (
+    BaseTask,
+    TaskMetadata,
+    TaskPriority,
+    TaskStatus,
+    PaymentWebhookTask,
+    PaymentIntentUpdateTask,
+    InvoiceGenerationTask,
+    SubscriptionRenewalTask,
+    EntitlementGrantTask,
+    NotificationSendTask,
+    AntifraudAnalysisTask,
+    TrackingEventTask,
+    MetricsCollectionTask,
+    AuditLogTask,
+    CleanupTask,
+    TaskFactory,
+    TaskValidator,
+    deserialize_task,
+)
+
+from .config import QueueConfig, get_queue_config
+from .queue_metrics import create_queue_metrics, QueueMetricsCollector
+from .dead_letter_queue import DatabaseDeadLetterQueue
+
+# Novos componentes de produção
+from .circuit_breaker import (
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitBreakerManager,
+    CircuitBreakerError,
+    CircuitBreakerOpenError,
+    CircuitBreakerTimeoutError,
+    CircuitBreakerFallbackError,
+    circuit_breaker,
+)
+
+from .rate_limiter import (
+    RateLimiter,
+    RateLimitConfig,
+    RateLimitManager,
+    RateLimitStrategy,
+    RateLimitAction,
+    RateLimitExceededError,
+    create_queue_rate_limiter,
+    create_tenant_rate_limiter,
+    rate_limit,
+)
+
+from .encryption import (
+    MessageEncryptor,
+    EncryptionConfig,
+    TransportEncryption,
+    EncryptionError,
+    DecryptionError,
+    IntegrityError,
+    get_encryptor,
+)
+
+from .serialization import (
+    VersionedSerializer,
+    SchemaRegistry,
+    SchemaVersion,
+    SerializationMetadata,
+    SerializationError,
+    DeserializationError,
+    TransformationError,
+    IntegrityError as SerializationIntegrityError,
+    get_serializer,
+)
+
+# Implementações
+from .implementations import (
+    InMemoryQueue,
+    RedisQueue,
+    RabbitMQQueue,
+    SQSQueue,
+)
+
+# Workers
+from .workers import (
+    BaseWorker,
+    PaymentWorker,
+    NotificationWorker,
+    AuditWorker,
+    AntifraudWorker,
+)
+
+# Fábricas de queue
+def create_queue(
+    backend: str = "redis",
+    use_circuit_breaker: bool = True,
+    use_rate_limiter: bool = True,
+    use_encryption: bool = True,
+    **kwargs
+) -> BaseQueue:
+    """Cria instância de fila com todos os componentes de produção"""
+    
+    # Cria queue base
+    if backend == "redis":
+        from .implementations.redis_queue import create_redis_queue
+        queue = create_redis_queue(**kwargs)
+    elif backend == "rabbitmq":
+        from .implementations.rabbitmq_queue import create_rabbitmq_queue
+        queue = create_rabbitmq_queue(**kwargs)
+    elif backend == "sqs":
+        from .implementations.sqs_queue import create_sqs_queue
+        queue = create_sqs_queue(**kwargs)
+    elif backend == "memory":
+        from .implementations.in_memory_queue import get_in_memory_queue
+        queue = get_in_memory_queue(**kwargs)
+    else:
+        raise ValueError(f"Backend não suportado: {backend}")
+    
+    # Aplica circuit breaker se configurado
+    if use_circuit_breaker:
+        from .circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+        
+        cb_config = CircuitBreakerConfig(
+            failure_threshold=3,
+            reset_timeout=30,
+            request_timeout=10
+        )
+        
+        # Wrapper com circuit breaker
+        original_publish = queue.publish
+        original_receive = queue.receive_message
+        
+        async def publish_with_cb(*args, **kwargs):
+            from .circuit_breaker import CircuitBreaker
+            cb = CircuitBreaker(f"queue_{backend}_publish")
+            return await cb.execute(original_publish, *args, **kwargs)
+        
+        async def receive_with_cb(*args, **kwargs):
+            from .circuit_breaker import CircuitBreaker
+            cb = CircuitBreaker(f"queue_{backend}_receive")
+            return await cb.execute(original_receive, *args, **kwargs)
+        
+        queue.publish = publish_with_cb
+        queue.receive_message = receive_with_cb
+    
+    # Aplica rate limiter se configurado
+    if use_rate_limiter:
+        from .rate_limiter import create_queue_rate_limiter
+        
+        limiter = create_queue_rate_limiter(
+            queue_name=backend,
+            max_per_minute=kwargs.get("max_rate_per_minute", 1000)
+        )
+        
+        queue.rate_limiter = limiter
+    
+    # Aplica criptografia se configurado
+    if use_encryption:
+        from .encryption import get_encryptor
+        
+        encryptor = get_encryptor()
+        queue.encryptor = encryptor
+    
+    logger.info(f"Queue {backend} criada com circuit_breaker={use_circuit_breaker}, "
+                f"rate_limiter={use_rate_limiter}, encryption={use_encryption}")
+    
+    return queue
+
+# Manager global para todos os componentes
+class QueueSystemManager:
+    """Gerencia todo o sistema de filas"""
+    
+    def __init__(self):
+        self.circuit_breaker_manager = CircuitBreakerManager()
+        self.rate_limit_manager = RateLimitManager()
+        self.queues: Dict[str, BaseQueue] = {}
+        self.workers = {}
+        
+        # Inicia monitoramento
+        self._monitoring_tasks = []
+        
+    async def start(self):
+        """Inicia todo o sistema de filas"""
+        logger.info("Iniciando Queue System Manager")
+        
+        # Inicia monitoramento de circuit breakers
+        await self.circuit_breaker_manager.start_monitoring()
+        
+        # Registra rate limiters padrão
+        self._register_default_rate_limiters()
+        
+        logger.info("Queue System Manager iniciado")
+    
+    async def stop(self):
+        """Para todo o sistema de filas"""
+        logger.info("Parando Queue System Manager")
+        
+        # Para circuit breakers
+        await self.circuit_breaker_manager.stop_monitoring()
+        
+        # Para rate limiters
+        await self.rate_limit_manager.shutdown_all()
+        
+        # Para todas as filas
+        for queue in self.queues.values():
+            await queue.shutdown()
+        
+        logger.info("Queue System Manager parado")
+    
+    def _register_default_rate_limiters(self):
+        """Registra rate limiters padrão"""
+        
+        # Rate limiter global
+        global_config = RateLimitConfig(
+            max_requests=10000,
+            window_seconds=3600,
+            strategy=RateLimitStrategy.TOKEN_BUCKET,
+            action=RateLimitAction.DELAY
+        )
+        self.rate_limit_manager.register("global", global_config, is_default=True)
+        
+        # Rate limiter por fila
+        queue_config = RateLimitConfig(
+            max_requests=1000,
+            window_seconds=60,
+            strategy=RateLimitStrategy.SLIDING_WINDOW,
+            action=RateLimitAction.REJECT
+        )
+        self.rate_limit_manager.register("queue_operations", queue_config)
+    
+    def get_system_status(self) -> Dict[str, Any]:
+        """Retorna status completo do sistema"""
+        
+        return {
+            "queues": {
+                "total": len(self.queues),
+                "names": list(self.queues.keys())
+            },
+            "circuit_breakers": self.circuit_breaker_manager.get_all_status(),
+            "rate_limiters": self.rate_limit_manager.get_all_status(),
+            "workers": len(self.workers),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+# Singleton global
+_queue_system_manager: Optional[QueueSystemManager] = None
+
+def get_queue_system_manager() -> QueueSystemManager:
+    """Retorna instância global do Queue System Manager"""
+    global _queue_system_manager
+    
+    if _queue_system_manager is None:
+        _queue_system_manager = QueueSystemManager()
+    
+    return _queue_system_manager
+
+
+# Exportações principais
+__all__ = [
+    # Interfaces básicas
+    "BaseQueue",
+    "DeadLetterQueue", 
+    "QueueMetrics",
+    "QueueMessage",
+    "QueueMetadata",
+    
+    # Exceções
+    "QueueError",
+    "QueueConfigurationError",
+    "QueuePublishError",
+    "QueueConsumeError",
+    "IdempotencyViolationError",
+    
+    # Tarefas
+    "BaseTask",
+    "TaskMetadata",
+    "TaskPriority",
+    "TaskStatus",
+    "PaymentWebhookTask",
+    "PaymentIntentUpdateTask",
+    "InvoiceGenerationTask",
+    "SubscriptionRenewalTask",
+    "EntitlementGrantTask",
+    "NotificationSendTask",
+    "AntifraudAnalysisTask",
+    "TrackingEventTask",
+    "MetricsCollectionTask",
+    "AuditLogTask",
+    "CleanupTask",
+    "TaskFactory",
+    "TaskValidator",
+    "deserialize_task",
+    
+    # Configuração
+    "QueueConfig",
+    "get_queue_config",
+    
+    # Implementações
+    "InMemoryQueue",
+    "RedisQueue",
+    "RabbitMQQueue",
+    "SQSQueue",
+    
+    # Workers
+    "BaseWorker",
+    "PaymentWorker",
+    "NotificationWorker",
+    "AuditWorker",
+    "AntifraudWorker",
+    
+    # Novos: Circuit Breakers
+    "CircuitBreaker",
+    "CircuitBreakerConfig",
+    "CircuitBreakerManager",
+    "CircuitBreakerError",
+    "CircuitBreakerOpenError",
+    "CircuitBreakerTimeoutError",
+    "CircuitBreakerFallbackError",
+    "circuit_breaker",
+    
+    # Novos: Rate Limiting
+    "RateLimiter",
+    "RateLimitConfig",
+    "RateLimitManager",
+    "RateLimitStrategy",
+    "RateLimitAction",
+    "RateLimitExceededError",
+    "create_queue_rate_limiter",
+    "create_tenant_rate_limiter",
+    "rate_limit",
+    
+    # Novos: Criptografia
+    "MessageEncryptor",
+    "EncryptionConfig",
+    "TransportEncryption",
+    "EncryptionError",
+    "DecryptionError",
+    "IntegrityError",
+    "get_encryptor",
+    
+    # Novos: Serialização Versionada
+    "VersionedSerializer",
+    "SchemaRegistry",
+    "SchemaVersion",
+    "SerializationMetadata",
+    "SerializationError",
+    "DeserializationError",
+    "TransformationError",
+    "SerializationIntegrityError",
+    "get_serializer",
+    
+    # Métricas
+    "create_queue_metrics",
+    "QueueMetricsCollector",
+    
+    # DLQ
+    "DatabaseDeadLetterQueue",
+    
+    # Fábricas e Managers
+    "create_queue",
+    "QueueSystemManager",
+    "get_queue_system_manager",
+]
+
+# Versão do módulo
+__version__ = "2.0.0-production"

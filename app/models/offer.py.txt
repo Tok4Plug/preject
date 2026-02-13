@@ -1,0 +1,504 @@
+# app/models/offer.py
+"""
+Modelo de Offer - Ofertas multi-moeda com preços dinâmicos.
+A moeda é definida pela oferta, não pela região do usuário.
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, Float, ForeignKey, Index, Text
+from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
+from sqlalchemy.sql import expression
+import enum
+
+from app.database import Base
+
+
+class OfferType(enum.Enum):
+    """Tipo de oferta."""
+    ONE_TIME = "one_time"           # Compra única
+    SUBSCRIPTION = "subscription"   # Assinatura recorrente
+    TRIAL = "trial"                 # Trial
+    UPSELL = "upsell"               # Upsell
+    DOWNSELL = "downsell"           # Downsell
+    CROSS_SELL = "cross_sell"       # Cross-sell
+
+
+class OfferStatus(enum.Enum):
+    """Status da oferta."""
+    DRAFT = "draft"                 # Rascunho, não visível
+    ACTIVE = "active"               # Ativa e disponível
+    PAUSED = "paused"               # Pausada, não disponível
+    ARCHIVED = "archived"           # Arquivada, histórico
+    DELETED = "deleted"             # Deletada
+
+
+class PricingModel(enum.Enum):
+    """Modelo de preço."""
+    FIXED = "fixed"                 # Preço fixo
+    TIERED = "tiered"               # Preço por tier (volume)
+    USAGE_BASED = "usage_based"    # Preço por uso
+    FREEMIUM = "freemium"          # Freemium
+
+
+class Offer(Base):
+    """
+    Oferta no sistema.
+    
+    Princípios:
+    1. Moeda definida pela oferta, não pelo usuário
+    2. Multi-moeda: uma oferta pode ter preços em diferentes moedas
+    3. Versionamento: histórico de alterações
+    4. Isolamento por tenant
+    5. Configuração dinâmica sem redeploy
+    """
+    
+    __tablename__ = "offers"
+    
+    # Identificação
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    external_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    
+    # Informações básicas
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    
+    # Tipo e status
+    offer_type: Mapped[OfferType] = mapped_column(Enum(OfferType), nullable=False, default=OfferType.ONE_TIME)
+    status: Mapped[OfferStatus] = mapped_column(Enum(OfferStatus), nullable=False, default=OfferStatus.DRAFT)
+    
+    # Moeda primária da oferta (para referência)
+    primary_currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")  # ISO 4217
+    
+    # Preços multi-moeda
+    prices: Mapped[Dict[str, float]] = mapped_column(JSONB, nullable=False, default=dict)  # {"USD": 29.90, "EUR": 27.90, "BRL": 149.90}
+    
+    # Modelo de preço
+    pricing_model: Mapped[PricingModel] = mapped_column(Enum(PricingModel), nullable=False, default=PricingModel.FIXED)
+    pricing_config: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Configuração
+    config: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Validade
+    valid_from: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    valid_until: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Limites
+    max_purchases: Mapped[Optional[int]] = mapped_column(Integer)  # Máximo de compras totais
+    max_purchases_per_user: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    available_quantity: Mapped[Optional[int]] = mapped_column(Integer)  # Quantidade disponível (se limitada)
+    
+    # Upsell/Downsell
+    upsell_offer_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    downsell_offer_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    parent_offer_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)  # Para hierarquia
+    
+    # Controle de versão
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_latest_version: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=expression.true())
+    previous_version_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    
+    # Tracking e pixels
+    tracking_pixels: Mapped[List[str]] = mapped_column(ARRAY(String(255)), nullable=False, default=[])  # IDs de pixels
+    conversion_tags: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)  # Meta, TikTok, Google
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    archived_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship(back_populates="offers")
+    payment_intents: Mapped[List["PaymentIntent"]] = relationship(back_populates="offer", cascade="all, delete-orphan")
+    subscriptions: Mapped[List["Subscription"]] = relationship(back_populates="offer", cascade="all, delete-orphan")
+    invoices: Mapped[List["Invoice"]] = relationship(back_populates="offer", cascade="all, delete-orphan")
+    audit_logs: Mapped[List["AuditLog"]] = relationship(back_populates="offer", cascade="all, delete-orphan")
+    
+    # Índices compostos
+    __table_args__ = (
+        Index('ix_offers_tenant_slug_version', 'tenant_id', 'slug', 'version'),
+        Index('ix_offers_tenant_status', 'tenant_id', 'status'),
+        Index('ix_offers_validity', 'valid_from', 'valid_until', 'status'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<Offer(id='{self.id}', name='{self.name}', type='{self.offer_type.value}', status='{self.status.value}')>"
+    
+    def to_dict(self, include_prices: bool = True) -> Dict[str, Any]:
+        """Converte o modelo para dicionário."""
+        data = {
+            "id": self.id,
+            "tenant_id": self.tenant_id,
+            "external_id": self.external_id,
+            "name": self.name,
+            "slug": self.slug,
+            "description": self.description,
+            "offer_type": self.offer_type.value,
+            "status": self.status.value,
+            "primary_currency": self.primary_currency,
+            "pricing_model": self.pricing_model.value,
+            "pricing_config": self.pricing_config,
+            "config": self.config,
+            "metadata": self.metadata,
+            "valid_from": self.valid_from.isoformat() if self.valid_from else None,
+            "valid_until": self.valid_until.isoformat() if self.valid_until else None,
+            "max_purchases": self.max_purchases,
+            "max_purchases_per_user": self.max_purchases_per_user,
+            "available_quantity": self.available_quantity,
+            "upsell_offer_id": self.upsell_offer_id,
+            "downsell_offer_id": self.downsell_offer_id,
+            "parent_offer_id": self.parent_offer_id,
+            "version": self.version,
+            "is_latest_version": self.is_latest_version,
+            "previous_version_id": self.previous_version_id,
+            "tracking_pixels": self.tracking_pixels,
+            "conversion_tags": self.conversion_tags,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
+            "archived_at": self.archived_at.isoformat() if self.archived_at else None
+        }
+        
+        if include_prices:
+            data["prices"] = self.prices
+        
+        return data
+    
+    @property
+    def is_available(self) -> bool:
+        """Verifica se a oferta está disponível para compra."""
+        if self.status != OfferStatus.ACTIVE:
+            return False
+        
+        if self.deleted_at is not None:
+            return False
+        
+        now = datetime.utcnow()
+        
+        # Verifica validade temporal
+        if self.valid_from and now < self.valid_from:
+            return False
+        
+        if self.valid_until and now > self.valid_until:
+            return False
+        
+        # Verifica quantidade disponível
+        if self.available_quantity is not None and self.available_quantity <= 0:
+            return False
+        
+        return True
+    
+    @property
+    def available_currencies(self) -> List[str]:
+        """Retorna lista de moedas disponíveis para esta oferta."""
+        return list(self.prices.keys())
+    
+    def get_price(self, currency: str) -> Optional[float]:
+        """Obtém o preço para uma moeda específica."""
+        return self.prices.get(currency.upper())
+    
+    def get_price_for_region(self, region: str, fallback_currency: str = "USD") -> Optional[float]:
+        """Obtém preço apropriado para uma região (com fallback)."""
+        # Mapeamento região -> moeda preferencial
+        region_currency_map = {
+            "BR": "BRL",
+            "LATAM": "USD",
+            "EU": "EUR",
+            "US": "USD",
+            "ASIA": "USD",
+            "GLOBAL": "USD"
+        }
+        
+        preferred_currency = region_currency_map.get(region, fallback_currency)
+        
+        # Tenta moeda preferencial
+        if preferred_currency in self.prices:
+            return self.prices[preferred_currency]
+        
+        # Tenta fallback
+        if fallback_currency in self.prices:
+            return self.prices[fallback_currency]
+        
+        # Tenta qualquer moeda disponível
+        if self.prices:
+            return next(iter(self.prices.values()))
+        
+        return None
+    
+    def update_prices(self, new_prices: Dict[str, float], merge: bool = True):
+        """Atualiza preços da oferta."""
+        # Normaliza moedas para uppercase
+        normalized_prices = {k.upper(): v for k, v in new_prices.items()}
+        
+        if merge:
+            self.prices.update(normalized_prices)
+        else:
+            self.prices = normalized_prices
+        
+        self.updated_at = datetime.utcnow()
+    
+    def set_price(self, currency: str, amount: float):
+        """Define preço para uma moeda específica."""
+        self.prices[currency.upper()] = amount
+        self.updated_at = datetime.utcnow()
+    
+    def remove_price(self, currency: str):
+        """Remove preço de uma moeda."""
+        currency = currency.upper()
+        if currency in self.prices:
+            del self.prices[currency]
+            self.updated_at = datetime.utcnow()
+    
+    def create_new_version(self) -> "Offer":
+        """Cria uma nova versão da oferta."""
+        new_offer = Offer(
+            tenant_id=self.tenant_id,
+            external_id=self.external_id,
+            name=self.name,
+            slug=self.slug,
+            description=self.description,
+            offer_type=self.offer_type,
+            status=OfferStatus.DRAFT,  # Nova versão começa como draft
+            primary_currency=self.primary_currency,
+            prices=self.prices.copy(),
+            pricing_model=self.pricing_model,
+            pricing_config=self.pricing_config.copy(),
+            config=self.config.copy(),
+            metadata=self.metadata.copy(),
+            valid_from=self.valid_from,
+            valid_until=self.valid_until,
+            max_purchases=self.max_purchases,
+            max_purchases_per_user=self.max_purchases_per_user,
+            available_quantity=self.available_quantity,
+            upsell_offer_id=self.upsell_offer_id,
+            downsell_offer_id=self.downsell_offer_id,
+            parent_offer_id=self.parent_offer_id,
+            version=self.version + 1,
+            is_latest_version=True,
+            previous_version_id=self.id,
+            tracking_pixels=self.tracking_pixels.copy(),
+            conversion_tags=self.conversion_tags.copy()
+        )
+        
+        # Marca versão atual como não mais a mais recente
+        self.is_latest_version = False
+        
+        return new_offer
+    
+    def publish(self):
+        """Publica a oferta (torna ativa)."""
+        if self.status == OfferStatus.DRAFT:
+            self.status = OfferStatus.ACTIVE
+            self.published_at = datetime.utcnow()
+            self.updated_at = datetime.utcnow()
+    
+    def pause(self):
+        """Pausa a oferta."""
+        if self.status == OfferStatus.ACTIVE:
+            self.status = OfferStatus.PAUSED
+            self.updated_at = datetime.utcnow()
+    
+    def resume(self):
+        """Retoma oferta pausada."""
+        if self.status == OfferStatus.PAUSED:
+            self.status = OfferStatus.ACTIVE
+            self.updated_at = datetime.utcnow()
+    
+    def archive(self):
+        """Arquiva a oferta."""
+        self.status = OfferStatus.ARCHIVED
+        self.archived_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def soft_delete(self):
+        """Deleta a oferta de forma reversível."""
+        self.deleted_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+    
+    def increment_purchase_count(self, amount: int = 1):
+        """Incrementa contador de compras (se disponível)."""
+        if self.available_quantity is not None:
+            self.available_quantity = max(0, self.available_quantity - amount)
+            self.updated_at = datetime.utcnow()
+    
+    def can_user_purchase(self, user_id: str, existing_purchases_count: int = 0) -> bool:
+        """Verifica se um usuário pode comprar esta oferta."""
+        if not self.is_available:
+            return False
+        
+        # Verifica limite por usuário
+        if existing_purchases_count >= self.max_purchases_per_user:
+            return False
+        
+        return True
+    
+    def get_upsell_offer(self) -> Optional["Offer"]:
+        """Obtém oferta de upsell associada."""
+        # Em produção, buscaria no banco
+        return None
+    
+    def get_downsell_offer(self) -> Optional["Offer"]:
+        """Obtém oferta de downsell associada."""
+        # Em produção, buscaria no banco
+        return None
+
+
+class OfferTemplate(Base):
+    """
+    Template para criação rápida de ofertas.
+    Separa conteúdo (template) das instâncias de oferta.
+    """
+    
+    __tablename__ = "offer_templates"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Identificação
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    
+    # Configuração do template
+    template_config: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    default_values: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Metadata
+    metadata: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Controle de versão
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relacionamentos
+    tenant: Mapped["Tenant"] = relationship()
+    instances: Mapped[List["Offer"]] = relationship(back_populates="template")
+    
+    # Índices
+    __table_args__ = (
+        {'schema': 'saas'},
+    )
+    
+    def __repr__(self):
+        return f"<OfferTemplate(id='{self.id}', name='{self.name}', version={self.version})>"
+    
+    def create_offer_from_template(self, override_values: Dict[str, Any] = None) -> Offer:
+        """Cria uma nova oferta a partir deste template."""
+        if override_values is None:
+            override_values = {}
+        
+        # Merge default values com overrides
+        merged_values = {**self.default_values, **override_values}
+        
+        # Cria oferta
+        offer = Offer(
+            tenant_id=self.tenant_id,
+            name=merged_values.get("name", f"{self.name} - Instance"),
+            slug=merged_values.get("slug", f"{self.slug}-{uuid.uuid4().hex[:8]}"),
+            description=merged_values.get("description", self.description),
+            offer_type=merged_values.get("offer_type", OfferType.ONE_TIME),
+            primary_currency=merged_values.get("primary_currency", "USD"),
+            prices=merged_values.get("prices", {}),
+            pricing_model=merged_values.get("pricing_model", PricingModel.FIXED),
+            pricing_config=merged_values.get("pricing_config", {}),
+            config={**self.template_config, **merged_values.get("config", {})},
+            metadata={**self.metadata, **merged_values.get("metadata", {})},
+            valid_from=merged_values.get("valid_from"),
+            valid_until=merged_values.get("valid_until"),
+            max_purchases=merged_values.get("max_purchases"),
+            max_purchases_per_user=merged_values.get("max_purchases_per_user", 1),
+            available_quantity=merged_values.get("available_quantity"),
+            tracking_pixels=merged_values.get("tracking_pixels", []),
+            conversion_tags=merged_values.get("conversion_tags", {}),
+            template_id=self.id
+        )
+        
+        return offer
+
+
+# Adiciona a relação de volta no Offer
+Offer.template = relationship("OfferTemplate", back_populates="instances")
+Offer.template_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("saas.offer_templates.id"), index=True)
+
+
+class OfferStat(Base):
+    """
+    Estatísticas da oferta para analytics.
+    """
+    
+    __tablename__ = "offer_stats"
+    
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    offer_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.offers.id"), nullable=False, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("saas.tenants.id"), nullable=False, index=True)
+    
+    # Métricas de visualização
+    total_views: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unique_views: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    # Métricas de conversão
+    total_clicks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unique_clicks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_purchases: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unique_purchasers: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    
+    # Métricas financeiras
+    total_revenue: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    revenue_by_currency: Mapped[Dict[str, float]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Taxas de conversão
+    view_to_click_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    click_to_purchase_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    overall_conversion_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    
+    # Métricas regionais
+    purchases_by_region: Mapped[Dict[str, int]] = mapped_column(JSONB, nullable=False, default=dict)
+    revenue_by_region: Mapped[Dict[str, float]] = mapped_column(JSONB, nullable=False, default=dict)
+    
+    # Timestamps
+    period_start: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    period_end: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Relacionamentos
+    offer: Mapped["Offer"] = relationship(back_populates="stats")
+    tenant: Mapped["Tenant"] = relationship()
+    
+    # Índices
+    __table_args__ = (
+        Index('ix_offer_stats_offer_period', 'offer_id', 'period_start', 'period_end'),
+        {'schema': 'saas'}
+    )
+    
+    def __repr__(self):
+        return f"<OfferStat(offer_id='{self.offer_id}', period='{self.period_start} to {self.period_end}')>"
+    
+    def update_conversion_rates(self):
+        """Atualiza todas as taxas de conversão."""
+        # View to Click Rate
+        if self.total_views > 0:
+            self.view_to_click_rate = (self.total_clicks / self.total_views) * 100
+        
+        # Click to Purchase Rate
+        if self.total_clicks > 0:
+            self.click_to_purchase_rate = (self.total_purchases / self.total_clicks) * 100
+        
+        # Overall Conversion Rate
+        if self.total_views > 0:
+            self.overall_conversion_rate = (self.total_purchases / self.total_views) * 100
+
+
+# Adiciona as relações de volta no Offer
+Offer.stats = relationship("OfferStat", back_populates="offer", cascade="all, delete-orphan")
