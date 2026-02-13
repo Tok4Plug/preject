@@ -1,0 +1,363 @@
+diff --git a/app/database.py b/app/database.py
+index 5c58fba35ff6df337f4bca5b65f0e58ecf9b6bd7..d0c532383b75989c02340f461932d3ba1f060085 100644
+--- a/app/database.py
++++ b/app/database.py
+@@ -1,249 +1,246 @@
+ """
+ Sistema de banco de dados multi-tenant com isolamento completo.
+ Suporta sharding e conexões dinâmicas por tenant.
+ """
+ 
+-import logging
+ import contextlib
+-from typing import Optional, Dict, Any, Generator
+-from sqlalchemy import create_engine, MetaData
+-from sqlalchemy.orm import sessionmaker, Session, scoped_session
+-from sqlalchemy.ext.declarative import declarative_base
+-from sqlalchemy.pool import QueuePool
++import logging
+ from threading import local
++from typing import Any, Dict, Generator, Optional
++
+ import redis
+ from redis.exceptions import RedisError
++from sqlalchemy import MetaData, text
++from sqlalchemy import create_engine
++from sqlalchemy.engine import Engine
++from sqlalchemy.ext.declarative import declarative_base
++from sqlalchemy.orm import Session, scoped_session, sessionmaker
++from sqlalchemy.pool import QueuePool
+ 
+-from app.config import config, DatabaseConfig
++from app.config import DatabaseConfig, Environment, config
+ 
+ logger = logging.getLogger(__name__)
+ 
+ # Thread-local storage para conexões de banco de dados
+ _thread_local = local()
+ 
+ # Base para todos os modelos
+ Base = declarative_base()
+ 
+ 
+ class DatabaseSessionManager:
+     """
+     Gerenciador de sessões de banco de dados com suporte a multi-tenant.
+     Isola completamente os dados de cada tenant.
+     """
+-    
++
+     def __init__(self):
+-        self._engines: Dict[str, Any] = {}
++        self._engines: Dict[str, Engine] = {}
+         self._session_factories: Dict[str, Any] = {}
+         self._metadata = MetaData()
+         self._redis_client: Optional[redis.Redis] = None
+-        
++
+     def init_app(self):
+         """Inicializa o gerenciador de banco de dados."""
+-        # Cria engine principal (para tabelas globais)
+         self._create_engine("global", config.database)
+-        
+-        # Inicializa Redis para cache e estado
+         self._init_redis()
+-        
+         logger.info("DatabaseSessionManager inicializado")
+-    
++
++    @staticmethod
++    def _build_engine_kwargs(db_config: DatabaseConfig) -> Dict[str, Any]:
++        """Monta kwargs compatíveis com o backend de banco configurado."""
++        url = db_config.url.lower()
++
++        base_kwargs: Dict[str, Any] = {
++            "echo": db_config.echo,
++            "pool_pre_ping": db_config.pool_pre_ping,
++            "pool_recycle": db_config.pool_recycle,
++        }
++
++        if url.startswith("sqlite"):
++            # SQLite não suporta REPEATABLE READ e costuma rodar melhor com check_same_thread=False
++            base_kwargs["connect_args"] = {"check_same_thread": False}
++            return base_kwargs
++
++        base_kwargs.update(
++            {
++                "poolclass": QueuePool,
++                "pool_size": db_config.pool_size,
++                "max_overflow": db_config.max_overflow,
++                "isolation_level": "REPEATABLE READ",
++            }
++        )
++        return base_kwargs
++
+     def _create_engine(self, tenant_id: str, db_config: DatabaseConfig):
+         """Cria uma engine de banco de dados para um tenant específico."""
+-        engine = create_engine(
+-            db_config.url,
+-            poolclass=QueuePool,
+-            pool_size=db_config.pool_size,
+-            max_overflow=db_config.max_overflow,
+-            pool_recycle=db_config.pool_recycle,
+-            pool_pre_ping=db_config.pool_pre_ping,
+-            echo=db_config.echo,
+-            isolation_level="REPEATABLE READ"
+-        )
+-        
++        engine = create_engine(db_config.url, **self._build_engine_kwargs(db_config))
++
+         self._engines[tenant_id] = engine
+         self._session_factories[tenant_id] = scoped_session(
+             sessionmaker(
+                 bind=engine,
+                 autocommit=False,
+                 autoflush=False,
+-                expire_on_commit=False
++                expire_on_commit=False,
+             )
+         )
+-        
+-        logger.debug(f"Engine criada para tenant: {tenant_id}")
+-    
++
++        logger.debug("Engine criada para tenant: %s", tenant_id)
++
+     def _init_redis(self):
+         """Inicializa cliente Redis."""
+         try:
+             self._redis_client = redis.from_url(
+                 config.redis.url,
+                 socket_timeout=config.redis.socket_timeout,
+                 socket_connect_timeout=config.redis.socket_connect_timeout,
+                 retry_on_timeout=config.redis.retry_on_timeout,
+                 health_check_interval=config.redis.health_check_interval,
+-                decode_responses=True
++                decode_responses=True,
+             )
+-            # Testa conexão
+             self._redis_client.ping()
+             logger.info("Redis client inicializado com sucesso")
+-        except RedisError as e:
+-            logger.error(f"Falha ao conectar ao Redis: {e}")
++        except RedisError as exc:
++            logger.warning("Falha ao conectar ao Redis: %s", exc)
+             self._redis_client = None
+-    
+-    def get_engine(self, tenant_id: str = "global"):
++
++    def get_engine(self, tenant_id: str = "global") -> Engine:
+         """Obtém engine de banco de dados para um tenant."""
+         if tenant_id not in self._engines:
+-            # Cria engine dinamicamente para novo tenant
+             db_config = config.get_tenant_database_config(tenant_id)
+             self._create_engine(tenant_id, db_config)
+-        
++
+         return self._engines[tenant_id]
+-    
++
+     def get_session(self, tenant_id: str = "global") -> Session:
+         """Obtém sessão de banco de dados para um tenant."""
+         if tenant_id not in self._session_factories:
+-            self.get_engine(tenant_id)  # Isso cria a factory se não existir
+-        
++            self.get_engine(tenant_id)
++
+         return self._session_factories[tenant_id]()
+-    
++
+     def get_redis(self) -> Optional[redis.Redis]:
+         """Obtém cliente Redis."""
+         return self._redis_client
+-    
++
+     @contextlib.contextmanager
+     def session_scope(self, tenant_id: str = "global") -> Generator[Session, None, None]:
+         """
+         Context manager para sessões de banco de dados.
+         Garante rollback em caso de erro e commit em caso de sucesso.
+         """
+         session = self.get_session(tenant_id)
+         try:
+             yield session
+             session.commit()
+-        except Exception as e:
++        except Exception as exc:
+             session.rollback()
+-            logger.error(f"Erro na sessão do banco: {e}")
++            logger.error("Erro na sessão do banco: %s", exc)
+             raise
+         finally:
+             session.close()
+-    
++
+     def create_all_tables(self, tenant_id: str = "global"):
+         """Cria todas as tabelas para um tenant específico."""
+-        from app.models import (
+-            User, Tenant, Bot, Offer, Subscription,
+-            Invoice, PaymentIntent, Entitlement, Price,
+-            AuditLog, AntifraudEvent, WebhookEvent, FlowState
+-        )
+-        
+-        with self.session_scope(tenant_id) as session:
+-            Base.metadata.create_all(self.get_engine(tenant_id))
+-            logger.info(f"Tabelas criadas para tenant: {tenant_id}")
+-    
++        try:
++            from app.models import (  # noqa: F401
++                AntifraudEvent,
++                AuditLog,
++                Bot,
++                Entitlement,
++                FlowState,
++                Invoice,
++                Offer,
++                PaymentIntent,
++                Price,
++                Subscription,
++                Tenant,
++                User,
++                WebhookEvent,
++            )
++        except Exception as exc:
++            raise RuntimeError("Módulos de modelos indisponíveis para create_all_tables") from exc
++
++        Base.metadata.create_all(self.get_engine(tenant_id))
++        logger.info("Tabelas criadas para tenant: %s", tenant_id)
++
+     def drop_all_tables(self, tenant_id: str = "global"):
+         """Remove todas as tabelas de um tenant (apenas para desenvolvimento)."""
+         if config.environment != Environment.DEVELOPMENT:
+             raise RuntimeError("Esta operação só é permitida em ambiente de desenvolvimento")
+-        
++
+         Base.metadata.drop_all(self.get_engine(tenant_id))
+-        logger.info(f"Tabelas removidas para tenant: {tenant_id}")
+-    
++        logger.info("Tabelas removidas para tenant: %s", tenant_id)
++
+     def health_check(self) -> Dict[str, bool]:
+         """Verifica saúde das conexões de banco de dados."""
+-        health_status = {}
+-        
+-        # Verifica conexão com banco principal
++        health_status = {"database_global": False, "redis": False}
++
+         try:
+-            with self.session_scope("global") as session:
+-                session.execute("SELECT 1")
++            with self.get_engine("global").connect() as conn:
++                conn.execute(text("SELECT 1"))
+             health_status["database_global"] = True
+-        except Exception as e:
+-            health_status["database_global"] = False
+-            logger.error(f"Health check falhou para banco global: {e}")
+-        
+-        # Verifica conexão com Redis
++        except Exception as exc:
++            logger.error("Health check falhou para banco global: %s", exc)
++
+         try:
+             if self._redis_client:
+                 self._redis_client.ping()
+                 health_status["redis"] = True
+-            else:
+-                health_status["redis"] = False
+-        except RedisError as e:
+-            health_status["redis"] = False
+-            logger.error(f"Health check falhou para Redis: {e}")
+-        
++        except RedisError as exc:
++            logger.error("Health check falhou para Redis: %s", exc)
++
+         return health_status
+ 
+ 
+ # Instância global do gerenciador de sessões
+ db_manager = DatabaseSessionManager()
+ 
+ 
+ class TenantAwareSession:
+     """
+     Wrapper para sessão de banco de dados que automaticamente
+-    aplica filtros por tenant em todas as queries.
++    aplica filtros por tenant em queries explícitas.
+     """
+-    
++
+     def __init__(self, session: Session, tenant_id: str):
+         self._session = session
+         self._tenant_id = tenant_id
+-    
++
+     def __getattr__(self, name):
+         """Delega atributos para a sessão subjacente."""
+-        attr = getattr(self._session, name)
+-        
+-        # Intercepta métodos de query para aplicar filtro de tenant
+-        if hasattr(attr, 'filter'):
+-            original_filter = attr.filter
+-            
+-            def tenant_filter(*args, **kwargs):
+-                # Aplica filtro de tenant automático
+-                from app.models import TenantAwareMixin
+-                model = attr._entity_zero().class_
+-                
+-                if hasattr(model, 'tenant_id'):
+-                    query = original_filter(model.tenant_id == self._tenant_id, *args, **kwargs)
+-                else:
+-                    query = original_filter(*args, **kwargs)
+-                
+-                return query
+-            
+-            return tenant_filter
+-        
+-        return attr
+-    
++        return getattr(self._session, name)
++
+     def query(self, *entities, **kwargs):
+-        """Cria query com filtro automático por tenant."""
++        """Cria query com filtro automático por tenant quando aplicável."""
+         query = self._session.query(*entities, **kwargs)
+-        
+-        # Aplica filtro de tenant se aplicável
+-        from app.models import TenantAwareMixin
++
+         for entity in entities:
+-            if hasattr(entity, 'tenant_id'):
++            if hasattr(entity, "tenant_id"):
+                 query = query.filter(entity.tenant_id == self._tenant_id)
+                 break
+-        
++
+         return query
+ 
+ 
+-def get_db_session(tenant_id: str = "global") -> Session:
++def get_db_session(tenant_id: str = "global") -> TenantAwareSession:
+     """
+     Obtém sessão de banco de dados para um tenant específico.
+     Esta é a função principal a ser usada em handlers e serviços.
+     """
+-    # Armazena tenant_id no thread-local para uso em callbacks
+     _thread_local.current_tenant_id = tenant_id
+-    
++
+     return TenantAwareSession(
+         session=db_manager.get_session(tenant_id),
+-        tenant_id=tenant_id
++        tenant_id=tenant_id,
+     )
+ 
+ 
+ def get_redis_client() -> Optional[redis.Redis]:
+     """Obtém cliente Redis."""
+     return db_manager.get_redis()
+ 
+ 
+ # Inicializa o gerenciador quando o módulo é importado
+-db_manager.init_app()
+\ No newline at end of file
++db_manager.init_app()

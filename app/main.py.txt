@@ -1,0 +1,619 @@
+diff --git a/app/main.py b/app/main.py
+index 4db6432c1aa5b46fefb5c82a28ad3c1e407bf59e..eb587cc09b11bb0413d5d03fd303225d0e1eccaf 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -1,390 +1,385 @@
+ """
+ Ponto de entrada principal do sistema SaaS multi-bot.
+ Responsável pela inicialização dinâmica de todos os componentes.
+ """
++
+ import asyncio
+-import logging
++import importlib
++import inspect
+ import signal
+ from contextlib import asynccontextmanager
+-from typing import Dict, List
++from typing import Any, Optional
+ 
+ import structlog
+ from fastapi import FastAPI, Request, status
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import JSONResponse
+ 
+ from app.config import settings
+-from app.core.healthcheck_engine import HealthcheckEngine
+-from app.database import init_db, shutdown_db
+-from app.handlers.telegram_bot import MultiBotManager
+-from app.queue.base import QueueManager
+-from app.utils.cryptography import CryptoManager
++from app.database import db_manager
+ 
+ # Configuração de logging estruturado
+ structlog.configure(
+     processors=[
+         structlog.stdlib.filter_by_level,
+         structlog.stdlib.add_logger_name,
+         structlog.stdlib.add_log_level,
+         structlog.stdlib.PositionalArgumentsFormatter(),
+         structlog.processors.TimeStamper(fmt="iso"),
+         structlog.processors.StackInfoRenderer(),
+         structlog.processors.format_exc_info,
+         structlog.processors.UnicodeDecoder(),
+         structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+     ],
+     logger_factory=structlog.stdlib.LoggerFactory(),
+     cache_logger_on_first_use=True,
+ )
+ 
+ logger = structlog.get_logger(__name__)
+ 
+ 
++def _load_optional(module_path: str, attr_name: str) -> Optional[Any]:
++    """Carrega dependência opcional sem quebrar inicialização da API."""
++    try:
++        module = importlib.import_module(module_path)
++        return getattr(module, attr_name, None)
++    except Exception as exc:  # pragma: no cover - proteção para ambiente parcial
++        logger.warning(
++            "optional_dependency_unavailable",
++            module=module_path,
++            attribute=attr_name,
++            error=str(exc),
++        )
++        return None
++
++
++def _get_bearer_token(request: Request) -> Optional[str]:
++    auth_token = request.headers.get("Authorization")
++    if not auth_token or not auth_token.startswith("Bearer "):
++        return None
++    return auth_token.replace("Bearer ", "", 1)
++
++
++async def _maybe_await(value: Any):
++    if inspect.isawaitable(value):
++        return await value
++    return value
++
++
+ @asynccontextmanager
+-async def lifespan(app: FastAPI):
+-    """
+-    Gerencia o ciclo de vida da aplicação.
+-    """
+-    # Startup
++async def lifespan(app_instance: FastAPI):
++    """Gerencia o ciclo de vida da aplicação."""
+     logger.info("app_starting", environment=settings.ENVIRONMENT)
+-    
++
++    crypto_manager = _load_optional("app.utils.cryptography", "CryptoManager")
++    queue_manager = _load_optional("app.queue.base", "QueueManager")
++    multi_bot_manager_cls = _load_optional("app.handlers.telegram_bot", "MultiBotManager")
++    health_engine_cls = _load_optional("app.core.healthcheck_engine", "HealthcheckEngine")
++
+     try:
+-        # Inicializa criptografia
+-        CryptoManager.initialize(settings.CRYPTO_SECRET_KEY)
+-        
+-        # Inicializa banco de dados
+-        await init_db()
+-        
+-        # Inicializa gerenciador de filas
+-        await QueueManager.initialize()
+-        
+-        # Inicializa gerenciador multi-bot
+-        bot_manager = MultiBotManager()
+-        await bot_manager.initialize_all_bots()
+-        
+-        # Inicializa Healthcheck Engine
+-        health_engine = HealthcheckEngine()
+-        await health_engine.initialize()
+-        
+-        # Adiciona instâncias ao state do app
+-        app.state.bot_manager = bot_manager
+-        app.state.queue_manager = QueueManager
+-        app.state.health_engine = health_engine
+-        
+-        # Configura handlers de shutdown
++        if crypto_manager and hasattr(crypto_manager, "initialize"):
++            crypto_manager.initialize(settings.CRYPTO_SECRET_KEY)
++
++        # db_manager já é inicializado no import de app.database
++        app_instance.state.queue_manager = queue_manager
++        app_instance.state.bot_manager = multi_bot_manager_cls() if multi_bot_manager_cls else None
++        app_instance.state.health_engine = health_engine_cls() if health_engine_cls else None
++
++        if queue_manager and hasattr(queue_manager, "initialize"):
++            await _maybe_await(queue_manager.initialize())
++
++        if app_instance.state.bot_manager and hasattr(app_instance.state.bot_manager, "initialize_all_bots"):
++            await _maybe_await(app_instance.state.bot_manager.initialize_all_bots())
++
++        if app_instance.state.health_engine and hasattr(app_instance.state.health_engine, "initialize"):
++            await _maybe_await(app_instance.state.health_engine.initialize())
++
+         loop = asyncio.get_event_loop()
+         for sig in (signal.SIGTERM, signal.SIGINT):
+-            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
+-        
++            try:
++                loop.add_signal_handler(
++                    sig,
++                    lambda current_app=app_instance: asyncio.create_task(shutdown(current_app)),
++                )
++            except (NotImplementedError, RuntimeError):
++                logger.warning("signal_handlers_not_supported")
++
++        app_instance.state.started = True
+         logger.info("app_started_successfully")
+         yield
+-        
+-    except Exception as e:
+-        logger.error("app_startup_failed", error=str(e), exc_info=True)
++
++    except Exception as exc:
++        logger.error("app_startup_failed", error=str(exc), exc_info=True)
+         raise
+-        
++
+     finally:
+-        # Shutdown
+         logger.info("app_shutting_down")
+-        await shutdown()
++        await shutdown(app_instance)
+ 
+ 
+-async def shutdown():
+-    """
+-    Processo de shutdown gracioso.
+-    """
++async def shutdown(app_instance: FastAPI):
++    """Processo de shutdown gracioso."""
+     logger.info("initiating_graceful_shutdown")
+-    
+-    # Para todos os bots
+-    if hasattr(app.state, 'bot_manager'):
+-        await app.state.bot_manager.shutdown_all_bots()
+-    
+-    # Para workers das filas
+-    if hasattr(app.state, 'queue_manager'):
+-        await app.state.queue_manager.shutdown()
+-    
+-    # Fecha conexões do banco
+-    await shutdown_db()
+-    
++
++    bot_manager = getattr(app_instance.state, "bot_manager", None)
++    queue_manager = getattr(app_instance.state, "queue_manager", None)
++
++    if bot_manager and hasattr(bot_manager, "shutdown_all_bots"):
++        await _maybe_await(bot_manager.shutdown_all_bots())
++
++    if queue_manager and hasattr(queue_manager, "shutdown"):
++        await _maybe_await(queue_manager.shutdown())
++
++    for engine in db_manager._engines.values():
++        engine.dispose()
++
++    app_instance.state.started = False
+     logger.info("shutdown_completed")
+ 
+ 
+-# Inicializa app FastAPI com lifespan
+ app = FastAPI(
+     title="SaaS Multi-Bot Platform",
+     description="Plataforma SaaS modular para gestão multi-bot, pagamentos e controle de acesso",
+     version="1.0.0",
+     docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
+     redoc_url="/redoc" if settings.ENVIRONMENT != "production" else None,
+-    lifespan=lifespan
++    lifespan=lifespan,
+ )
+ 
+-
+-# Middlewares
+ app.add_middleware(
+     CORSMiddleware,
+     allow_origins=settings.CORS_ORIGINS,
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+ )
+ 
+ 
+ class TenantMiddleware:
+-    """
+-    Middleware para extrair e validar tenant ID de todas as requisições.
+-    """
++    """Middleware para extrair e validar tenant ID de todas as requisições."""
++
+     async def __call__(self, request: Request, call_next):
+-        # Extrai tenant ID do header ou do path
+         tenant_id = request.headers.get("X-Tenant-ID") or request.query_params.get("tenant_id")
+-        
++
+         if not tenant_id and request.url.path.startswith("/api/"):
+-            # Para APIs, requer tenant ID
+             return JSONResponse(
+                 status_code=status.HTTP_400_BAD_REQUEST,
+-                content={"detail": "Tenant ID is required"}
++                content={"detail": "Tenant ID is required"},
+             )
+-        
+-        # Adiciona tenant_id ao request state
++
+         request.state.tenant_id = tenant_id
+-        
+-        # Log estruturado
+-        logger.info(
+-            "request_received",
+-            path=request.url.path,
+-            method=request.method,
+-            tenant_id=tenant_id,
+-            client_ip=request.client.host if request.client else None
+-        )
+-        
+         response = await call_next(request)
+-        
+-        logger.info(
+-            "request_completed",
+-            path=request.url.path,
+-            method=request.method,
+-            status_code=response.status_code,
+-            tenant_id=tenant_id
+-        )
+-        
+         return response
+ 
+ 
+-# Adiciona middleware de tenant
+ app.middleware("http")(TenantMiddleware())
+ 
+ 
+-# Exception handlers globais
+ @app.exception_handler(Exception)
+ async def global_exception_handler(request: Request, exc: Exception):
+-    """
+-    Handler global de exceções.
+-    """
+-    error_id = CryptoManager.generate_uuid()
+-    
++    """Handler global de exceções."""
++    crypto_manager = _load_optional("app.utils.cryptography", "CryptoManager")
++    error_id = "internal-error"
++
++    if crypto_manager and hasattr(crypto_manager, "generate_uuid"):
++        error_id = crypto_manager.generate_uuid()
++
+     logger.error(
+         "unhandled_exception",
+         error_id=error_id,
+         path=request.url.path,
+         method=request.method,
+-        tenant_id=getattr(request.state, 'tenant_id', None),
++        tenant_id=getattr(request.state, "tenant_id", None),
+         error_type=type(exc).__name__,
+         error=str(exc),
+-        exc_info=True
++        exc_info=True,
+     )
+-    
++
+     return JSONResponse(
+         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+         content={
+             "error_id": error_id,
+             "detail": "Internal server error",
+-            "status_code": status.HTTP_500_INTERNAL_SERVER_ERROR
+-        }
++            "status_code": status.HTTP_500_INTERNAL_SERVER_ERROR,
++        },
+     )
+ 
+ 
+-# Endpoints de sistema
+ @app.get("/health", tags=["System"])
+ async def health_check():
+-    """
+-    Health check endpoint para Kubernetes e load balancers.
+-    """
+-    if hasattr(app.state, 'health_engine'):
+-        health_status = await app.state.health_engine.check_all()
+-        if all(status["status"] == "healthy" for status in health_status.values()):
++    """Health check endpoint para Kubernetes e load balancers."""
++    health_engine = getattr(app.state, "health_engine", None)
++    if health_engine and hasattr(health_engine, "check_all"):
++        health_status = await _maybe_await(health_engine.check_all())
++        if all(component.get("status") == "healthy" for component in health_status.values()):
+             return {"status": "healthy", "services": health_status}
+-        else:
+-            return JSONResponse(
+-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+-                content={"status": "unhealthy", "services": health_status}
+-            )
+-    return {"status": "healthy"}
++        return JSONResponse(
++            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
++            content={"status": "unhealthy", "services": health_status},
++        )
++
++    return {"status": "healthy", "services": {"app": "healthy"}}
+ 
+ 
+ @app.get("/ready", tags=["System"])
+ async def readiness_check():
+-    """
+-    Readiness check para verificar se a aplicação está pronta para receber tráfego.
+-    """
+-    checks = {}
+-    
+-    # Verifica banco de dados
+-    try:
+-        # Tenta uma query simples
+-        from app.database import database
+-        await database.execute("SELECT 1")
+-        checks["database"] = "ready"
+-    except Exception as e:
+-        checks["database"] = f"not_ready: {str(e)}"
+-    
+-    # Verifica filas
+-    if hasattr(app.state, 'queue_manager'):
++    """Readiness check para verificar se a aplicação está pronta para receber tráfego."""
++    checks = {"app": "ready" if getattr(app.state, "started", False) else "not_ready"}
++
++    queue_manager = getattr(app.state, "queue_manager", None)
++    if queue_manager and hasattr(queue_manager, "ping"):
+         try:
+-            await app.state.queue_manager.ping()
++            await _maybe_await(queue_manager.ping())
+             checks["queues"] = "ready"
+-        except Exception as e:
+-            checks["queues"] = f"not_ready: {str(e)}"
+-    
+-    # Verifica bots
+-    if hasattr(app.state, 'bot_manager'):
+-        bots_status = await app.state.bot_manager.get_status()
+-        checks["bots"] = bots_status
+-    
+-    if all("ready" in str(v) for v in checks.values()):
++        except Exception as exc:
++            checks["queues"] = f"not_ready: {exc}"
++
++    bot_manager = getattr(app.state, "bot_manager", None)
++    if bot_manager and hasattr(bot_manager, "get_status"):
++        checks["bots"] = await _maybe_await(bot_manager.get_status())
++
++    if all(str(value).startswith("ready") or value == "ready" for value in checks.values() if isinstance(value, str)):
+         return {"status": "ready", "checks": checks}
+-    else:
+-        return JSONResponse(
+-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+-            content={"status": "not_ready", "checks": checks}
+-        )
++
++    return JSONResponse(
++        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
++        content={"status": "not_ready", "checks": checks},
++    )
+ 
+ 
+ @app.get("/metrics", tags=["System"])
+ async def metrics_endpoint():
+-    """
+-    Endpoint de métricas para Prometheus.
+-    """
+-    from app.core.metrics_engine import MetricsEngine
+-    metrics = await MetricsEngine.get_all_metrics()
+-    return metrics
++    """Endpoint de métricas para Prometheus."""
++    metrics_engine = _load_optional("app.core.metrics_engine", "MetricsEngine")
++    if metrics_engine and hasattr(metrics_engine, "get_all_metrics"):
++        return await _maybe_await(metrics_engine.get_all_metrics())
++
++    return JSONResponse(
++        status_code=status.HTTP_501_NOT_IMPLEMENTED,
++        content={"detail": "Metrics engine unavailable in this build"},
++    )
+ 
+ 
+-# Endpoint para webhooks de pagamento
+ @app.post("/webhooks/payment/{provider}", tags=["Webhooks"])
+ async def payment_webhook(provider: str, request: Request):
+-    """
+-    Endpoint para receber webhooks de todos os providers de pagamento.
+-    """
+-    from app.handlers.webhook_handler import PaymentWebhookHandler
+-    
+-    # Extrai raw body
++    """Endpoint para receber webhooks de todos os providers de pagamento."""
++    handler_cls = _load_optional("app.handlers.webhook_handler", "PaymentWebhookHandler")
++    if not handler_cls:
++        return JSONResponse(
++            status_code=status.HTTP_501_NOT_IMPLEMENTED,
++            content={"detail": "Webhook handler unavailable in this build"},
++        )
++
+     raw_body = await request.body()
+     headers = dict(request.headers)
+-    
+-    # Processa webhook
+-    handler = PaymentWebhookHandler()
+-    result = await handler.process(
+-        provider=provider,
+-        raw_body=raw_body,
+-        headers=headers,
+-        signature=headers.get("x-signature")
+-    )
+-    
+-    if result["success"]:
+-        return {"status": "processed", "event_id": result["event_id"]}
+-    else:
+-        return JSONResponse(
+-            status_code=status.HTTP_400_BAD_REQUEST,
+-            content={"status": "error", "detail": result["error"]}
++    handler = handler_cls()
++
++    result = await _maybe_await(
++        handler.process(
++            provider=provider,
++            raw_body=raw_body,
++            headers=headers,
++            signature=headers.get("x-signature"),
+         )
++    )
++
++    if result.get("success"):
++        return {"status": "processed", "event_id": result.get("event_id")}
++
++    return JSONResponse(
++        status_code=status.HTTP_400_BAD_REQUEST,
++        content={"status": "error", "detail": result.get("error", "unknown_error")},
++    )
+ 
+ 
+-# API Admin (protegida)
+ @app.get("/admin/bots", tags=["Admin"])
+ async def list_bots(request: Request):
+-    """
+-    Lista todos os bots registrados (requer autenticação admin).
+-    """
+-    # Verifica token admin
+-    auth_token = request.headers.get("Authorization")
+-    if not auth_token or not auth_token.startswith("Bearer "):
++    """Lista todos os bots registrados (requer autenticação admin)."""
++    token = _get_bearer_token(request)
++    if not token:
+         return JSONResponse(
+             status_code=status.HTTP_401_UNAUTHORIZED,
+-            content={"detail": "Missing or invalid authorization token"}
++            content={"detail": "Missing or invalid authorization token"},
+         )
+-    
+-    token = auth_token.replace("Bearer ", "")
++
+     if token != settings.ADMIN_API_TOKEN:
+         return JSONResponse(
+             status_code=status.HTTP_403_FORBIDDEN,
+-            content={"detail": "Invalid admin token"}
++            content={"detail": "Invalid admin token"},
++        )
++
++    bot_model = _load_optional("app.models.bot", "Bot")
++    if not bot_model or not hasattr(bot_model, "get_all_active"):
++        return JSONResponse(
++            status_code=status.HTTP_501_NOT_IMPLEMENTED,
++            content={"detail": "Bot model unavailable in this build"},
+         )
+-    
+-    from app.models.bot import Bot
+-    bots = await Bot.get_all_active()
++
++    bots = await _maybe_await(bot_model.get_all_active())
+     return {"bots": [bot.to_dict() for bot in bots]}
+ 
+ 
+ @app.post("/admin/bots/register", tags=["Admin"])
+ async def register_bot(request: Request):
+-    """
+-    Registra um novo bot dinamicamente.
+-    """
+-    # Verifica token admin
+-    auth_token = request.headers.get("Authorization")
+-    if not auth_token or not auth_token.startswith("Bearer "):
++    """Registra um novo bot dinamicamente."""
++    token = _get_bearer_token(request)
++    if not token:
+         return JSONResponse(
+             status_code=status.HTTP_401_UNAUTHORIZED,
+-            content={"detail": "Missing or invalid authorization token"}
++            content={"detail": "Missing or invalid authorization token"},
+         )
+-    
+-    token = auth_token.replace("Bearer ", "")
++
+     if token != settings.ADMIN_API_TOKEN:
+         return JSONResponse(
+             status_code=status.HTTP_403_FORBIDDEN,
+-            content={"detail": "Invalid admin token"}
++            content={"detail": "Invalid admin token"},
+         )
+-    
++
+     data = await request.json()
+-    
+-    from app.models.bot import Bot
+-    from app.handlers.telegram_bot import MultiBotManager
+-    
++    bot_model = _load_optional("app.models.bot", "Bot")
++    crypto_manager = _load_optional("app.utils.cryptography", "CryptoManager")
++
++    if not bot_model or not crypto_manager:
++        return JSONResponse(
++            status_code=status.HTTP_501_NOT_IMPLEMENTED,
++            content={"detail": "Bot registration dependencies unavailable in this build"},
++        )
++
+     try:
+-        # Cria bot no banco
+-        bot = await Bot.create(
+-            name=data["name"],
+-            token_hash=CryptoManager.hash_token(data["token"]),
+-            platform="telegram",
+-            default_flow=data.get("default_flow", "main_flow"),
+-            config=data.get("config", {}),
+-            status="active"
++        bot = await _maybe_await(
++            bot_model.create(
++                name=data["name"],
++                token_hash=crypto_manager.hash_token(data["token"]),
++                platform="telegram",
++                default_flow=data.get("default_flow", "main_flow"),
++                config=data.get("config", {}),
++                status="active",
++            )
+         )
+-        
+-        # Inicializa bot dinamicamente
+-        if hasattr(app.state, 'bot_manager'):
+-            await app.state.bot_manager.initialize_bot(bot.id, data["token"])
+-        
++
++        bot_manager = getattr(app.state, "bot_manager", None)
++        if bot_manager and hasattr(bot_manager, "initialize_bot"):
++            await _maybe_await(bot_manager.initialize_bot(bot.id, data["token"]))
++
+         logger.info("bot_registered_dynamically", bot_id=bot.id, bot_name=bot.name)
+-        
+         return {"status": "registered", "bot": bot.to_dict()}
+-        
+-    except Exception as e:
+-        logger.error("bot_registration_failed", error=str(e))
++
++    except Exception as exc:
++        logger.error("bot_registration_failed", error=str(exc), exc_info=True)
+         return JSONResponse(
+             status_code=status.HTTP_400_BAD_REQUEST,
+-            content={"detail": str(e)}
++            content={"detail": str(exc)},
+         )
+ 
+ 
+ if __name__ == "__main__":
+     import uvicorn
+-    
++
+     uvicorn.run(
+         "app.main:app",
+         host="0.0.0.0",
+         port=settings.PORT,
+         reload=settings.ENVIRONMENT == "development",
+-        log_config=None,  # Usa structlog configurado
+-        access_log=False  # Já temos logging estruturado
+-    )
+\ No newline at end of file
++        log_config=None,
++        access_log=False,
++    )
